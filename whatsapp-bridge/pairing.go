@@ -65,7 +65,7 @@ type pairSession struct {
 	cancel    context.CancelFunc
 	firstCode chan struct{} // closed on the first QR code or when the session ends
 	once      sync.Once
-	done      chan struct{} // closed when the session ends, whatever the reason
+	done      chan struct{} // closed when the session ends without pairing
 	doneOnce  sync.Once
 	paired    bool // pairing succeeded; guarded by pairingManager.mu
 }
@@ -159,7 +159,10 @@ func (pm *pairingManager) endSessionLocked(s *pairSession) {
 	pm.qr = ""
 	pm.qrExpires = time.Time{}
 	s.signalFirst()
-	s.doneOnce.Do(func() { close(s.done) })
+	if !s.paired {
+		// A paired session is released by the channel close instead (see consumeQR)
+		s.doneOnce.Do(func() { close(s.done) })
+	}
 }
 
 // StartPairing arms a QR session if none is active. GetQRChannel must come before Connect.
@@ -229,29 +232,19 @@ func (pm *pairingManager) replaceUnpairedClient(c waClient) {
 // does not close the channel after every failure (for example a passkey error followed by our
 // Disconnect), so a session that ended without pairing is released here instead of waiting
 // for a close that never comes. After a successful pairing the context is still cancelled
-// only once the channel has closed (see endSessionLocked).
+// only once the channel has closed (see endSessionLocked), so done is never signalled then.
 func (pm *pairingManager) consumeQR(s *pairSession, ch <-chan whatsmeow.QRChannelItem) {
-	for open := true; open; {
+loop:
+	for {
 		select {
 		case item, ok := <-ch:
 			if !ok {
-				open = false
-				break
+				break loop
 			}
 			pm.handleQR(s, item)
 		case <-s.done:
-			pm.mu.Lock()
-			paired := s.paired
-			pm.mu.Unlock()
-			if !paired {
-				s.cancel()
-				return
-			}
-			// Paired: wait for whatsmeow to close the channel before cancelling its context.
-			for item := range ch {
-				pm.handleQR(s, item)
-			}
-			open = false
+			s.cancel()
+			return
 		}
 	}
 	// Channel closed: whatever the reason, the session is over.
