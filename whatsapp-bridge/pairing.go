@@ -19,6 +19,11 @@ import (
 // (-ldflags "-X main.bridgeVersion=<source hash>") to detect daemons running stale code.
 var bridgeVersion = "0.3.0"
 
+// bridgeRelease is the release this bridge belongs to, reported by /api/health. Unlike
+// bridgeVersion it is never overridden at build time, so supervisors can order bridges by it
+// and never replace a newer bridge with an older one.
+const bridgeRelease = "0.3.0"
+
 // Pairing states reported in /api/status ("replaced" is derived from the replaced flag).
 const (
 	pairIdle     = "idle"
@@ -483,6 +488,7 @@ func stderrIsTTY() bool {
 type healthResponse struct {
 	Service      string `json:"service"`
 	Version      string `json:"version"`
+	Release      string `json:"release"`
 	StoreDir     string `json:"store_dir"`
 	PID          int    `json:"pid"`
 	AuthRequired bool   `json:"auth_required"`
@@ -497,6 +503,7 @@ func (a *apiServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, healthResponse{
 		Service:      "whatsapp-bridge",
 		Version:      bridgeVersion,
+		Release:      bridgeRelease,
 		StoreDir:     a.storeDirAbs,
 		PID:          os.Getpid(),
 		AuthRequired: a.token != "",

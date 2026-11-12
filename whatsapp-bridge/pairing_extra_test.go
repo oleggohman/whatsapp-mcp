@@ -297,7 +297,7 @@ func TestHealthReportsServiceAndAuth(t *testing.T) {
 		t.Fatalf("code = %d", rec.Code)
 	}
 	resp := decode[healthResponse](t, rec.Body.String())
-	if resp.Service != "whatsapp-bridge" || resp.Version != bridgeVersion || resp.PID != os.Getpid() || !resp.AuthRequired || resp.StoreDir == "" {
+	if resp.Service != "whatsapp-bridge" || resp.Version != bridgeVersion || resp.Release != bridgeRelease || resp.PID != os.Getpid() || !resp.AuthRequired || resp.StoreDir == "" {
 		t.Fatalf("health = %+v", resp)
 	}
 }

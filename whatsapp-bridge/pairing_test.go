@@ -523,8 +523,9 @@ func TestHealthAndStatusAuth(t *testing.T) {
 	bridgeVersion = "stamped-abc123"
 	t.Cleanup(func() { bridgeVersion = old })
 	rec = do(h, http.MethodGet, "/api/health", "")
-	if hr := decode[healthResponse](t, rec.Body.String()); hr.Version != "stamped-abc123" {
-		t.Fatalf("health version = %q, want stamped value", hr.Version)
+	// The release is a constant that the stamp never changes: supervisors order bridges by it.
+	if hr := decode[healthResponse](t, rec.Body.String()); hr.Version != "stamped-abc123" || hr.Release != bridgeRelease {
+		t.Fatalf("health version = %q release = %q, want stamped value and %q", hr.Version, hr.Release, bridgeRelease)
 	}
 
 	if rec := do(h, http.MethodGet, "/api/status", ""); rec.Code != http.StatusUnauthorized {
