@@ -33,14 +33,30 @@ type fakeWA struct {
 	pairErr     error
 	pairArgs    []string
 	qrCtx       context.Context // ctx passed to the last GetQRChannel
+	connGate    chan struct{}   // when set, IsConnected blocks until it is closed
+	connEntered chan struct{}   // when set, IsConnected signals here before blocking
 }
 
 func newFakeWA(paired bool) *fakeWA {
 	return &fakeWA{fakeClient: &fakeClient{}, paired: paired, conn: paired, pairCode: "ABCD-EFGH"}
 }
 
-func (f *fakeWA) IsConnected() bool { f.mu.Lock(); defer f.mu.Unlock(); return f.conn }
-func (f *fakeWA) Paired() bool      { f.mu.Lock(); defer f.mu.Unlock(); return f.paired }
+func (f *fakeWA) IsConnected() bool {
+	f.mu.Lock()
+	gate, entered := f.connGate, f.connEntered
+	f.mu.Unlock()
+	if gate != nil {
+		// Like whatsmeow's socketLock held by a slow Connect.
+		if entered != nil {
+			entered <- struct{}{}
+		}
+		<-gate
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.conn
+}
+func (f *fakeWA) Paired() bool { f.mu.Lock(); defer f.mu.Unlock(); return f.paired }
 func (f *fakeWA) Connect() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -265,6 +281,44 @@ func TestPairSuccessEventKeepsQRContextUntilChannelCloses(t *testing.T) {
 	waitFor(t, "QR context cancelled after the channel closed", func() bool { return ctx.Err() != nil })
 	if _, d, _ := fw.counts(); d != 0 {
 		t.Fatalf("must not disconnect after success, got %d", d)
+	}
+}
+
+// A Connect holding whatsmeow's socket lock blocks IsConnected; that must not block the
+// pairing manager's mutex (Client, events) while Status or Reconnect waits.
+func TestSlowIsConnectedDoesNotBlockManager(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		call func(pm *pairingManager)
+	}{
+		{"Status", func(pm *pairingManager) { pm.Status() }},
+		{"Reconnect", func(pm *pairingManager) { _ = pm.Reconnect() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fw := newFakeWA(true)
+			pm := newTestPairing(fw, nil)
+			gate, entered := make(chan struct{}), make(chan struct{}, 1)
+			fw.mu.Lock()
+			fw.connGate, fw.connEntered = gate, entered
+			fw.mu.Unlock()
+			done := make(chan struct{})
+			go func() { tc.call(pm); close(done) }()
+			<-entered // the call is now blocked inside IsConnected
+			free := make(chan struct{})
+			go func() {
+				pm.Client()
+				pm.handleEvent(fw, &events.Connected{})
+				close(free)
+			}()
+			select {
+			case <-free:
+			case <-time.After(time.Second):
+				close(gate)
+				t.Fatalf("%s held the manager lock while IsConnected blocked", tc.name)
+			}
+			close(gate)
+			<-done
+		})
 	}
 }
 

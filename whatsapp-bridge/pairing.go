@@ -119,12 +119,12 @@ type statusResponse struct {
 	PairingError string `json:"pairing_error,omitempty"`
 }
 
-// Status snapshots the current state.
+// Status snapshots the current state. IsConnected runs after pm.mu is released: it waits for
+// whatsmeow's socket lock, which a Connect holds for the whole dial and handshake.
 func (pm *pairingManager) Status() statusResponse {
 	pm.mu.Lock()
-	defer pm.mu.Unlock()
+	c := pm.client
 	st := statusResponse{LoggedIn: pm.loggedIn, Pairing: pairIdle}
-	st.Connected = !pm.replaced && pm.client.IsConnected()
 	switch {
 	case pm.replaced:
 		st.Pairing = pairReplaced
@@ -137,6 +137,9 @@ func (pm *pairingManager) Status() statusResponse {
 		st.QR = pm.qr
 		st.QRExpiresAt = pm.qrExpires.Unix()
 	}
+	replaced := pm.replaced
+	pm.mu.Unlock()
+	st.Connected = !replaced && c.IsConnected()
 	return st
 }
 
@@ -341,14 +344,15 @@ func (pm *pairingManager) Reconnect() error {
 	pm.mu.Lock()
 	c := pm.client
 	wasReplaced := pm.replaced
+	pm.mu.Unlock()
 	if !c.Paired() {
-		pm.mu.Unlock()
 		return &pairError{status: http.StatusConflict, msg: "not logged in; start pairing instead"}
 	}
-	if c.IsConnected() && !wasReplaced {
-		pm.mu.Unlock()
+	// Outside pm.mu: IsConnected waits for whatsmeow's socket lock (see Status).
+	if !wasReplaced && c.IsConnected() {
 		return nil
 	}
+	pm.mu.Lock()
 	pm.replaced = false
 	pm.mu.Unlock()
 	if err := c.Connect(); err != nil {
