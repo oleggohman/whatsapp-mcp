@@ -106,3 +106,31 @@ def test_ffmpeg_never_reads_mcp_stdin(tmp_path, monkeypatch):
     cmd, kwargs = calls[0]
     assert "-nostdin" in cmd and cmd.index("-nostdin") < cmd.index("-i")
     assert kwargs.get("stdin") is audio.subprocess.DEVNULL
+
+
+def test_find_ffmpeg_probes_beyond_minimal_path(tmp_path, monkeypatch):
+    """A GUI client's minimal PATH lacks Homebrew; the probe list and the env override cover it."""
+    probed = tmp_path / "homebrew" / "ffmpeg"
+    probed.parent.mkdir()
+    probed.write_text("#!/bin/sh\n")
+    probed.chmod(0o755)
+    monkeypatch.delenv("WHATSAPP_FFMPEG_BIN", raising=False)
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    monkeypatch.setattr(audio, "FFMPEG_PROBE_PATHS", (str(tmp_path / "missing"), str(probed)))
+    assert audio.find_ffmpeg() == str(probed)
+
+    monkeypatch.setattr(audio, "FFMPEG_PROBE_PATHS", ())
+    assert audio.find_ffmpeg() == "ffmpeg"  # not installed: running it gives the clear error
+
+    monkeypatch.setenv("WHATSAPP_FFMPEG_BIN", "/custom/ffmpeg")
+    assert audio.find_ffmpeg() == "/custom/ffmpeg"
+    calls = []
+    monkeypatch.setattr(
+        audio.subprocess,
+        "run",
+        lambda cmd, **kw: calls.append(cmd) or audio.subprocess.CompletedProcess(cmd, 0),
+    )
+    src = tmp_path / "voice.mp3"
+    src.write_bytes(b"mp3")
+    audio.convert_to_opus_ogg(str(src), str(tmp_path / "out.ogg"))
+    assert calls[0][0] == "/custom/ffmpeg"

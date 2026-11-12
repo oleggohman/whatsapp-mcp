@@ -59,7 +59,7 @@ You configure one MCP server (`whatsapp-mcp-server`). It builds, starts and supe
    }
    ```
 
-   The `env` block is optional. No variable is required: the server inherits `HOME` from the client, which is all `go build` and `uv` need. Add `WHATSAPP_GO_BIN` (absolute path to the `go` binary) when the GUI app starts with a minimal `PATH` that does not contain Go. The server also probes `/opt/homebrew/bin`, `/usr/local/go/bin`, `/usr/local/bin`, `~/go/bin` and `~/sdk/*/bin` on its own. If your client strips `HOME`, set `HOME` or `GOCACHE` in `env` as well.
+   The `env` block is optional. No variable is required: the server inherits `HOME` from the client, which is all `go build` and `uv` need. Add `WHATSAPP_GO_BIN` (absolute path to the `go` binary) when the GUI app starts with a minimal `PATH` that does not contain Go. The server also probes `/opt/homebrew/bin`, `/usr/local/go/bin`, `/usr/local/bin`, `~/go/bin` and `~/sdk/*/bin` on its own. If your client strips `HOME`, set `HOME` or `GOCACHE` in `env` as well. The same minimal `PATH` affects `ffmpeg` (used by `send_audio_message` to convert non-`.ogg` audio): the server looks for it on `PATH`, then in `/opt/homebrew/bin`, `/usr/local/bin` and `/usr/bin`; set `WHATSAPP_FFMPEG_BIN` (absolute path) if it lives elsewhere.
 
    **Claude Code**:
 
@@ -107,6 +107,7 @@ Bridge (Go) and MCP server (Python) read the same names. When the server spawns 
 | `WHATSAPP_BRIDGE_SRC` | `whatsapp-bridge` | server | Bridge source directory used for builds |
 | `WHATSAPP_BRIDGE_START_TIMEOUT` | `60` | server | Seconds to wait for the spawned bridge to answer |
 | `WHATSAPP_GO_BIN` | `go` from `PATH`, then common install paths | server | Go toolchain used to build the bridge |
+| `WHATSAPP_FFMPEG_BIN` | `ffmpeg` from `PATH`, then common install paths | server | ffmpeg used by `send_audio_message` to convert audio |
 | `WHATSAPP_DB_PATH` | `<store>/messages.db` | server | Override the `messages.db` path for read queries |
 | `WHATSAPP_LOG_LEVEL` | `INFO` | server | Python log level (logs go to stderr) |
 

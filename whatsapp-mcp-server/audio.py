@@ -1,6 +1,27 @@
 import os
+import shutil
 import subprocess
 import tempfile
+
+# GUI MCP clients often start with a minimal PATH that lacks Homebrew and /usr/local.
+FFMPEG_PROBE_PATHS = ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg")
+
+
+def find_ffmpeg() -> str:
+    """ffmpeg to run: WHATSAPP_FFMPEG_BIN, PATH, then common install locations.
+
+    Falls back to plain "ffmpeg", which fails with FileNotFoundError when it is not installed.
+    """
+    explicit = os.environ.get("WHATSAPP_FFMPEG_BIN")
+    if explicit:
+        return explicit
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    for candidate in FFMPEG_PROBE_PATHS:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return "ffmpeg"
 
 
 def convert_to_opus_ogg(input_file, output_file=None, bitrate="32k", sample_rate=24000):
@@ -35,7 +56,7 @@ def convert_to_opus_ogg(input_file, output_file=None, bitrate="32k", sample_rate
 
     # Build the ffmpeg command
     cmd = [
-        "ffmpeg",
+        find_ffmpeg(),
         "-nostdin",  # never read the MCP stdio stream for interactive commands
         "-i",
         input_file,
@@ -65,7 +86,8 @@ def convert_to_opus_ogg(input_file, output_file=None, bitrate="32k", sample_rate
     except FileNotFoundError as e:
         # subprocess raises this when the ffmpeg executable itself is missing
         raise FileNotFoundError(
-            "ffmpeg not found on PATH. Install ffmpeg to send non-.ogg audio."
+            "ffmpeg not found on PATH or in common install locations. Install ffmpeg, or set "
+            "WHATSAPP_FFMPEG_BIN to its absolute path, to send non-.ogg audio."
         ) from e
     except subprocess.CalledProcessError as e:
         raise RuntimeError(
