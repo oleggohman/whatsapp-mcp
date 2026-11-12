@@ -35,6 +35,7 @@ type fakeWA struct {
 	qrCtx       context.Context // ctx passed to the last GetQRChannel
 	connGate    chan struct{}   // when set, IsConnected blocks until it is closed
 	connEntered chan struct{}   // when set, IsConnected signals here before blocking
+	onConnect   func()          // when set, runs inside Connect without f.mu held
 }
 
 func newFakeWA(paired bool) *fakeWA {
@@ -58,6 +59,12 @@ func (f *fakeWA) IsConnected() bool {
 }
 func (f *fakeWA) Paired() bool { f.mu.Lock(); defer f.mu.Unlock(); return f.paired }
 func (f *fakeWA) Connect() error {
+	f.mu.Lock()
+	hook := f.onConnect
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.order = append(f.order, "connect")
