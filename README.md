@@ -4,8 +4,6 @@
 
 A Model Context Protocol (MCP) server that lets Claude (Claude Desktop, Claude Code) or any other MCP client search and read your personal WhatsApp messages and send messages and media. It connects to your own WhatsApp account as a linked device through WhatsApp's multi-device API, using the [whatsmeow](https://github.com/tulir/whatsmeow) library. Your messages are stored locally in SQLite. They reach the language model only when a tool returns them.
 
-![WhatsApp MCP](./example-use.png)
-
 This project is a fork of [lharries/whatsapp-mcp](https://github.com/lharries/whatsapp-mcp) (MIT license).
 
 > **Caution:** like most MCP servers, this one is exposed to [the lethal trifecta](https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/): a prompt-injected model could leak private data. See [Security and privacy](#security-and-privacy).
