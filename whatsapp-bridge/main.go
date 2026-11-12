@@ -85,12 +85,8 @@ func handleMessage(r *chatResolver, messageStore *MessageStore, msg *events.Mess
 			direction = "→"
 		}
 
-		// Log based on message type
-		if mediaType != "" {
-			logf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
-		} else if content != "" {
-			logf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
-		}
+		// Log metadata only, never message bodies or file names
+		logf("[%s] %s %s in %s: %d text bytes, media %q\n", timestamp, direction, sender, chatJID, len(content), mediaType)
 	}
 }
 
@@ -404,14 +400,9 @@ func handleHistorySync(r *chatResolver, self string, messageStore *MessageStore,
 					logger.Warnf("Failed to store history message: %v", err)
 				} else {
 					syncedCount++
-					// Log successful message storage
-					if mediaType != "" {
-						logger.Infof("Stored message: [%s] %s -> %s: [%s: %s] %s",
-							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, mediaType, filename, content)
-					} else {
-						logger.Infof("Stored message: [%s] %s -> %s: %s",
-							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, content)
-					}
+					// Log metadata only, never message bodies or file names
+					logger.Infof("Stored message: [%s] %s -> %s: %d text bytes, media %q",
+						timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, len(content), mediaType)
 				}
 			}
 		}
