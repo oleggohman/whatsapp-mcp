@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -90,10 +91,6 @@ func handleMessage(r *chatResolver, messageStore *MessageStore, msg *events.Mess
 		// Log metadata only, never message bodies or file names
 		logf("[%s] %s %s in %s: %d text bytes, media %q\n", timestamp, direction, sender, chatJID, len(content), mediaType)
 	}
-}
-
-func main() {
-	os.Exit(run())
 }
 
 // deviceContainer is the part of *sqlstore.Container that run needs.
@@ -223,8 +220,9 @@ func run() int {
 	})
 	if isTTY() {
 		pm.printQR = func(code string) {
-			logln("\nScan this QR code with your WhatsApp app:")
-			qrterminal.GenerateHalfBlock(code, qrterminal.L, os.Stderr)
+			out := os.Stderr
+			_, _ = fmt.Fprintln(out, "\nScan this QR code with your WhatsApp app:")
+			qrterminal.GenerateHalfBlock(code, qrterminal.L, out)
 		}
 	}
 
@@ -260,13 +258,9 @@ func run() int {
 	notifySignals(exitChan)
 	idleCtx, stopIdle := context.WithCancel(context.Background())
 	defer stopIdle()
-	idleExit := make(chan struct{}, 1)
-	watchIdle(idleCtx, idle, idleExitDuration(), func() {
-		select {
-		case idleExit <- struct{}{}:
-		default:
-		}
-	})
+	idleExit := make(chan struct{})
+	// watchIdle calls this at most once
+	watchIdle(idleCtx, idle, idleExitDuration(), func() { close(idleExit) })
 
 	logln("REST server is running. Press Ctrl+C to disconnect and exit.")
 	select {
