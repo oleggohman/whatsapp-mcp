@@ -7,12 +7,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"mime"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"go.mau.fi/whatsmeow"
@@ -82,15 +84,11 @@ func sendWhatsAppMessage(client bridgeClient, recipient string, message string, 
 
 	// Check if we have media to send
 	if mediaPath != "" {
-		// Re-validate here so every caller gets the same guarantees as the REST handler
-		if err := validateMediaPath(mediaPath); err != nil {
-			return false, err.Error()
-		}
-
-		// Read media file (path validated above: absolute, regular file, size-capped)
-		mediaData, err := os.ReadFile(mediaPath) //nolint:gosec // G304: path validated by validateMediaPath
+		// Validate and read through one open file, so every caller gets the same guarantees
+		// as the REST handler and a swap after validation cannot slip anything past them
+		mediaData, err := readMediaFile(mediaPath)
 		if err != nil {
-			return false, fmt.Sprintf("Error reading media file: %v", err)
+			return false, err.Error()
 		}
 
 		// Determine media type and mime type based on file extension
@@ -255,6 +253,39 @@ func validateMediaPath(p string) error {
 		return fmt.Errorf("media file too large (%d bytes, max %d)", info.Size(), maxMediaBytes)
 	}
 	return nil
+}
+
+// readMediaFile applies the validateMediaPath rules to the file it actually opens and reads
+// at most maxMediaBytes from it, so the path cannot be swapped for a FIFO, a device or a
+// bigger file between the check and the read.
+func readMediaFile(p string) ([]byte, error) {
+	if !filepath.IsAbs(p) {
+		return nil, errors.New("media_path must be an absolute path")
+	}
+	// O_NONBLOCK: opening a FIFO must not wait for a writer (it is rejected below)
+	f, err := os.OpenFile(p, os.O_RDONLY|syscall.O_NONBLOCK, 0) //nolint:gosec // G304: checked below
+	if err != nil {
+		return nil, fmt.Errorf("media_path is not accessible: %v", err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("media_path is not accessible: %v", err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("media_path must be a regular file")
+	}
+	if info.Size() > maxMediaBytes {
+		return nil, fmt.Errorf("media file too large (%d bytes, max %d)", info.Size(), maxMediaBytes)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxMediaBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("Error reading media file: %v", err)
+	}
+	if int64(len(data)) > maxMediaBytes {
+		return nil, fmt.Errorf("media file too large (more than %d bytes)", maxMediaBytes)
+	}
+	return data, nil
 }
 
 // bridgeAddr returns the configured REST listen address (loopback by default).
