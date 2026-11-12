@@ -86,7 +86,12 @@ def _isolate_bridge_env(tmp_path_factory, monkeypatch):
 
     monkeypatch.setenv("WHATSAPP_BRIDGE_AUTOSTART", "0")
     monkeypatch.setenv("WHATSAPP_STORE_DIR", str(tmp_path_factory.mktemp("store")))
-    for var in ("WHATSAPP_BRIDGE_ADDR", "WHATSAPP_BRIDGE_BIN", "WHATSAPP_BRIDGE_SRC", "WHATSAPP_GO_BIN"):
+    for var in (
+        "WHATSAPP_BRIDGE_ADDR",
+        "WHATSAPP_BRIDGE_BIN",
+        "WHATSAPP_BRIDGE_SRC",
+        "WHATSAPP_GO_BIN",
+    ):
         monkeypatch.delenv(var, raising=False)
     bridge_manager.reset_manager()
     yield

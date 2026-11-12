@@ -32,7 +32,11 @@ def test_list_messages_sender_and_query_filters(store_dir):
 
 def test_list_messages_date_filters(store_dir):
     out = whatsapp.list_messages(after="2025-01-02T00:00:00", include_context=False)
-    assert "group hello" in out and "from lid" in out and "hello\n" not in out.replace("group hello", "")
+    assert (
+        "group hello" in out
+        and "from lid" in out
+        and "hello\n" not in out.replace("group hello", "")
+    )
     out = whatsapp.list_messages(before="2025-01-01T09:30:00", include_context=False)
     assert "bob says hi" in out and "group hello" not in out
 
@@ -48,7 +52,10 @@ def test_list_messages_pagination(store_dir):
     page1 = whatsapp.list_messages(chat_jid=ALICE, limit=2, page=1, include_context=False)
     assert "third" in page0 and "second" in page0 and "hello" not in page0
     assert "hello" in page1 and "third" not in page1
-    assert whatsapp.list_messages(chat_jid=ALICE, limit=2, page=5, include_context=False) == "No messages to display."
+    assert (
+        whatsapp.list_messages(chat_jid=ALICE, limit=2, page=5, include_context=False)
+        == "No messages to display."
+    )
 
 
 def test_list_messages_context(store_dir):

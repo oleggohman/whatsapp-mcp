@@ -70,16 +70,26 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         url = urlsplit(self.path)
         if url.path == "/api/health":
-            return self._send(200, {
-                "service": "whatsapp-bridge", "version": os.environ.get("FAKE_VERSION", "fakev"),
-                "store_dir": store, "pid": os.getpid(), "auth_required": bool(token),
-            })
+            return self._send(
+                200,
+                {
+                    "service": "whatsapp-bridge",
+                    "version": os.environ.get("FAKE_VERSION", "fakev"),
+                    "store_dir": store,
+                    "pid": os.getpid(),
+                    "auth_required": bool(token),
+                },
+            )
         if url.path == "/api/status":
             if not self._authed():
                 return
             if parse_qs(url.query).get("start_pairing") == ["1"] and not state["logged_in"]:
                 state["pairing"] = "qr"
-            body = {"connected": state["logged_in"], "logged_in": state["logged_in"], "pairing": state["pairing"]}
+            body = {
+                "connected": state["logged_in"],
+                "logged_in": state["logged_in"],
+                "pairing": state["pairing"],
+            }
             if state["pairing"] == "qr":
                 body["qr"] = "2@fakeqrpayload,abc,def"
             return self._send(200, body)

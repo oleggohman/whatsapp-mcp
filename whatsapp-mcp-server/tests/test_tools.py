@@ -1,23 +1,22 @@
-"""Every MCP tool invoked through FastMCP (exercises output-schema validation), plus DB behaviour."""
+"""Every MCP tool invoked through FastMCP (exercises output-schema validation), plus DB."""
 
 import json
-import shutil
 import sqlite3
 from pathlib import Path
 
 import httpx
 import pytest
+from conftest import make_messages_db
 from mcp.server.fastmcp.exceptions import ToolError
 
 import main
 import whatsapp
-from conftest import make_messages_db
 
 BASELINE = Path(__file__).parent / "baseline_tools.json"
 
 
 def _payload(result):
-    """Return the structured payload of a call_tool result (unwrapping FastMCP's {"result": ...})."""
+    """Return the structured payload of a call_tool result (unwrap FastMCP's {"result": ...})."""
     content, structured = result
     if structured is not None:
         return structured.get("result", structured) if set(structured) == {"result"} else structured
@@ -55,8 +54,13 @@ async def test_list_messages(store_dir):
 
 
 async def test_list_messages_dates_and_context(store_dir):
-    out = await call("list_messages", after="2025-01-01T10:00:30", before="2025-01-01T10:01:30",
-                     chat_jid="111@s.whatsapp.net", include_context=False)
+    out = await call(
+        "list_messages",
+        after="2025-01-01T10:00:30",
+        before="2025-01-01T10:01:30",
+        chat_jid="111@s.whatsapp.net",
+        include_context=False,
+    )
     assert "second" in out and "hello" not in out and "third" not in out
     with_ctx = await call("list_messages", query="second", context_before=1, context_after=1)
     assert "hello" in with_ctx and "third" in with_ctx
@@ -70,7 +74,9 @@ async def test_list_chats(store_dir):
     alice = next(c for c in res if c["jid"] == "111@s.whatsapp.net")
     assert alice["last_message"] == "third"
     assert alice["last_message_time"] == "2025-01-01T10:02:00+00:00"
-    assert [c["name"] for c in await call("list_chats", sort_by="name", include_last_message=False)][0] == "Alice"
+    assert [
+        c["name"] for c in await call("list_chats", sort_by="name", include_last_message=False)
+    ][0] == "Alice"
 
 
 async def test_get_chat(store_dir):
@@ -108,7 +114,10 @@ async def test_get_message_context(store_dir):
 
 
 async def test_send_message(store_dir, bridge_ok):
-    assert await call("send_message", recipient="123", message="hi") == {"success": True, "message": "sent"}
+    assert await call("send_message", recipient="123", message="hi") == {
+        "success": True,
+        "message": "sent",
+    }
     res = await call("send_message", recipient="", message="hi")
     assert res == {"success": False, "message": "Recipient must be provided"}
 
@@ -126,9 +135,18 @@ async def test_send_file_and_audio(store_dir, bridge_ok, tmp_path):
 
 async def test_download_media(store_dir, bridge_ok, monkeypatch):
     res = await call("download_media", message_id="m3", chat_jid="111@s.whatsapp.net")
-    assert res == {"success": True, "message": "Media downloaded successfully", "file_path": "/store/x.jpg"}
-    monkeypatch.setattr(whatsapp, "_http_transport", httpx.MockTransport(
-        lambda r: httpx.Response(200, json={"success": False, "message": "no media"})))
+    assert res == {
+        "success": True,
+        "message": "Media downloaded successfully",
+        "file_path": "/store/x.jpg",
+    }
+    monkeypatch.setattr(
+        whatsapp,
+        "_http_transport",
+        httpx.MockTransport(
+            lambda r: httpx.Response(200, json={"success": False, "message": "no media"})
+        ),
+    )
     res = await call("download_media", message_id="m1", chat_jid="x")
     assert res == {"success": False, "message": "Failed to download media"}
 
@@ -183,6 +201,7 @@ def test_connect_is_read_only(store_dir):
 
 def _normalize(schema: dict) -> dict:
     """Reduce an input schema to param names, required list and base types."""
+
     def base_type(prop):
         if "type" in prop:
             return prop["type"]
@@ -199,6 +218,10 @@ async def test_tool_schemas_match_baseline():
     baseline = json.loads(BASELINE.read_text())
     tools = {t.name: t.inputSchema for t in await main.mcp.list_tools()}
     # The baseline tools stay unchanged; Task 9a adds exactly these pairing/status tools.
-    assert set(tools) == set(baseline) | {"get_connection_status", "get_pairing_qr", "pair_with_phone_number"}
+    assert set(tools) == set(baseline) | {
+        "get_connection_status",
+        "get_pairing_qr",
+        "pair_with_phone_number",
+    }
     for name, schema in baseline.items():
         assert _normalize(tools[name]) == _normalize(schema), name

@@ -1,6 +1,5 @@
-"""Bridge supervisor: build, spawn, shared-daemon reuse and the pairing tools (fake bridge + fake go)."""
+"""Bridge supervisor: build, spawn, shared-daemon reuse and pairing tools (fake bridge + go)."""
 
-import json
 import os
 import signal
 import socket
@@ -43,7 +42,9 @@ def _write_exe(path: Path, text: str) -> Path:
 def env(tmp_path, monkeypatch):
     """Autostart enabled, private store/port, fake bridge binary, empty source dir (no build)."""
     store = tmp_path / "store"
-    binary = _write_exe(tmp_path / "bridge-bin", f"#!{sys.executable}\n" + FAKE_BRIDGE_SRC.read_text())
+    binary = _write_exe(
+        tmp_path / "bridge-bin", f"#!{sys.executable}\n" + FAKE_BRIDGE_SRC.read_text()
+    )
     src = tmp_path / "src"
     src.mkdir()
     port = _free_port()
@@ -55,7 +56,14 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("WHATSAPP_BRIDGE_START_TIMEOUT", "20")
     monkeypatch.setenv("WHATSAPP_DB_PATH", str(store / "messages.db"))
     stores = [store]
-    yield {"store": store, "binary": binary, "src": src, "port": port, "tmp": tmp_path, "stores": stores}
+    yield {
+        "store": store,
+        "binary": binary,
+        "src": src,
+        "port": port,
+        "tmp": tmp_path,
+        "stores": stores,
+    }
     for s in stores:  # stop every fake daemon this test started
         pid_file = s / "fake.pid"
         if pid_file.exists():
@@ -71,12 +79,19 @@ def spawns(store: Path) -> int:
 
 
 def start_fake(env, store: Path | None = None, **extra) -> subprocess.Popen:
-    """Start the fake bridge by hand (as another MCP client would have) and wait until it answers."""
+    """Start the fake bridge by hand (as another MCP client would) and wait until it answers."""
     store = store or env["store"]
     if store not in env["stores"]:
         env["stores"].append(store)
-    e = dict(os.environ, WHATSAPP_STORE_DIR=str(store), WHATSAPP_BRIDGE_ADDR=f"127.0.0.1:{env['port']}", **extra)
-    proc = subprocess.Popen([str(env["binary"])], env=e, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    e = dict(
+        os.environ,
+        WHATSAPP_STORE_DIR=str(store),
+        WHATSAPP_BRIDGE_ADDR=f"127.0.0.1:{env['port']}",
+        **extra,
+    )
+    proc = subprocess.Popen(
+        [str(env["binary"])], env=e, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
     return proc
 
 
@@ -185,7 +200,10 @@ def test_autostart_disabled(env, monkeypatch):
 
 def test_token_created_exclusively_and_shared(env):
     results: list[str] = []
-    threads = [threading.Thread(target=lambda: results.append(bridge_manager.ensure_token())) for _ in range(8)]
+    threads = [
+        threading.Thread(target=lambda: results.append(bridge_manager.ensure_token()))
+        for _ in range(8)
+    ]
     for t in threads:
         t.start()
     for t in threads:
@@ -220,7 +238,7 @@ sleep {sleep}
   if [ "$1" = "-o" ]; then out="$2"; fi
   shift
 done
-cp {env['binary']} "$out"
+cp {env["binary"]} "$out"
 chmod +x "$out"
 """
     return _write_exe(env["tmp"] / "fake-go", body)
@@ -274,7 +292,7 @@ def test_go_probing(env, monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("PATH", str(tmp_path / "empty"))
     found = bridge_manager.find_go()
-    # Real installs under /opt/homebrew etc. may win on a dev machine; the probe list is what matters.
+    # Real installs under /opt/homebrew etc. may win on a dev machine; the probe list matters.
     assert found is not None and found.endswith("/go")
 
 
@@ -315,7 +333,9 @@ async def test_lifespan_returns_fast_and_tools_report_starting(env, monkeypatch)
     t0 = time.monotonic()
     async with main.lifespan(main.mcp):
         assert time.monotonic() - t0 < 1.0  # the 2 s build did not block startup
-        payload = _data(await main.mcp.call_tool("send_message", {"recipient": "123", "message": "hi"}))
+        payload = _data(
+            await main.mcp.call_tool("send_message", {"recipient": "123", "message": "hi"})
+        )
         assert payload["success"] is False and "building/starting" in payload["message"]
         status = _data(await main.mcp.call_tool("get_connection_status", {}))
         assert status["state"] in ("building", "starting")
@@ -331,13 +351,18 @@ async def test_pairing_tools_through_mcp(env):
     assert mgr._done.wait(30)
 
     status = _data(await main.mcp.call_tool("get_connection_status", {}))
-    assert status["state"] == "running" and status["logged_in"] is False and status["pairing"] == "idle"
+    assert (
+        status["state"] == "running"
+        and status["logged_in"] is False
+        and status["pairing"] == "idle"
+    )
     assert "restart_needed" not in status
 
     content = await main.mcp.call_tool("get_pairing_qr", {})
     kinds = [c.type for c in content]
     assert kinds[0] == "image" and content[0].mimeType == "image/png"
     import base64
+
     assert base64.b64decode(content[0].data)[:8] == b"\x89PNG\r\n\x1a\n"
     assert any("2@fakeqrpayload" in getattr(c, "text", "") for c in content)
 
