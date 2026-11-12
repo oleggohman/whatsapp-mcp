@@ -59,7 +59,12 @@ func loadToken(dir string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("read token file: %w", err)
 	}
-	return strings.TrimSpace(string(b)), nil
+	t := strings.TrimSpace(string(b))
+	if t == "" {
+		// Fail closed: an existing but empty token file must not silently disable auth.
+		return "", errors.New("token file bridge.token exists but is empty; delete it or write a token")
+	}
+	return t, nil
 }
 
 // idleTracker records the last API activity for the optional idle exit.

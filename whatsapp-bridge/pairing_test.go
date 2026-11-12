@@ -517,6 +517,22 @@ func TestTokenPrecedence(t *testing.T) {
 	}
 }
 
+func TestEmptyTokenFileFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("WHATSAPP_BRIDGE_TOKEN", "")
+	if err := os.WriteFile(filepath.Join(dir, "bridge.token"), []byte(" \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if tok, err := loadToken(dir); err == nil {
+		t.Fatalf("empty token file must be an error, got token %q", tok)
+	}
+	// An explicit env token still wins over a broken file.
+	t.Setenv("WHATSAPP_BRIDGE_TOKEN", "from-env")
+	if tok, err := loadToken(dir); err != nil || tok != "from-env" {
+		t.Fatalf("env token: %q %v", tok, err)
+	}
+}
+
 func TestIdleExit(t *testing.T) {
 	t.Run("fires when enabled", func(t *testing.T) {
 		tr := newIdleTracker()

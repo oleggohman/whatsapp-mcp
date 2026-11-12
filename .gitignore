@@ -4,3 +4,4 @@ whatsapp.log
 # Locally built bridge binary and its source-hash sidecar
 whatsapp-bridge/whatsapp-bridge
 *.srchash
+whatsapp-bridge/whatsapp-client
