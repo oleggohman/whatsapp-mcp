@@ -156,21 +156,10 @@ func sendWhatsAppMessage(client bridgeClient, recipient string, message string, 
 				FileLength:    &resp.FileLength,
 			}
 		case whatsmeow.MediaAudio:
-			// Handle ogg audio files
-			var seconds uint32 = 30 // Default fallback
-			var waveform []byte = nil
-
-			// Try to analyze the ogg file
-			if strings.Contains(mimeType, "ogg") {
-				analyzedSeconds, analyzedWaveform, err := analyzeOggOpus(mediaData)
-				if err == nil {
-					seconds = analyzedSeconds
-					waveform = analyzedWaveform
-				} else {
-					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)
-				}
-			} else {
-				logf("Not an Ogg Opus file: %s\n", mimeType)
+			// Only .ogg maps to audio, so the file is always analyzed as Ogg Opus
+			seconds, waveform, err := analyzeOggOpus(mediaData)
+			if err != nil {
+				return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)
 			}
 
 			msg.AudioMessage = &waE2E.AudioMessage{
