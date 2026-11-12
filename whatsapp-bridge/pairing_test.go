@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -109,7 +110,12 @@ func codeItem(c string) whatsmeow.QRChannelItem {
 
 // newTestPairing builds a manager whose logout replacement is returned by next.
 func newTestPairing(c *fakeWA, next *fakeWA) *pairingManager {
-	pm := newPairingManager(c, func() (waClient, error) { return next, nil })
+	pm := newPairingManager(c, func() (waClient, error) {
+		if next == nil {
+			return nil, errors.New("no replacement client in this test")
+		}
+		return next, nil
+	})
 	pm.waitCode = 500 * time.Millisecond
 	return pm
 }
@@ -609,5 +615,45 @@ func TestStatusGETCannotChangeState(t *testing.T) {
 	}
 	if _, _, qr := unpaired.counts(); qr != 1 {
 		t.Fatalf("start-pairing qrCalls = %d, want 1", qr)
+	}
+}
+
+// GetQRChannel leaves an event handler behind when Connect fails; the retry must use a
+// fresh client so that stale handler cannot disconnect the new session.
+func TestFailedConnectReplacesClient(t *testing.T) {
+	first := newFakeWA(false)
+	first.connectErr = errors.New("dial failed")
+	fresh := newFakeWA(false)
+	pm := newTestPairing(first, fresh)
+
+	if _, err := pm.StartPairing(); err == nil {
+		t.Fatal("StartPairing should fail when Connect fails")
+	}
+	if pm.current() != waClient(fresh) {
+		t.Fatal("client with the stale QR handler was kept after a failed connect")
+	}
+	if _, err := pm.StartPairing(); err != nil {
+		t.Fatal(err)
+	}
+	if c, _, q := first.counts(); c != 1 || q != 1 {
+		t.Fatalf("old client reused: connects=%d qrCalls=%d", c, q)
+	}
+	if c, _, q := fresh.counts(); c != 1 || q != 1 {
+		t.Fatalf("fresh client: connects=%d qrCalls=%d, want 1/1", c, q)
+	}
+	fresh.send(codeItem("c"))
+	waitFor(t, "QR on the fresh client", func() bool { return pm.Status().QR == "c" })
+}
+
+// Without a replacement the old client stays (pairing can still be retried).
+func TestFailedConnectKeepsClientWhenReplacementFails(t *testing.T) {
+	first := newFakeWA(false)
+	first.connectErr = errors.New("dial failed")
+	pm := newTestPairing(first, nil)
+	if _, err := pm.StartPairing(); err == nil {
+		t.Fatal("StartPairing should fail when Connect fails")
+	}
+	if pm.current() != waClient(first) {
+		t.Fatal("client must stay when no replacement can be built")
 	}
 }

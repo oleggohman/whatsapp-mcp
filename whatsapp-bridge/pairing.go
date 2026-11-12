@@ -179,6 +179,10 @@ func (pm *pairingManager) StartPairing() (*pairSession, error) {
 	}
 	if err := c.Connect(); err != nil {
 		cancel()
+		// GetQRChannel registered an event handler on c that cancel() does not remove. Left in
+		// place, it would disconnect the client on the next attempt's first QR code, so the
+		// next attempt gets a fresh client instead.
+		pm.replaceUnpairedClient(c)
 		return nil, fmt.Errorf("start pairing: connect: %w", err)
 	}
 	s := &pairSession{client: c, cancel: cancel, firstCode: make(chan struct{})}
@@ -195,6 +199,21 @@ func (pm *pairingManager) StartPairing() (*pairSession, error) {
 	pm.mu.Unlock()
 	go pm.consumeQR(s, ch)
 	return s, nil
+}
+
+// replaceUnpairedClient swaps in a fresh client for c (still current, unpaired); on failure c stays.
+func (pm *pairingManager) replaceUnpairedClient(c waClient) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	if pm.client != c || pm.newClient == nil || c.Paired() {
+		return
+	}
+	nc, err := pm.newClient()
+	if err != nil {
+		logf("Failed to create a new client after a failed pairing connect: %v\n", err)
+		return
+	}
+	pm.client = nc
 }
 
 // consumeQR feeds QR channel items into the state machine until the channel closes.
