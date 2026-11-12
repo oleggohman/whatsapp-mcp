@@ -279,6 +279,8 @@ func run() int {
 	logln("REST server is running. Press Ctrl+C to disconnect and exit.")
 	select {
 	case <-exitChan:
+	case <-api.shutdown:
+		logger.Infof("Shutdown requested via API; exiting")
 	case <-idleExit:
 		logger.Infof("No API activity for %s; exiting", idleExitDuration())
 	}

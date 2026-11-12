@@ -588,3 +588,34 @@ func TestDefaultSignalHookDeliversSIGTERM(t *testing.T) {
 		t.Fatal("SIGTERM not delivered to the registered channel")
 	}
 }
+
+func TestRunExitsGracefullyOnAPIShutdown(t *testing.T) {
+	h := newRunHarness(t, &fakeContainer{dev: &store.Device{}})
+	code := h.start()
+	h.registered()
+	cl := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}, Timeout: settleTimeout}
+	resp, err := cl.Post("http://"+h.addr()+"/api/shutdown", "application/json", strings.NewReader(`{"version":"`+bridgeVersion+`"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("shutdown status = %d", resp.StatusCode)
+	}
+	if c := h.wait(code); c != 0 {
+		t.Fatalf("code = %d", c)
+	}
+	if logs := h.logs.String(); !strings.Contains(logs, "Shutdown requested via API; exiting") || !strings.Contains(logs, "Disconnecting...") {
+		t.Fatalf("missing shutdown logs:\n%s", logs)
+	}
+	if c := h.client(0); c == nil {
+		t.Fatal("no client created")
+	} else if _, disconnects, _ := c.counts(); disconnects != 1 {
+		t.Fatalf("disconnects = %d", disconnects)
+	}
+	l, err := acquireLock(filepath.Join(h.dir, "bridge.lock"))
+	if err != nil {
+		t.Fatalf("lock must be free after shutdown: %v", err)
+	}
+	l.Release()
+}

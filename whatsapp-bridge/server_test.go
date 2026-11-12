@@ -564,3 +564,65 @@ func assertUnder(t *testing.T, root, path string) {
 		t.Fatalf("%s is not under %s", real, absRoot)
 	}
 }
+
+func shutdownAuth(v string) func(*http.Request) {
+	return func(r *http.Request) { r.Header.Set("Authorization", v) }
+}
+
+func shutdownSignalled(a *apiServer) bool {
+	select {
+	case <-a.shutdown:
+		return true
+	default:
+		return false
+	}
+}
+
+func TestShutdownMatchingVersionSignals(t *testing.T) {
+	a, h := newTestAPI(t, &fakeClient{}, "tok")
+	auth := shutdownAuth("Bearer tok")
+	body := `{"version":"` + bridgeVersion + `"}`
+	rec := do(h, http.MethodPost, "/api/shutdown", body, auth)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"success":true`) {
+		t.Fatalf("got %d %q", rec.Code, rec.Body.String())
+	}
+	if !shutdownSignalled(a) {
+		t.Fatal("shutdown channel not signalled")
+	}
+	// Repeated requests must not block even when nobody drained the channel
+	for i := 0; i < 2; i++ {
+		if rec := do(h, http.MethodPost, "/api/shutdown", body, auth); rec.Code != http.StatusOK {
+			t.Fatalf("repeat %d status = %d", i, rec.Code)
+		}
+	}
+	if !shutdownSignalled(a) || shutdownSignalled(a) {
+		t.Fatal("expected exactly one pending signal")
+	}
+}
+
+func TestShutdownRejections(t *testing.T) {
+	cases := []struct {
+		name   string
+		method string
+		body   string
+		opts   []func(*http.Request)
+		want   int
+	}{
+		{"version mismatch", http.MethodPost, `{"version":"other"}`, []func(*http.Request){shutdownAuth("Bearer tok")}, http.StatusConflict},
+		{"missing version", http.MethodPost, `{}`, []func(*http.Request){shutdownAuth("Bearer tok")}, http.StatusConflict},
+		{"bad json", http.MethodPost, `{`, []func(*http.Request){shutdownAuth("Bearer tok")}, http.StatusBadRequest},
+		{"get", http.MethodGet, ``, []func(*http.Request){shutdownAuth("Bearer tok")}, http.StatusMethodNotAllowed},
+		{"no token", http.MethodPost, `{"version":"` + bridgeVersion + `"}`, nil, http.StatusUnauthorized},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			a, h := newTestAPI(t, &fakeClient{}, "tok")
+			if rec := do(h, c.method, "/api/shutdown", c.body, c.opts...); rec.Code != c.want {
+				t.Fatalf("status = %d, want %d", rec.Code, c.want)
+			}
+			if shutdownSignalled(a) {
+				t.Fatal("shutdown must not be signalled")
+			}
+		})
+	}
+}

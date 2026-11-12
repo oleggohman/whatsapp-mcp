@@ -311,6 +311,7 @@ type apiServer struct {
 	pairing     *pairingManager // status/pairing endpoints; nil answers 503
 	idle        *idleTracker    // optional; touched by authenticated non-health requests
 	storeDirAbs string          // absolute store dir reported by /api/health
+	shutdown    chan struct{}   // signalled by /api/shutdown; buffered(1), created only in newAPIServer
 }
 
 // route is one API endpoint plus its guard policy.
@@ -323,7 +324,7 @@ type route struct {
 // newAPIServer builds an apiServer; addr is the configured listen address, whose host
 // (when it is a concrete name/IP) joins the Host allowlist.
 func newAPIServer(client func() bridgeClient, store *MessageStore, token, addr string) *apiServer {
-	a := &apiServer{client: client, messageStore: store, token: token}
+	a := &apiServer{client: client, messageStore: store, token: token, shutdown: make(chan struct{}, 1)}
 	if abs, err := filepathAbs(storeDir()); err == nil {
 		a.storeDirAbs = abs
 	} else {
@@ -347,6 +348,7 @@ func (a *apiServer) routes() []route {
 		{pattern: "/api/pair-phone", handler: a.handlePairPhone, auth: true},
 		{pattern: "/api/send", handler: a.handleSend, auth: true},
 		{pattern: "/api/download", handler: a.handleDownload, auth: true},
+		{pattern: "/api/shutdown", handler: a.handleShutdown, auth: true},
 	}
 }
 
@@ -430,6 +432,40 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		logf("Failed to write response: %v\n", err)
 	}
+}
+
+// requestShutdown asks run() to exit; repeated calls are no-ops and never block.
+func (a *apiServer) requestShutdown() {
+	select {
+	case a.shutdown <- struct{}{}:
+	default:
+	}
+}
+
+// shutdownRequest is the body of POST /api/shutdown.
+type shutdownRequest struct {
+	Version string `json:"version"`
+}
+
+// handleShutdown handles POST /api/shutdown. It only obeys a caller that names the exact
+// version of this build, so a supervisor cannot stop a bridge it did not mean to replace.
+func (a *apiServer) handleShutdown(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req shutdownRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request format", http.StatusBadRequest)
+		return
+	}
+	if req.Version != bridgeVersion {
+		http.Error(w, "Version mismatch", http.StatusConflict)
+		return
+	}
+	logln("Shutdown requested via API")
+	writeJSON(w, http.StatusOK, SendMessageResponse{Success: true, Message: "Shutting down"})
+	a.requestShutdown()
 }
 
 // handleSend handles POST /api/send.
