@@ -38,6 +38,9 @@ EX_TEMPFAIL = 75  # bridge exit code: a peer bridge holds the store lock (runnin
 LOG_ROTATE_BYTES = 5 * 1024 * 1024
 LOG_TAIL_BYTES = 4096
 FAILED_RETRY_SECONDS = 30.0  # a failed start is retried by the next bridge call after this
+# After exit 75, spawn again when the lock-holding peer still does not answer after this long:
+# a peer that is shutting down has closed its listener but holds the lock for up to ~10s.
+PEER_RESPAWN_SECONDS = 2.0
 HEALTH_TIMEOUT = httpx.Timeout(3.0, connect=1.0)
 API_TIMEOUT = httpx.Timeout(30.0, connect=3.0)
 
@@ -490,7 +493,7 @@ class BridgeManager:
             self._done.set()
             return
         proc = self._spawn(binary)
-        self._wait_for_health(proc)
+        self._wait_for_health(proc, binary)
         self.state = "running"
         self._done.set()
 
@@ -521,8 +524,10 @@ class BridgeManager:
                 start_new_session=True,
             )
 
-    def _wait_for_health(self, proc: "subprocess.Popen[bytes] | None") -> None:
+    def _wait_for_health(self, proc: "subprocess.Popen[bytes] | None", binary: str) -> None:
+        """Poll health until the deadline (start timeout), which also bounds the respawns."""
         deadline = time.monotonic() + start_timeout()
+        peer_since = 0.0  # time.monotonic() of the last exit 75, while proc is None
         while time.monotonic() < deadline:
             if self.health() is not None:
                 return
@@ -531,8 +536,13 @@ class BridgeManager:
                 if code == EX_TEMPFAIL:
                     logger.info("bridge peer holds the store lock; waiting for it to answer")
                     proc = None  # a peer won the race: keep polling health
+                    peer_since = time.monotonic()
                 elif code is not None:
                     raise BridgeError(f"bridge exited with code {code}:\n{self.log_tail()}")
+            elif time.monotonic() - peer_since >= PEER_RESPAWN_SECONDS:
+                # The peer may be shutting down rather than starting: try to take over.
+                logger.info("bridge peer still not answering; spawning again")
+                proc = self._spawn(binary)
             time.sleep(0.2)
         raise BridgeError(
             f"bridge did not answer within {start_timeout():.0f}s:\n{self.log_tail()}"

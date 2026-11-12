@@ -3,6 +3,8 @@
 Behaviour is driven by environment variables:
   FAKE_EXIT_EARLY=<code>  print "boom" to stderr and exit immediately
   FAKE_START_DELAY=<s>    sleep after taking the lock, before listening
+  FAKE_EXIT_AFTER=<s>     hold the lock without listening for s seconds, then exit (a peer
+                          that is shutting down: listener closed, lock not yet released)
   FAKE_VERSION            version reported by /api/health (default "fakev")
   FAKE_TOKEN              token required instead of <store>/bridge.token
   FAKE_LOGGED_IN=1        report an already paired account
@@ -61,6 +63,10 @@ def status_body():
         body["qr"] = "2@fakeqrpayload,abc,def"
     return body
 
+
+if os.environ.get("FAKE_EXIT_AFTER"):
+    time.sleep(float(os.environ["FAKE_EXIT_AFTER"]))
+    sys.exit(0)
 
 time.sleep(float(os.environ.get("FAKE_START_DELAY", "0")))
 

@@ -146,6 +146,20 @@ def test_exit_75_keeps_polling_until_peer_answers(env):
     assert spawns(env["store"]) == 1
 
 
+def test_exit_75_from_exiting_peer_respawns(env, monkeypatch):
+    """A peer shutting down holds the lock without listening; respawn once it is gone."""
+    monkeypatch.setattr(bridge_manager, "PEER_RESPAWN_SECONDS", 0.5)
+    monkeypatch.setenv("WHATSAPP_BRIDGE_START_TIMEOUT", "8")
+    start_fake(env, FAKE_EXIT_AFTER="1.5")
+    deadline = time.monotonic() + 5
+    while spawns(env["store"]) == 0 and time.monotonic() < deadline:
+        time.sleep(0.05)  # wait until the peer holds the lock
+    mgr = BridgeManager()
+    mgr.ensure_running()  # first spawn exits 75; a later one takes the lock and answers
+    assert mgr.state == "running"
+    assert spawns(env["store"]) == 2
+
+
 def test_early_exit_reports_log_tail(env, monkeypatch):
     monkeypatch.setenv("FAKE_EXIT_EARLY", "3")
     mgr = BridgeManager()
