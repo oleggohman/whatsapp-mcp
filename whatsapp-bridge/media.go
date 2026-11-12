@@ -113,15 +113,14 @@ func (d *MediaDownloader) GetMediaType() whatsmeow.MediaType {
 }
 
 // Function to download media from a message
-func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string) (bool, string, string, string, error) {
+func downloadMedia(client bridgeClient, messageStore *MessageStore, messageID, chatJID string) (bool, string, string, string, error) {
 	// Query the database for the message
 	var mediaType, filename, url string
 	var mediaKey, fileSHA256, fileEncSHA256 []byte
 	var fileLength uint64
 	var err error
 
-	// First, check if we already have this file
-	chatDir := filepath.Join(storeDir(), strings.ReplaceAll(chatJID, ":", "_"))
+	// Resolved below once the message is known (filename is remote-controlled)
 	localPath := ""
 
 	// Get media info from the database
@@ -144,13 +143,12 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("not a media message")
 	}
 
-	// Create directory for the chat if it doesn't exist
-	if err := os.MkdirAll(chatDir, 0755); err != nil {
-		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
+	// Build a path that is guaranteed to stay under the store dir (filename comes from the remote sender)
+	chatDir, localPath, safeName, err := safeMediaPath(storeDir(), chatJID, filename)
+	if err != nil {
+		return false, "", "", "", err
 	}
-
-	// Generate a local path for the file
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
+	filename = safeName
 
 	// Get absolute path
 	absPath, err := filepath.Abs(localPath)
@@ -164,12 +162,17 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return true, mediaType, filename, absPath, nil
 	}
 
+	// Create directory for the chat if it doesn't exist
+	if err := os.MkdirAll(chatDir, 0755); err != nil {
+		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
+	}
+
 	// If we don't have all the media info we need, we can't download
 	if url == "" || len(mediaKey) == 0 || len(fileSHA256) == 0 || len(fileEncSHA256) == 0 || fileLength == 0 {
 		return false, "", "", "", fmt.Errorf("incomplete media information for download")
 	}
 
-	fmt.Printf("Attempting to download media for message %s in chat %s...\n", messageID, chatJID)
+	fmt.Printf("Attempting to download media for message %s...\n", messageID)
 
 	// Extract direct path from URL
 	directPath := extractDirectPathFromURL(url)
@@ -206,12 +209,64 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Save the downloaded media to file
-	if err := os.WriteFile(localPath, mediaData, 0644); err != nil {
+	if err := os.WriteFile(localPath, mediaData, 0600); err != nil {
 		return false, "", "", "", fmt.Errorf("failed to save media file: %v", err)
 	}
 
 	fmt.Printf("Successfully downloaded %s media to %s (%d bytes)\n", mediaType, absPath, len(mediaData))
 	return true, mediaType, filename, absPath, nil
+}
+
+// sanitizeChatDirName turns a chat JID into a single safe directory name.
+func sanitizeChatDirName(chatJID string) string {
+	name := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '@', r == '.', r == '-', r == '_':
+			return r
+		}
+		return '_'
+	}, chatJID)
+	// A name made only of dots would address the current/parent directory
+	if strings.Trim(name, ".") == "" {
+		return ""
+	}
+	return name
+}
+
+// sanitizeFilename reduces a remote-controlled filename to a bare, non-special file name.
+func sanitizeFilename(filename string) (string, error) {
+	// Treat both separators as separators regardless of OS, then keep the last element
+	name := strings.ReplaceAll(filename, "\\", "/")
+	name = filepath.Base(filepath.FromSlash(name))
+	name = strings.ReplaceAll(name, "\x00", "")
+	if name == "" || name == "." || name == ".." || name == string(filepath.Separator) {
+		return "", fmt.Errorf("invalid media filename %q", filename)
+	}
+	return name, nil
+}
+
+// safeMediaPath returns the chat directory, full file path and sanitized filename for a
+// download, verifying the result resolves under root.
+func safeMediaPath(root, chatJID, filename string) (chatDir, localPath, safeName string, err error) {
+	safeName, err = sanitizeFilename(filename)
+	if err != nil {
+		return "", "", "", err
+	}
+	dirName := sanitizeChatDirName(chatJID)
+	if dirName == "" {
+		return "", "", "", fmt.Errorf("invalid chat JID for media path")
+	}
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return "", "", "", fmt.Errorf("failed to resolve store directory: %v", err)
+	}
+	chatDir = filepath.Join(absRoot, dirName)
+	localPath = filepath.Join(chatDir, safeName)
+	rel, err := filepath.Rel(absRoot, localPath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", "", "", fmt.Errorf("media path escapes store directory")
+	}
+	return chatDir, localPath, safeName, nil
 }
 
 // Extract direct path from a WhatsApp media URL

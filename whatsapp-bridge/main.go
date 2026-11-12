@@ -171,6 +171,21 @@ func main() {
 		}
 	})
 
+	// Start the REST API before connecting; handlers answer "Not connected" until the client is up
+	api := newAPIServer(func() bridgeClient { return client }, messageStore, os.Getenv("WHATSAPP_BRIDGE_TOKEN"), bridgeAddr())
+	restServer, _, err := startRESTServer(bridgeAddr(), api.handler())
+	if err != nil {
+		logger.Errorf("Failed to start REST API server: %v", err)
+		return
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := restServer.Shutdown(ctx); err != nil {
+			logger.Warnf("REST API shutdown: %v", err)
+		}
+	}()
+
 	// Create channel to track connection success
 	connected := make(chan bool, 1)
 
@@ -222,9 +237,6 @@ func main() {
 	}
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
-
-	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
@@ -337,7 +349,7 @@ func handleHistorySync(r *chatResolver, self string, messageStore *MessageStore,
 				}
 
 				// Log the message content for debugging
-				logger.Infof("Message content: %v, Media Type: %v", content, mediaType)
+				logger.Infof("Message: %d text bytes, Media Type: %v", len(content), mediaType)
 
 				// Skip messages with no content and no media
 				if content == "" && mediaType == "" {

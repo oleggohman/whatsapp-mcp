@@ -2,17 +2,41 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"mime"
+	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
 )
+
+const (
+	defaultBridgeAddr = "127.0.0.1:8080"
+	maxRequestBody    = 1 << 20 // 1 MB cap for JSON request bodies
+)
+
+// maxMediaBytes caps the size of a file that may be sent (a var so tests can lower it).
+var maxMediaBytes int64 = 100 << 20
+
+// bridgeClient is the subset of *whatsmeow.Client used by the REST handlers,
+// so tests can substitute a fake.
+type bridgeClient interface {
+	IsConnected() bool
+	Upload(ctx context.Context, plaintext []byte, appInfo whatsmeow.MediaType) (whatsmeow.UploadResponse, error)
+	SendMessage(ctx context.Context, to types.JID, message *waE2E.Message, extra ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error)
+	Download(ctx context.Context, msg whatsmeow.DownloadableMessage) ([]byte, error)
+}
 
 // SendMessageResponse represents the response for the send message API
 type SendMessageResponse struct {
@@ -28,8 +52,8 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
-	if !client.IsConnected() {
+func sendWhatsAppMessage(client bridgeClient, recipient string, message string, mediaPath string) (bool, string) {
+	if client == nil || !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
 
@@ -58,7 +82,12 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 	// Check if we have media to send
 	if mediaPath != "" {
-		// Read media file
+		// Re-validate here so every caller gets the same guarantees as the REST handler
+		if err := validateMediaPath(mediaPath); err != nil {
+			return false, err.Error()
+		}
+
+		// Read media file (path validated above: absolute, regular file, size-capped)
 		mediaData, err := os.ReadFile(mediaPath)
 		if err != nil {
 			return false, fmt.Sprintf("Error reading media file: %v", err)
@@ -113,7 +142,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			return false, fmt.Sprintf("Error uploading media: %v", err)
 		}
 
-		fmt.Println("Media uploaded", resp)
+		fmt.Printf("Media uploaded (%d bytes)\n", resp.FileLength)
 
 		// Create the appropriate message type based on media type
 		switch mediaType {
@@ -210,113 +239,255 @@ type DownloadMediaResponse struct {
 	Path     string `json:"path,omitempty"`
 }
 
-// Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
-	// Handler for sending messages
-	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
-		// Only allow POST requests
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+// validateMediaPath ensures a media path is absolute, points at a regular file and is not too big.
+func validateMediaPath(p string) error {
+	if !filepath.IsAbs(p) {
+		return errors.New("media_path must be an absolute path")
+	}
+	info, err := os.Stat(p)
+	if err != nil {
+		return fmt.Errorf("media_path is not accessible: %v", err)
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("media_path must be a regular file")
+	}
+	if info.Size() > maxMediaBytes {
+		return fmt.Errorf("media file too large (%d bytes, max %d)", info.Size(), maxMediaBytes)
+	}
+	return nil
+}
+
+// bridgeAddr returns the configured REST listen address (loopback by default).
+func bridgeAddr() string {
+	if a := os.Getenv("WHATSAPP_BRIDGE_ADDR"); a != "" {
+		return a
+	}
+	return defaultBridgeAddr
+}
+
+// apiServer holds what the REST handlers need. The client is fetched per request
+// so it can be swapped (or absent) without rebuilding the handler.
+type apiServer struct {
+	client       func() bridgeClient
+	messageStore *MessageStore
+	token        string   // optional bearer token; empty disables auth
+	extraHosts   []string // additional allowed Host names (configured bind host)
+}
+
+// route is one API endpoint plus its guard policy.
+type route struct {
+	pattern string
+	handler http.HandlerFunc
+	auth    bool // requires the bearer token when one is configured
+}
+
+// newAPIServer builds an apiServer; addr is the configured listen address, whose host
+// (when it is a concrete name/IP) joins the Host allowlist.
+func newAPIServer(client func() bridgeClient, store *MessageStore, token, addr string) *apiServer {
+	a := &apiServer{client: client, messageStore: store, token: token}
+	if host, _, err := net.SplitHostPort(addr); err == nil && host != "" {
+		if ip := net.ParseIP(host); ip == nil || !ip.IsUnspecified() {
+			a.extraHosts = append(a.extraHosts, strings.ToLower(host))
+		}
+	}
+	return a
+}
+
+// routes lists all endpoints; later tasks add entries here with their own auth flag.
+func (a *apiServer) routes() []route {
+	return []route{
+		{pattern: "/api/send", handler: a.handleSend, auth: true},
+		{pattern: "/api/download", handler: a.handleDownload, auth: true},
+	}
+}
+
+// handler returns the guarded mux.
+func (a *apiServer) handler() http.Handler {
+	mux := http.NewServeMux()
+	for _, rt := range a.routes() {
+		mux.Handle(rt.pattern, a.guard(rt.auth, rt.handler))
+	}
+	return mux
+}
+
+// hostAllowed reports whether the request Host names this machine (DNS-rebinding defence).
+func (a *apiServer) hostAllowed(hostport string) bool {
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	host = strings.ToLower(strings.Trim(host, "[]"))
+	switch host {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	for _, h := range a.extraHosts {
+		if host == strings.Trim(h, "[]") {
+			return true
+		}
+	}
+	return false
+}
+
+// tokenOK compares the bearer token in constant time.
+func (a *apiServer) tokenOK(r *http.Request) bool {
+	got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if !ok {
+		return false
+	}
+	want := sha256.Sum256([]byte(a.token))
+	have := sha256.Sum256([]byte(got))
+	return subtle.ConstantTimeCompare(want[:], have[:]) == 1
+}
+
+// guard rejects requests that could come from a browser or a rebinding attack and
+// enforces the optional token on routes that need it.
+func (a *apiServer) guard(auth bool, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !a.hostAllowed(r.Host) {
+			http.Error(w, "Forbidden host", http.StatusForbidden)
 			return
 		}
-
-		// Parse the request body
-		var req SendMessageRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid request format", http.StatusBadRequest)
+		// Legit clients (MCP server, curl) never send Origin; browsers always do on cross-site POSTs
+		if r.Header.Get("Origin") != "" {
+			http.Error(w, "Browser-originated requests are not allowed", http.StatusForbidden)
 			return
 		}
-
-		// Validate request
-		if req.Recipient == "" {
-			http.Error(w, "Recipient is required", http.StatusBadRequest)
+		if auth && a.token != "" && !a.tokenOK(r) {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
-
-		if req.Message == "" && req.MediaPath == "" {
-			http.Error(w, "Message or media path is required", http.StatusBadRequest)
-			return
-		}
-
-		fmt.Println("Received request to send message", req.Message, req.MediaPath)
-
-		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
-		fmt.Println("Message sent", success, message)
-		// Set response headers
-		w.Header().Set("Content-Type", "application/json")
-
-		// Set appropriate status code
-		if !success {
-			w.WriteHeader(http.StatusInternalServerError)
-		}
-
-		// Send response
-		json.NewEncoder(w).Encode(SendMessageResponse{
-			Success: success,
-			Message: message,
-		})
-	})
-
-	// Handler for downloading media
-	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
-		// Only allow POST requests
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		// Parse the request body
-		var req DownloadMediaRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid request format", http.StatusBadRequest)
-			return
-		}
-
-		// Validate request
-		if req.MessageID == "" || req.ChatJID == "" {
-			http.Error(w, "Message ID and Chat JID are required", http.StatusBadRequest)
-			return
-		}
-
-		// Download the media
-		success, mediaType, filename, path, err := downloadMedia(client, messageStore, req.MessageID, req.ChatJID)
-
-		// Set response headers
-		w.Header().Set("Content-Type", "application/json")
-
-		// Handle download result
-		if !success || err != nil {
-			errMsg := "Unknown error"
-			if err != nil {
-				errMsg = err.Error()
+		// Only requests with bodies need the JSON content type; it forces a CORS preflight in browsers
+		if r.Method == http.MethodPost {
+			mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+			if err != nil || mt != "application/json" {
+				http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
+				return
 			}
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+		next(w, r)
+	}
+}
 
-			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(DownloadMediaResponse{
-				Success: false,
-				Message: fmt.Sprintf("Failed to download media: %s", errMsg),
-			})
+// writeJSON writes v as JSON with the given status, logging encode failures.
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		fmt.Printf("Failed to write response: %v\n", err)
+	}
+}
+
+// handleSend handles POST /api/send.
+func (a *apiServer) handleSend(w http.ResponseWriter, r *http.Request) {
+	// Only allow POST requests
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse the request body
+	var req SendMessageRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request format", http.StatusBadRequest)
+		return
+	}
+
+	// Validate request
+	if req.Recipient == "" {
+		http.Error(w, "Recipient is required", http.StatusBadRequest)
+		return
+	}
+
+	if req.Message == "" && req.MediaPath == "" {
+		http.Error(w, "Message or media path is required", http.StatusBadRequest)
+		return
+	}
+
+	if req.MediaPath != "" {
+		if err := validateMediaPath(req.MediaPath); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+	}
 
-		// Send successful response
-		json.NewEncoder(w).Encode(DownloadMediaResponse{
-			Success:  true,
-			Message:  fmt.Sprintf("Successfully downloaded %s media", mediaType),
-			Filename: filename,
-			Path:     path,
+	// Log metadata only, never message bodies
+	fmt.Printf("Received request to send message (text %d bytes, media %t)\n", len(req.Message), req.MediaPath != "")
+
+	// Send the message
+	success, message := sendWhatsAppMessage(a.client(), req.Recipient, req.Message, req.MediaPath)
+	fmt.Println("Message sent", success)
+
+	status := http.StatusOK
+	if !success {
+		status = http.StatusInternalServerError
+	}
+	writeJSON(w, status, SendMessageResponse{Success: success, Message: message})
+}
+
+// handleDownload handles POST /api/download.
+func (a *apiServer) handleDownload(w http.ResponseWriter, r *http.Request) {
+	// Only allow POST requests
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse the request body
+	var req DownloadMediaRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request format", http.StatusBadRequest)
+		return
+	}
+
+	// Validate request
+	if req.MessageID == "" || req.ChatJID == "" {
+		http.Error(w, "Message ID and Chat JID are required", http.StatusBadRequest)
+		return
+	}
+
+	// Download the media
+	success, mediaType, filename, path, err := downloadMedia(a.client(), a.messageStore, req.MessageID, req.ChatJID)
+
+	// Handle download result
+	if !success || err != nil {
+		errMsg := "Unknown error"
+		if err != nil {
+			errMsg = err.Error()
+		}
+		writeJSON(w, http.StatusInternalServerError, DownloadMediaResponse{
+			Success: false,
+			Message: fmt.Sprintf("Failed to download media: %s", errMsg),
 		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, DownloadMediaResponse{
+		Success:  true,
+		Message:  fmt.Sprintf("Successfully downloaded %s media", mediaType),
+		Filename: filename,
+		Path:     path,
 	})
+}
 
-	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
-	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
-
-	// Run server in a goroutine so it doesn't block
+// startRESTServer binds addr synchronously (so bind errors surface) and serves handler
+// in the background. Call Shutdown on the returned server to stop it.
+func startRESTServer(addr string, handler http.Handler) (*http.Server, net.Addr, error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to listen on %s: %w", addr, err)
+	}
+	srv := &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+	}
+	fmt.Printf("Starting REST API server on %s...\n", ln.Addr())
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
+	return srv, ln.Addr(), nil
 }
