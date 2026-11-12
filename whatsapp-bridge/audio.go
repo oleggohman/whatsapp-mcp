@@ -8,95 +8,73 @@ import (
 	"math/rand"
 )
 
-// analyzeOggOpus tries to extract duration and generate a simple waveform from an Ogg Opus file
+// opusHeadMinLen is the minimum size of an OpusHead packet:
+// magic(8) + version(1) + channels(1) + preSkip(2) + sampleRate(4) + gain(2) + mapping(1).
+const opusHeadMinLen = 19
+
+// opusGranuleRate is the fixed rate Opus granule positions are expressed in (RFC 7845).
+const opusGranuleRate = 48000
+
+// analyzeOggOpus extracts the duration from an Ogg Opus file and generates a placeholder waveform
 func analyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
-	// Try to detect if this is a valid Ogg file by checking for the "OggS" signature
-	// at the beginning of the file
 	if len(data) < 4 || string(data[0:4]) != "OggS" {
 		return 0, nil, fmt.Errorf("not a valid Ogg file (missing OggS signature)")
 	}
 
-	// Parse Ogg pages to find the last page with a valid granule position
 	var lastGranule uint64
-	var sampleRate uint32 = 48000 // Default Opus sample rate
-	var preSkip uint16 = 0
+	var preSkip uint16
 	var foundOpusHead bool
 
-	// Scan through the file looking for Ogg pages
 	for i := 0; i < len(data); {
-		// Check if we have enough data to read Ogg page header
-		if i+27 >= len(data) {
+		// Need a full fixed header (27 bytes) to read page fields
+		if i+27 > len(data) {
 			break
 		}
-
-		// Verify Ogg page signature
 		if string(data[i:i+4]) != "OggS" {
-			// Skip until next potential page
 			i++
 			continue
 		}
 
-		// Extract header fields
 		granulePos := binary.LittleEndian.Uint64(data[i+6 : i+14])
 		pageSeqNum := binary.LittleEndian.Uint32(data[i+18 : i+22])
 		numSegments := int(data[i+26])
 
-		// Extract segment table
-		if i+27+numSegments >= len(data) {
+		if i+27+numSegments > len(data) {
 			break
 		}
-		segmentTable := data[i+27 : i+27+numSegments]
-
-		// Calculate page size
 		pageSize := 27 + numSegments
-		for _, segLen := range segmentTable {
+		for _, segLen := range data[i+27 : i+27+numSegments] {
 			pageSize += int(segLen)
 		}
+		// Truncated page: stop rather than slice out of range
+		if i+pageSize > len(data) {
+			break
+		}
 
-		// Check if we're looking at an OpusHead packet (should be in first few pages)
 		if !foundOpusHead && pageSeqNum <= 1 {
-			// Look for "OpusHead" marker in this page
 			pageData := data[i : i+pageSize]
-			headPos := bytes.Index(pageData, []byte("OpusHead"))
-			if headPos >= 0 && headPos+12 < len(pageData) {
-				// Found OpusHead, extract sample rate and pre-skip
-				// OpusHead format: Magic(8) + Version(1) + Channels(1) + PreSkip(2) + SampleRate(4) + ...
-				headPos += 8 // Skip "OpusHead" marker
-				// PreSkip is 2 bytes at offset 10
-				if headPos+12 <= len(pageData) {
-					preSkip = binary.LittleEndian.Uint16(pageData[headPos+10 : headPos+12])
-					sampleRate = binary.LittleEndian.Uint32(pageData[headPos+12 : headPos+16])
-					foundOpusHead = true
-					fmt.Printf("Found OpusHead: sampleRate=%d, preSkip=%d\n", sampleRate, preSkip)
-				}
+			if headPos := bytes.Index(pageData, []byte("OpusHead")); headPos >= 0 &&
+				headPos+opusHeadMinLen <= len(pageData) {
+				// PreSkip is a little-endian uint16 at offset 10 from the magic start
+				preSkip = binary.LittleEndian.Uint16(pageData[headPos+10 : headPos+12])
+				foundOpusHead = true
 			}
 		}
 
-		// Keep track of last valid granule position
-		if granulePos != 0 {
+		// 0xFFFFFFFFFFFFFFFF means "no granule position" for this page
+		if granulePos != 0 && granulePos != math.MaxUint64 {
 			lastGranule = granulePos
 		}
 
-		// Move to next page
 		i += pageSize
 	}
 
-	if !foundOpusHead {
-		fmt.Println("Warning: OpusHead not found, using default values")
-	}
-
-	// Calculate duration based on granule position
-	if lastGranule > 0 {
-		// Formula for duration: (lastGranule - preSkip) / sampleRate
-		durationSeconds := float64(lastGranule-uint64(preSkip)) / float64(sampleRate)
+	if lastGranule > uint64(preSkip) {
+		durationSeconds := float64(lastGranule-uint64(preSkip)) / opusGranuleRate
 		duration = uint32(math.Ceil(durationSeconds))
-		fmt.Printf("Calculated Opus duration from granule: %f seconds (lastGranule=%d)\n",
-			durationSeconds, lastGranule)
 	} else {
-		// Fallback to rough estimation if granule position not found
-		fmt.Println("Warning: No valid granule position found, using estimation")
-		durationEstimate := float64(len(data)) / 2000.0 // Very rough approximation
-		duration = uint32(durationEstimate)
+		// No usable granule position: fall back to a rough size-based estimate
+		duration = uint32(float64(len(data)) / 2000.0)
 	}
 
 	// Make sure we have a reasonable duration (at least 1 second, at most 300 seconds)
@@ -106,12 +84,7 @@ func analyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 		duration = 300
 	}
 
-	// Generate waveform
 	waveform = placeholderWaveform(duration)
-
-	fmt.Printf("Ogg Opus analysis: size=%d bytes, calculated duration=%d sec, waveform=%d bytes\n",
-		len(data), duration, len(waveform))
-
 	return duration, waveform, nil
 }
 
