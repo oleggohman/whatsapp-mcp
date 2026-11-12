@@ -657,3 +657,43 @@ func TestFailedConnectKeepsClientWhenReplacementFails(t *testing.T) {
 		t.Fatal("client must stay when no replacement can be built")
 	}
 }
+
+// A timeout teardown that runs while StartPairing is arming a new session on the same
+// client must not disconnect that new session.
+func TestQRTeardownDoesNotKillNewSession(t *testing.T) {
+	fw := newFakeWA(false)
+	pm := newTestPairing(fw, nil)
+	s, err := pm.StartPairing()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pm.startMu.Lock() // a StartPairing is in progress
+	done := make(chan struct{})
+	go func() {
+		pm.handleQR(s, whatsmeow.QRChannelTimeout)
+		close(done)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	// StartPairing finishes arming the next session before releasing startMu.
+	s2 := &pairSession{client: fw, cancel: func() {}, firstCode: make(chan struct{})}
+	pm.mu.Lock()
+	pm.sess = s2
+	pm.mu.Unlock()
+	pm.startMu.Unlock()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handleQR did not return")
+	}
+	if _, d, _ := fw.counts(); d != 0 {
+		t.Fatalf("stale teardown disconnected the new session (disconnects=%d)", d)
+	}
+	pm.mu.Lock()
+	active := pm.sess == s2
+	pm.mu.Unlock()
+	if !active {
+		t.Fatal("stale teardown ended the new session")
+	}
+}

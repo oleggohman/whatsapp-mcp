@@ -254,6 +254,17 @@ func (pm *pairingManager) handleQR(s *pairSession, item whatsmeow.QRChannelItem)
 		pm.mu.Unlock()
 	default:
 		// timeout, error, err-*: stop trying and go idle until asked again (no process exit).
+		// Tear down under startMu (lock order startMu, then mu) so a StartPairing on the same
+		// client cannot connect a new session between the teardown and the Disconnect below.
+		pm.mu.Unlock()
+		pm.startMu.Lock()
+		defer pm.startMu.Unlock()
+		pm.mu.Lock()
+		if pm.sess != s {
+			// Already ended elsewhere (success, logout or a newer session): nothing to tear down.
+			pm.mu.Unlock()
+			return
+		}
 		pm.endSessionLocked(s)
 		pm.mu.Unlock()
 		if item.Error != nil {
