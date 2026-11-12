@@ -1,6 +1,6 @@
 # WhatsApp MCP Server
 
-[![CI](https://github.com/oleggohman/cc-things/actions/workflows/ci.yml/badge.svg)](https://github.com/oleggohman/cc-things/actions/workflows/ci.yml)
+[![CI](https://github.com/oleggohman/whatsapp-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/oleggohman/whatsapp-mcp/actions/workflows/ci.yml)
 
 A Model Context Protocol (MCP) server that lets Claude (Claude Desktop, Claude Code) or any other MCP client search and read your personal WhatsApp messages and send messages and media. It connects to your own WhatsApp account as a linked device through WhatsApp's multi-device API, using the [whatsmeow](https://github.com/tulir/whatsmeow) library. Your messages are stored locally in SQLite. They reach the language model only when a tool returns them.
 
@@ -46,7 +46,7 @@ This project is a fork of [lharries/whatsapp-mcp](https://github.com/lharries/wh
 
 ### Option A: release archive (no Go needed)
 
-1. Download the archive for your OS from the [Releases page](https://github.com/oleggohman/cc-things/releases) (`darwin-arm64`, `darwin-amd64`, `linux-amd64` or `windows-amd64`), together with `SHA256SUMS`.
+1. Download the archive for your OS from the [Releases page](https://github.com/oleggohman/whatsapp-mcp/releases) (`darwin-arm64`, `darwin-amd64`, `linux-amd64` or `windows-amd64`), together with `SHA256SUMS`.
 2. Verify it: `sha256sum -c SHA256SUMS --ignore-missing` (macOS: `shasum -a 256 -c SHA256SUMS --ignore-missing`).
 3. Extract it. The prebuilt bridge is at `whatsapp-bridge/whatsapp-bridge`.
 4. On macOS the binary is unsigned and Gatekeeper blocks it. Remove the quarantine flag once:
@@ -58,7 +58,7 @@ This project is a fork of [lharries/whatsapp-mcp](https://github.com/lharries/wh
 ### Option B: from source
 
 ```bash
-git clone https://github.com/oleggohman/cc-things.git whatsapp-mcp
+git clone https://github.com/oleggohman/whatsapp-mcp.git
 cd whatsapp-mcp
 ```
 
