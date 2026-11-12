@@ -183,7 +183,7 @@ MCP client (Claude)  <-- stdio -->  Python MCP server  <-- REST, localhost -->  
                                           +------ reads (read-only) ------ SQLite store: messages.db, whatsapp.db
 ```
 
-1. **Go bridge** (`whatsapp-bridge/`) connects to WhatsApp, handles pairing, and writes message history to `messages.db`. It serves a small REST API: `/api/health`, `/api/status`, `/api/start-pairing`, `/api/pair-phone`, `/api/reconnect`, `/api/send`, `/api/download`. `GET /api/status` is read-only. Every state change is a `POST`.
+1. **Go bridge** (`whatsapp-bridge/`) connects to WhatsApp, handles pairing, and writes message history to `messages.db`. It serves a small REST API: `/api/health`, `/api/status`, `/api/start-pairing`, `/api/pair-phone`, `/api/reconnect`, `/api/send`, `/api/download`, `/api/shutdown`. `GET /api/status` is read-only. Every state change is a `POST`.
 2. **Python MCP server** (`whatsapp-mcp-server/`) implements the tools. It reads `messages.db` read-only and calls the bridge for sending, downloading and pairing.
 
 The store directory defaults to `whatsapp-bridge/store`. It holds `messages.db`, `whatsapp.db` (the whatsmeow session), `bridge.token`, `bridge.lock`, `bridge.log` and downloaded media.
@@ -195,7 +195,8 @@ The bridge is a shared daemon, one per store directory. Any MCP client starts it
 - **Stopping it.** Set `WHATSAPP_BRIDGE_IDLE_EXIT` (for example `30m`) so it exits after that long without API activity. Only bridge calls count: send, download, pairing and `get_connection_status`. Or kill it: `curl -s http://127.0.0.1:8080/api/health` shows its `pid`, then run `kill <pid>`.
 - **Restarting.** The next tool call that needs the bridge starts a new one. The MCP client does not need a restart. A failed start is retried 30 seconds later.
 - **Stale reads after an idle exit.** The read tools never start the bridge, so they return history only up to the exit. Call `get_connection_status` first when you need fresh messages.
-- **After you update the repository,** the running daemon keeps the old build. `get_connection_status` shows `restart_needed: true` (only for a bridge the server built from source). Kill the daemon. The next bridge call rebuilds and starts the new version.
+- **After you update the plugin or the repository,** restart the MCP server (for example, reconnect it under `/mcp` in Claude Code). On startup the server notices that the running bridge was built from older sources, builds the new version while the old bridge keeps serving, asks the old bridge to shut down (`POST /api/shutdown`), and starts the new one. The WhatsApp login is kept. Bridges older than 0.3.0 have no shutdown endpoint and are stopped with `SIGTERM` instead, after the server checks that the bridge accepts its token. Another open Claude session loses at most one call and then reuses the new bridge.
+- **When it is not replaced automatically,** `get_connection_status` shows `restart_needed: true` with a hint. This happens while a pairing is in progress, when Go is not installed, for a prebuilt (release) binary, on Windows, and when the bridge stops in the middle of a session rather than at server startup. Kill the daemon as the hint says. The next bridge call rebuilds and starts the new version.
 - **One bridge per WhatsApp login.** The bridge locks `<store>/bridge.lock` and exits with code 75 when another bridge holds it. The lock does not cover copies of a store. A second process that connects with the same login makes WhatsApp disconnect the first one, and the first reports `pairing: "replaced"`.
 
 ### Manual two-process mode
@@ -244,7 +245,7 @@ No variable is required. The Go bridge and the Python server read the same names
 
 ## Upgrading from the original (lharries) version
 
-1. **Back up `whatsapp-bridge/store/`** (or your `WHATSAPP_STORE_DIR`). The new bridge migrates `whatsapp.db` on first run. The migration is one-way: older versions cannot read the result.
+1. **Back up `whatsapp-bridge/store/`** (or your `WHATSAPP_STORE_DIR`) before you update. The new bridge migrates `whatsapp.db` on first run, and a stale bridge is replaced automatically when the MCP server starts. The migration is one-way: older versions cannot read the result.
 2. **Stop the old bridge.** Only one bridge may run per WhatsApp login.
 3. Register the MCP server as described in [Connect to Claude](#connect-to-claude). The old `go run main.go` workflow is replaced by the tools above.
 
