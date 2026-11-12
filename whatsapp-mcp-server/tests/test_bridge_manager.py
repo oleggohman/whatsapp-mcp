@@ -1,5 +1,6 @@
 """Bridge supervisor: build, spawn, shared-daemon reuse and pairing tools (fake bridge + go)."""
 
+import errno
 import os
 import signal
 import socket
@@ -220,6 +221,37 @@ def test_empty_token_file_from_crash_is_replaced(env):
     token = bridge_manager.ensure_token()
     assert len(token) == 64 and stale.read_text() == token
     assert oct(stale.stat().st_mode & 0o777) == "0o600"
+    assert sorted(p.name for p in env["store"].iterdir()) == ["bridge.token"]
+
+
+def test_concurrent_recovery_of_empty_token_yields_one_token(env):
+    """Two clients finding the same stale empty file must not overwrite each other's token."""
+    env["store"].mkdir()
+    (env["store"] / "bridge.token").touch(mode=0o600)
+    results: list[str] = []
+    threads = [
+        threading.Thread(target=lambda: results.append(bridge_manager.ensure_token()))
+        for _ in range(2)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(15)
+    assert len(results) == 2 and len(set(results)) == 1 and len(results[0]) == 64
+    assert (env["store"] / "bridge.token").read_text() == results[0]
+
+
+def test_token_created_without_hard_link_support(env, monkeypatch):
+    """Filesystems without hard links fall back to an exclusive create."""
+
+    def no_link(src, dst, **kw):
+        raise OSError(errno.EPERM, "hard links not supported")
+
+    monkeypatch.setattr(bridge_manager.os, "link", no_link)
+    token = bridge_manager.ensure_token()
+    path = env["store"] / "bridge.token"
+    assert len(token) == 64 and path.read_text() == token
+    assert oct(path.stat().st_mode & 0o777) == "0o600"
     assert sorted(p.name for p in env["store"].iterdir()) == ["bridge.token"]
 
 

@@ -21,6 +21,11 @@ from urllib.parse import urlsplit
 
 import httpx
 
+try:
+    import fcntl
+except ImportError:  # Windows: recovery runs without the advisory lock
+    fcntl = None  # type: ignore[assignment]
+
 logger = logging.getLogger(__name__)
 
 SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -116,6 +121,52 @@ def read_token() -> str | None:
         return None
 
 
+def _create_token_file(tmp: str, path: str, token: str) -> bool:
+    """Atomically create path holding token; False when path already exists.
+
+    Hard-links the fully written temp file into place. Filesystems without hard links
+    (exFAT, some network mounts) fall back to O_CREAT|O_EXCL plus write and fsync.
+    """
+    try:
+        os.link(tmp, path)
+        return True
+    except FileExistsError:
+        return False
+    except OSError:
+        pass
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return False
+    with open(fd, "w", encoding="utf-8") as f:
+        f.write(token)
+        f.flush()
+        os.fsync(f.fileno())
+    return True
+
+
+def _recover_empty_token(tmp: str, path: str, token: str) -> str:
+    """Replace a stale empty token file; concurrent clients end up with one token.
+
+    The recovery runs under an exclusive advisory lock on the store directory and re-reads
+    the file under it, so only the first client replaces the file and the rest read its token.
+    """
+    lock_fd = None
+    if fcntl is not None:
+        lock_fd = os.open(os.path.dirname(path), os.O_RDONLY)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    try:
+        existing = read_token()
+        if existing:
+            return existing
+        logger.warning("token file %s is empty (left by a crash); replacing it", path)
+        os.replace(tmp, path)
+        return token
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+
+
 def ensure_token() -> str:
     """Return the token, creating <store>/bridge.token (0600) if needed.
 
@@ -137,20 +188,15 @@ def ensure_token() -> str:
             f.write(token)
             f.flush()
             os.fsync(f.fileno())
-        try:
-            os.link(tmp, path)
+        if _create_token_file(tmp, path, token):
             return token
-        except FileExistsError:
-            pass
         # A peer created it first; an older peer may still be writing, so retry briefly.
         for _ in range(50):
             existing = read_token()
             if existing:
                 return existing
             time.sleep(0.05)
-        logger.warning("token file %s is empty (left by a crash); replacing it", path)
-        os.replace(tmp, path)
-        return read_token() or token
+        return _recover_empty_token(tmp, path, token)
     except OSError as e:
         raise BridgeError(f"could not create token file {path}: {e}") from e
     finally:
