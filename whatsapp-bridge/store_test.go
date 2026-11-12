@@ -33,7 +33,7 @@ func TestStoreDir(t *testing.T) {
 
 func TestSqliteDSNEscapes(t *testing.T) {
 	got := sqliteDSN("/a b/c?d#e%f/messages.db")
-	want := "file:/a b/c%3fd%23e%25f/messages.db?_foreign_keys=on"
+	want := "file:/a b/c%3fd%23e%25f/messages.db?_foreign_keys=on&_busy_timeout=5000"
 	if got != want {
 		t.Fatalf("got %q want %q", got, want)
 	}
@@ -200,5 +200,21 @@ func TestGetMediaInfoMissingRow(t *testing.T) {
 	_, _, _, _, _, _, _, err := s.GetMediaInfo("nope", "a@s.whatsapp.net")
 	if !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("want sql.ErrNoRows, got %v", err)
+	}
+}
+
+func TestMessagesDSNOptions(t *testing.T) {
+	got := messagesDSN("/x/messages.db")
+	want := "file:/x/messages.db?_foreign_keys=on&_busy_timeout=5000&_txlock=immediate&_journal_mode=WAL"
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
+func TestNewMessageStoreUsesWAL(t *testing.T) {
+	s := newTestStore(t)
+	var mode string
+	if err := s.db.QueryRow("PRAGMA journal_mode").Scan(&mode); err != nil || mode != "wal" {
+		t.Fatalf("journal_mode = %q, %v", mode, err)
 	}
 }

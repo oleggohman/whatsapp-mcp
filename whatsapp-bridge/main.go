@@ -7,13 +7,13 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"reflect"
 	"syscall"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -21,13 +21,24 @@ import (
 )
 
 // Handle regular incoming messages with media support
-func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
-	// Save message to database
-	chatJID := msg.Info.Chat.String()
-	sender := msg.Info.Sender.User
+func handleMessage(r *chatResolver, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
+	ctx := context.Background()
 
-	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
-	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
+	// Normalize LID addressing to phone numbers where a mapping is known
+	chat := messageChatJID(ctx, r.lids, &msg.Info)
+	chatJID := chat.String()
+	sender := messageSenderUser(ctx, r.lids, &msg.Info)
+	r.mergeIfMapped(ctx, msg.Info.Chat, chat)
+
+	// Name hints only make sense for the other party of an incoming DM
+	var hints nameHints
+	if !msg.Info.IsFromMe && !msg.Info.IsGroup {
+		hints.pushName = msg.Info.PushName
+		if vn := msg.Info.VerifiedName; vn != nil && vn.Details != nil {
+			hints.verifiedName = vn.Details.GetVerifiedName()
+		}
+	}
+	name := r.chatName(ctx, chat, hints)
 
 	// Update chat in database with the message timestamp (keeps last message time updated)
 	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
@@ -130,19 +141,30 @@ func main() {
 	}
 	defer messageStore.Close()
 
+	resolver := newChatResolver(messageStore, client.Store.Contacts, client.Store.LIDs,
+		func(ctx context.Context, jid types.JID) (string, error) {
+			info, err := client.GetGroupInfo(ctx, jid)
+			if err != nil {
+				return "", err
+			}
+			return info.Name, nil
+		})
+
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.Message:
 			// Process regular messages
-			handleMessage(client, messageStore, v, logger)
+			handleMessage(resolver, messageStore, v, logger)
 
 		case *events.HistorySync:
 			// Process history sync events
-			handleHistorySync(client, messageStore, v, logger)
+			handleHistorySync(resolver, selfUser(client), messageStore, v, logger)
+			resolver.trigger()
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+			resolver.trigger()
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
@@ -218,93 +240,27 @@ func main() {
 	client.Disconnect()
 }
 
-// GetChatName determines the appropriate name for a chat based on JID and other info
-func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, logger waLog.Logger) string {
-	// First, check if chat already exists in database with a name
-	var existingName string
-	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
-	if err == nil && existingName != "" {
-		// Chat exists with a name, use that
-		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
-		return existingName
+// selfUser returns the bare user digits of the logged-in account ("" before pairing).
+func selfUser(client *whatsmeow.Client) string {
+	if client.Store.ID == nil {
+		return ""
 	}
+	return client.Store.ID.User
+}
 
-	// Need to determine chat name
-	var name string
-
-	if jid.Server == "g.us" {
-		// This is a group chat
-		logger.Infof("Getting name for group: %s", chatJID)
-
-		// Use conversation data if provided (from history sync)
-		if conversation != nil {
-			// Extract name from conversation if available
-			// This uses type assertions to handle different possible types
-			var displayName, convName *string
-			// Try to extract the fields we care about regardless of the exact type
-			v := reflect.ValueOf(conversation)
-			if v.Kind() == reflect.Ptr && !v.IsNil() {
-				v = v.Elem()
-
-				// Try to find DisplayName field
-				if displayNameField := v.FieldByName("DisplayName"); displayNameField.IsValid() && displayNameField.Kind() == reflect.Ptr && !displayNameField.IsNil() {
-					dn := displayNameField.Elem().String()
-					displayName = &dn
-				}
-
-				// Try to find Name field
-				if nameField := v.FieldByName("Name"); nameField.IsValid() && nameField.Kind() == reflect.Ptr && !nameField.IsNil() {
-					n := nameField.Elem().String()
-					convName = &n
-				}
-			}
-
-			// Use the name we found
-			if displayName != nil && *displayName != "" {
-				name = *displayName
-			} else if convName != nil && *convName != "" {
-				name = *convName
-			}
-		}
-
-		// If we didn't get a name, try group info
-		if name == "" {
-			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
-			if err == nil && groupInfo.Name != "" {
-				name = groupInfo.Name
-			} else {
-				// Fallback name for groups
-				name = fmt.Sprintf("Group %s", jid.User)
-			}
-		}
-
-		logger.Infof("Using group name: %s", name)
-	} else {
-		// This is an individual contact
-		logger.Infof("Getting name for contact: %s", chatJID)
-
-		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
-		if err == nil && contact.FullName != "" {
-			name = contact.FullName
-		} else if sender != "" {
-			// Fallback to sender
-			name = sender
-		} else {
-			// Last fallback to JID
-			name = jid.User
-		}
-
-		logger.Infof("Using contact name: %s", name)
+// conversationName returns the best name carried by a history-sync conversation.
+func conversationName(conv *waHistorySync.Conversation) string {
+	if n := conv.GetName(); n != "" {
+		return n
 	}
-
-	return name
+	return conv.GetDisplayName()
 }
 
 // Handle history sync events
-func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, historySync *events.HistorySync, logger waLog.Logger) {
+func handleHistorySync(r *chatResolver, self string, messageStore *MessageStore, historySync *events.HistorySync, logger waLog.Logger) {
 	fmt.Printf("Received history sync event with %d conversations\n", len(historySync.Data.Conversations))
 
+	ctx := context.Background()
 	syncedCount := 0
 	for _, conversation := range historySync.Data.Conversations {
 		// Parse JID from the conversation
@@ -312,17 +268,29 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			continue
 		}
 
-		chatJID := *conversation.ID
-
 		// Try to parse the JID
-		jid, err := types.ParseJID(chatJID)
+		origJID, err := types.ParseJID(*conversation.ID)
 		if err != nil {
-			logger.Warnf("Failed to parse JID %s: %v", chatJID, err)
+			logger.Warnf("Failed to parse JID %s: %v", *conversation.ID, err)
 			continue
 		}
 
-		// Get appropriate chat name by passing the history sync conversation directly
-		name := GetChatName(client, messageStore, jid, chatJID, conversation, "", logger)
+		// Normalize LID chats to their phone number; the conversation may carry the PN itself
+		var altPN types.JID
+		if pn := conversation.GetPnJID(); pn != "" {
+			altPN, _ = types.ParseJID(pn)
+		}
+		jid := normalizeJID(ctx, r.lids, origJID, altPN)
+		chatJID := jid.String()
+		r.mergeIfMapped(ctx, origJID, jid)
+		if lidStr := conversation.GetLidJID(); lidStr != "" && jid.Server == types.DefaultUserServer {
+			if lid, err := types.ParseJID(lidStr); err == nil {
+				r.mergeIfMapped(ctx, lid, jid)
+			}
+		}
+
+		// Get appropriate chat name from the stored name, contacts and the conversation itself
+		name := r.chatName(ctx, jid, nameHints{convName: conversationName(conversation)})
 
 		// Process messages
 		messages := conversation.Messages
@@ -376,23 +344,18 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					continue
 				}
 
-				// Determine sender
-				var sender string
+				// Determine sender (always bare user digits)
 				isFromMe := false
+				participant := ""
 				if msg.Message.Key != nil {
 					if msg.Message.Key.FromMe != nil {
 						isFromMe = *msg.Message.Key.FromMe
 					}
-					if !isFromMe && msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "" {
-						sender = *msg.Message.Key.Participant
-					} else if isFromMe {
-						sender = client.Store.ID.User
-					} else {
-						sender = jid.User
+					if msg.Message.Key.Participant != nil {
+						participant = *msg.Message.Key.Participant
 					}
-				} else {
-					sender = jid.User
 				}
+				sender := historySender(ctx, r.lids, participant, isFromMe, jid, self)
 
 				// Store message
 				msgID := ""

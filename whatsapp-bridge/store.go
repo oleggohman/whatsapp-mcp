@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -9,6 +10,8 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	"go.mau.fi/whatsmeow/store"
+	"go.mau.fi/whatsmeow/types"
 )
 
 // defaultStoreDir is used when WHATSAPP_STORE_DIR is not set.
@@ -25,7 +28,23 @@ func storeDir() string {
 // sqliteDSN builds a go-sqlite3 file: DSN for path, escaping URI-special characters.
 func sqliteDSN(path string) string {
 	escaped := strings.NewReplacer("%", "%25", "?", "%3f", "#", "%23").Replace(path)
-	return "file:" + escaped + "?_foreign_keys=on"
+	return "file:" + escaped + "?_foreign_keys=on&_busy_timeout=5000"
+}
+
+// messagesDSN is sqliteDSN plus immediate write transactions and WAL, so the repair
+// pass and the Python reader (mode=ro) do not block each other.
+func messagesDSN(path string) string {
+	return sqliteDSN(path) + "&_txlock=immediate&_journal_mode=WAL"
+}
+
+// messagesDBPath returns the location of messages.db.
+func messagesDBPath() string {
+	return filepath.Join(storeDir(), "messages.db")
+}
+
+// openMessagesDB opens messages.db with the standard DSN options.
+func openMessagesDB(path string) (*sql.DB, error) {
+	return sql.Open("sqlite3", messagesDSN(path))
 }
 
 // Message represents a chat message for our client
@@ -51,7 +70,7 @@ func NewMessageStore() (*MessageStore, error) {
 	}
 
 	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", sqliteDSN(filepath.Join(storeDir(), "messages.db")))
+	db, err := openMessagesDB(messagesDBPath())
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
@@ -190,4 +209,139 @@ func (store *MessageStore) GetMediaInfo(id, chatJID string) (string, string, str
 	).Scan(&mediaType, &filename, &url, &mediaKey, &fileSHA256, &fileEncSHA256, &fileLength)
 
 	return mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, err
+}
+
+// getChatName returns the stored name of a chat ("" if the chat is missing).
+func (store *MessageStore) getChatName(jid string) string {
+	var name sql.NullString
+	if err := store.db.QueryRow("SELECT name FROM chats WHERE jid = ?", jid).Scan(&name); err != nil {
+		return ""
+	}
+	return name.String
+}
+
+// updateChatName sets the name of an existing chat.
+func (store *MessageStore) updateChatName(jid, name string) error {
+	_, err := store.db.Exec("UPDATE chats SET name = ? WHERE jid = ?", name, jid)
+	return err
+}
+
+// chatsWithName lists (jid, name) of all chats, optionally restricted to a JID suffix such as "@lid".
+func (store *MessageStore) chatsWithName(suffix string) ([][2]string, error) {
+	rows, err := store.db.Query("SELECT jid, COALESCE(name, '') FROM chats WHERE jid LIKE ?", "%"+suffix)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out [][2]string
+	for rows.Next() {
+		var jid, name string
+		if err := rows.Scan(&jid, &name); err != nil {
+			return nil, err
+		}
+		out = append(out, [2]string{jid, name})
+	}
+	return out, rows.Err()
+}
+
+// mergeChat moves everything stored under the LID chat to the PN chat in one transaction
+// and removes the LID chat. It is idempotent: a missing LID chat is a no-op.
+func (store *MessageStore) mergeChat(ctx context.Context, lid, pn string, lids store.LIDStore) error {
+	lidJ, err := types.ParseJID(lid)
+	if err != nil {
+		return fmt.Errorf("parse lid jid: %w", err)
+	}
+	pnJ, err := types.ParseJID(pn)
+	if err != nil {
+		return fmt.Errorf("parse pn jid: %w", err)
+	}
+
+	// Resolve sender mappings before the write transaction so no other lookup runs inside it.
+	senderRows, err := store.db.QueryContext(ctx,
+		"SELECT DISTINCT sender FROM messages WHERE chat_jid IN (?, ?)", lid, pn)
+	if err != nil {
+		return err
+	}
+	senderMap := map[string]string{}
+	var senders []string
+	for senderRows.Next() {
+		var s sql.NullString
+		if err := senderRows.Scan(&s); err != nil {
+			senderRows.Close()
+			return err
+		}
+		if s.String != "" {
+			senders = append(senders, s.String)
+		}
+	}
+	senderRows.Close()
+	if lids != nil {
+		for _, s := range senders {
+			mapped, err := lids.GetPNForLID(ctx, types.NewJID(s, types.HiddenUserServer))
+			if err == nil && !mapped.IsEmpty() && mapped.User != s {
+				senderMap[s] = mapped.User
+			}
+		}
+	}
+
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var lidName sql.NullString
+	var lidTime sql.NullTime
+	err = tx.QueryRowContext(ctx, "SELECT name, last_message_time FROM chats WHERE jid = ?", lid).Scan(&lidName, &lidTime)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	// 1. PN chat row must exist before messages move (foreign key).
+	if _, err := tx.ExecContext(ctx,
+		"INSERT OR IGNORE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)", pn, lidName, lidTime); err != nil {
+		return err
+	}
+	// 2. Move messages; rows whose (id, chat_jid) already exist under the PN chat are skipped.
+	if _, err := tx.ExecContext(ctx, "UPDATE OR IGNORE messages SET chat_jid = ? WHERE chat_jid = ?", pn, lid); err != nil {
+		return err
+	}
+	// 3. Whatever is still under the LID chat is a duplicate of a PN row.
+	if _, err := tx.ExecContext(ctx, "DELETE FROM messages WHERE chat_jid = ?", lid); err != nil {
+		return err
+	}
+	// 4. Map LID senders to PN digits.
+	for from, to := range senderMap {
+		if _, err := tx.ExecContext(ctx, "UPDATE messages SET sender = ? WHERE chat_jid = ? AND sender = ?", to, pn, from); err != nil {
+			return err
+		}
+	}
+	// 5. Best name and latest time on the PN chat.
+	var pnName sql.NullString
+	var pnTime sql.NullTime
+	if err := tx.QueryRowContext(ctx, "SELECT name, last_message_time FROM chats WHERE jid = ?", pn).Scan(&pnName, &pnTime); err != nil {
+		return err
+	}
+	best := pnName.String
+	if isPlaceholderName(best, pnJ) && !isPlaceholderName(lidName.String, lidJ) {
+		best = lidName.String
+	}
+	if best == "" {
+		best = lidName.String
+	}
+	last := pnTime
+	if lidTime.Valid && (!last.Valid || lidTime.Time.After(last.Time)) {
+		last = lidTime
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE chats SET name = ?, last_message_time = ? WHERE jid = ?", best, last, pn); err != nil {
+		return err
+	}
+	// 6. Drop the LID chat.
+	if _, err := tx.ExecContext(ctx, "DELETE FROM chats WHERE jid = ?", lid); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
