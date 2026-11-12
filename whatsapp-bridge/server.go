@@ -255,6 +255,22 @@ func validateMediaPath(p string) error {
 	return nil
 }
 
+// mediaFile is the part of *os.File that readMediaFile uses.
+type mediaFile interface {
+	io.ReadCloser
+	Stat() (os.FileInfo, error)
+}
+
+// openMediaFile opens p for reading; a seam so tests can inject read and stat failures.
+// O_NONBLOCK: opening a FIFO must not wait for a writer (it is rejected after the open).
+var openMediaFile = func(p string) (mediaFile, error) {
+	f, err := os.OpenFile(p, os.O_RDONLY|syscall.O_NONBLOCK, 0) //nolint:gosec // G304: checked by readMediaFile
+	if err != nil {
+		return nil, err
+	}
+	return f, nil
+}
+
 // readMediaFile applies the validateMediaPath rules to the file it actually opens and reads
 // at most maxMediaBytes from it, so the path cannot be swapped for a FIFO, a device or a
 // bigger file between the check and the read.
@@ -262,8 +278,7 @@ func readMediaFile(p string) ([]byte, error) {
 	if !filepath.IsAbs(p) {
 		return nil, errors.New("media_path must be an absolute path")
 	}
-	// O_NONBLOCK: opening a FIFO must not wait for a writer (it is rejected below)
-	f, err := os.OpenFile(p, os.O_RDONLY|syscall.O_NONBLOCK, 0) //nolint:gosec // G304: checked below
+	f, err := openMediaFile(p)
 	if err != nil {
 		return nil, fmt.Errorf("media_path is not accessible: %v", err)
 	}
@@ -320,7 +335,7 @@ type route struct {
 // (when it is a concrete name/IP) joins the Host allowlist.
 func newAPIServer(client func() bridgeClient, store *MessageStore, token, addr string) *apiServer {
 	a := &apiServer{client: client, messageStore: store, token: token}
-	if abs, err := filepath.Abs(storeDir()); err == nil {
+	if abs, err := filepathAbs(storeDir()); err == nil {
 		a.storeDirAbs = abs
 	} else {
 		a.storeDirAbs = storeDir()
@@ -523,7 +538,7 @@ func (a *apiServer) handleDownload(w http.ResponseWriter, r *http.Request) {
 // restShutdownTimeout bounds the graceful REST shutdown. http.Server.Shutdown only treats a
 // connection that never sent a request (StateNew) as idle once it is 5 s old, so anything
 // at or below 5 s can expire on such a connection.
-const restShutdownTimeout = 10 * time.Second
+var restShutdownTimeout = 10 * time.Second
 
 // shutdownRESTServer shuts srv down gracefully within timeout and then force-closes whatever
 // is left, so no connection outlives the bridge's exit. It returns the graceful error.
@@ -537,10 +552,13 @@ func shutdownRESTServer(srv *http.Server, timeout time.Duration) error {
 	return err
 }
 
+// listenTCP is a seam so tests can inject a failing listener.
+var listenTCP = func(addr string) (net.Listener, error) { return net.Listen("tcp", addr) }
+
 // startRESTServer binds addr synchronously (so bind errors surface) and serves handler
 // in the background. Call Shutdown on the returned server to stop it.
 func startRESTServer(addr string, handler http.Handler) (*http.Server, net.Addr, error) {
-	ln, err := net.Listen("tcp", addr)
+	ln, err := listenTCP(addr)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to listen on %s: %w", addr, err)
 	}

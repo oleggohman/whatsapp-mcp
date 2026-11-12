@@ -13,6 +13,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -95,6 +96,38 @@ func main() {
 	os.Exit(run())
 }
 
+// deviceContainer is the part of *sqlstore.Container that run needs.
+type deviceContainer interface {
+	GetFirstDevice(ctx context.Context) (*store.Device, error)
+	NewDevice() *store.Device
+}
+
+// wmClient is what buildClient needs from a whatsmeow client beyond waClient.
+type wmClient interface {
+	waClient
+	AddEventHandler(handler whatsmeow.EventHandler) uint32
+	GetGroupInfo(ctx context.Context, jid types.JID) (*types.GroupInfo, error)
+}
+
+// Seams for run: the defaults use the real whatsmeow client, device store and OS signals;
+// tests swap them to run the bridge without contacting WhatsApp.
+var (
+	openDeviceContainer = func(ctx context.Context, dsn string, log waLog.Logger) (deviceContainer, error) {
+		c, err := sqlstore.New(ctx, "sqlite3", dsn, log)
+		if err != nil {
+			return nil, err
+		}
+		return c, nil
+	}
+	newWMClient = func(dev *store.Device, log waLog.Logger) wmClient {
+		c := whatsmeow.NewClient(dev, log)
+		c.InitialAutoReconnect = true
+		return realClient{c}
+	}
+	notifySignals = func(c chan<- os.Signal) { signal.Notify(c, syscall.SIGINT, syscall.SIGTERM) }
+	isTTY         = stderrIsTTY
+)
+
 // run starts the bridge and returns the process exit code.
 func run() int {
 	// Headless daemon: all logs go to stderr
@@ -127,7 +160,7 @@ func run() int {
 		return 1
 	}
 
-	container, err := sqlstore.New(context.Background(), "sqlite3", sqliteDSN(filepath.Join(dir, "whatsapp.db")), dbLog)
+	container, err := openDeviceContainer(context.Background(), sqliteDSN(filepath.Join(dir, "whatsapp.db")), dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return 1
@@ -158,9 +191,7 @@ func run() int {
 	// buildClient creates a client for a device store and attaches all event handlers.
 	// It is also used after a logout to build the replacement client.
 	buildClient := func(dev *store.Device) waClient {
-		c := whatsmeow.NewClient(dev, logger)
-		c.InitialAutoReconnect = true
-		rc := realClient{c}
+		c := newWMClient(dev, logger)
 		resolver := newDeviceChatResolver(messageStore, dev,
 			func(ctx context.Context, jid types.JID) (string, error) {
 				info, err := c.GetGroupInfo(ctx, jid)
@@ -171,12 +202,12 @@ func run() int {
 			})
 		c.AddEventHandler(func(evt interface{}) {
 			// Pairing/login state machine first, then message processing
-			pm.handleEvent(rc, evt)
+			pm.handleEvent(c, evt)
 			switch v := evt.(type) {
 			case *events.Message:
 				handleMessage(resolver, messageStore, v, logger)
 			case *events.HistorySync:
-				handleHistorySync(resolver, selfUser(c), messageStore, v, logger)
+				handleHistorySync(resolver, selfUser(dev), messageStore, v, logger)
 				resolver.trigger()
 			case *events.Connected:
 				logger.Infof("Connected to WhatsApp")
@@ -185,12 +216,12 @@ func run() int {
 				logger.Warnf("Device logged out; start pairing again to log in")
 			}
 		})
-		return rc
+		return c
 	}
 	pm = newPairingManager(buildClient(deviceStore), func() (waClient, error) {
 		return buildClient(container.NewDevice()), nil
 	})
-	if stderrIsTTY() {
+	if isTTY() {
 		pm.printQR = func(code string) {
 			logln("\nScan this QR code with your WhatsApp app:")
 			qrterminal.GenerateHalfBlock(code, qrterminal.L, os.Stderr)
@@ -218,7 +249,7 @@ func run() int {
 		if err := c.Connect(); err != nil {
 			logger.Errorf("Failed to connect: %v", err)
 		}
-	} else if stderrIsTTY() {
+	} else if isTTY() {
 		// Interactive run: show a QR code right away. Headless runs wait for an explicit request.
 		if _, err := pm.StartPairing(); err != nil {
 			logger.Errorf("Failed to start pairing: %v", err)
@@ -226,7 +257,7 @@ func run() int {
 	}
 
 	exitChan := make(chan os.Signal, 1)
-	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
+	notifySignals(exitChan)
 	idleCtx, stopIdle := context.WithCancel(context.Background())
 	defer stopIdle()
 	idleExit := make(chan struct{}, 1)
@@ -250,11 +281,11 @@ func run() int {
 }
 
 // selfUser returns the bare user digits of the logged-in account ("" before pairing).
-func selfUser(client *whatsmeow.Client) string {
-	if client.Store.ID == nil {
+func selfUser(dev *store.Device) string {
+	if dev.ID == nil {
 		return ""
 	}
-	return client.Store.ID.User
+	return dev.ID.User
 }
 
 // conversationName returns the best name carried by a history-sync conversation.
@@ -424,8 +455,16 @@ func syncConversation(ctx context.Context, r *chatResolver, self string, message
 	return syncedCount
 }
 
+// historyClient is the part of the WhatsApp client that requestHistorySync needs.
+type historyClient interface {
+	IsConnected() bool
+	Paired() bool
+	BuildHistorySyncRequest(lastKnownMessageInfo *types.MessageInfo, count int) *waE2E.Message
+	SendMessage(ctx context.Context, to types.JID, message *waE2E.Message, extra ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error)
+}
+
 // Request history sync from the server
-func requestHistorySync(client *whatsmeow.Client) {
+func requestHistorySync(client historyClient) {
 	if client == nil {
 		logln("Client is not initialized. Cannot request history sync.")
 		return
@@ -436,7 +475,7 @@ func requestHistorySync(client *whatsmeow.Client) {
 		return
 	}
 
-	if client.Store.ID == nil {
+	if !client.Paired() {
 		logln("Client is not logged in. Please scan the QR code first.")
 		return
 	}

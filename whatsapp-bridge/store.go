@@ -43,7 +43,7 @@ func messagesDBPath() string {
 }
 
 // openMessagesDB opens messages.db with the standard DSN options.
-func openMessagesDB(path string) (*sql.DB, error) {
+var openMessagesDB = func(path string) (*sql.DB, error) {
 	return sql.Open("sqlite3", messagesDSN(path))
 }
 

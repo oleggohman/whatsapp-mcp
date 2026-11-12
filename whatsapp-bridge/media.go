@@ -150,11 +150,8 @@ func downloadMedia(client bridgeClient, messageStore *MessageStore, messageID, c
 	}
 	filename = safeName
 
-	// Get absolute path
-	absPath, err := filepath.Abs(localPath)
-	if err != nil {
-		return false, "", "", "", fmt.Errorf("failed to get absolute path: %v", err)
-	}
+	// safeMediaPath already returns absolute paths
+	absPath := localPath
 
 	// Check if file already exists
 	if _, err := os.Stat(localPath); err == nil {
@@ -245,6 +242,12 @@ func sanitizeFilename(filename string) (string, error) {
 	return name, nil
 }
 
+// Indirections so tests can reach the defensive error paths of safeMediaPath.
+var (
+	filepathAbs = filepath.Abs
+	filepathRel = filepath.Rel
+)
+
 // safeMediaPath returns the chat directory, full file path and sanitized filename for a
 // download, verifying the result resolves under root.
 func safeMediaPath(root, chatJID, filename string) (chatDir, localPath, safeName string, err error) {
@@ -256,13 +259,13 @@ func safeMediaPath(root, chatJID, filename string) (chatDir, localPath, safeName
 	if dirName == "" {
 		return "", "", "", fmt.Errorf("invalid chat JID for media path")
 	}
-	absRoot, err := filepath.Abs(root)
+	absRoot, err := filepathAbs(root)
 	if err != nil {
 		return "", "", "", fmt.Errorf("failed to resolve store directory: %v", err)
 	}
 	chatDir = filepath.Join(absRoot, dirName)
 	localPath = filepath.Join(chatDir, safeName)
-	rel, err := filepath.Rel(absRoot, localPath)
+	rel, err := filepathRel(absRoot, localPath)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
 		return "", "", "", fmt.Errorf("media path escapes store directory")
 	}
