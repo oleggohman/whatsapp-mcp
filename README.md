@@ -111,7 +111,7 @@ git tag vX.Y.Z && git push origin vX.Y.Z
 
 The bridge is a shared daemon, one per store directory. Any MCP client spawns it when it is absent, and none of them stops it: it survives the client exiting and is shared by Claude Desktop and Claude Code at the same time. Its log is `<store>/bridge.log`. When the supervisor starts a bridge and the log is over 5 MB, it moves it to `bridge.log.1` first; a running bridge keeps appending to its log until it exits, so a long-lived daemon can grow it past 5 MB (message bodies are never logged).
 
-- **Stop it** by setting `WHATSAPP_BRIDGE_IDLE_EXIT` (for example `30m`) so it exits after that long without API activity, or by killing it: `curl -s http://127.0.0.1:8080/api/health` shows its `pid`, then `kill <pid>`. The next tool call that needs the bridge (send, download, pairing, `get_connection_status`) spawns a new one; the MCP client does not need a restart. A failed start (for example Go missing or the port taken) is retried the same way 30 seconds after the failure.
+- **Stop it** by setting `WHATSAPP_BRIDGE_IDLE_EXIT` (for example `30m`) so it exits after that long without API activity (only calls to the bridge count: send, download, pairing and `get_connection_status`; the read-only tools query `messages.db` directly), or by killing it: `curl -s http://127.0.0.1:8080/api/health` shows its `pid`, then `kill <pid>`. The next tool call that needs the bridge (send, download, pairing, `get_connection_status`) spawns a new one; the MCP client does not need a restart. Read-only tools (`list_messages`, `list_chats`, search and so on) never start the bridge, so after an idle exit they return history only up to the exit until one of those calls revives it; call `get_connection_status` first when you need fresh messages. A failed start (for example Go missing or the port taken) is retried the same way 30 seconds after the failure.
 - **After updating the repository**, a running daemon keeps running the old build. `get_connection_status` then shows `restart_needed: true` (only for a bridge the server built from source, not for a release binary); kill the daemon as above, and the next bridge call rebuilds and spawns the new version.
 - **One bridge per WhatsApp login.** The bridge takes a lock on `<store>/bridge.lock` and exits with code 75 when another bridge already holds it for the same store directory (the supervisor treats that as "a peer is starting" and spawns again every 2 seconds until one answers or the start timeout ends, so a bridge that is still shutting down is replaced). The lock does not protect *copies* of a store: if a second process connects with the same WhatsApp device, WhatsApp kicks the first one off. The bridge then reports `pairing: "replaced"` and does **not** reconnect on its own (two bridges would kick each other forever); stop the other process, then call `get_connection_status` with `reconnect: true` to take the login back (the tool sends `POST /api/reconnect`).
 
@@ -125,7 +125,7 @@ Bridge (Go) and MCP server (Python) read the same names. When the server spawns 
 | `WHATSAPP_API_BASE_URL` | `http://localhost:8080/api` | server | Where the server reaches the bridge |
 | `WHATSAPP_BRIDGE_ADDR` | derived from the API URL (`127.0.0.1:8080`) | both | Listen address of the bridge REST API; loopback by default |
 | `WHATSAPP_BRIDGE_TOKEN` | token file | both | API token; overrides `<store>/bridge.token` |
-| `WHATSAPP_BRIDGE_IDLE_EXIT` | unset (never) | bridge | Go duration (`30m`, `12h`); the bridge exits after this long without API activity (health polls do not count) |
+| `WHATSAPP_BRIDGE_IDLE_EXIT` | unset (never) | bridge | Go duration (`30m`, `12h`); the bridge exits after this long without API activity (health polls and read-only tools do not count; after the exit, read-only tools see no new messages until a bridge call restarts it) |
 | `WHATSAPP_BRIDGE_AUTOSTART` | `1` | server | `0`/`false`/`no`/`off` disables build and spawn (manual mode) |
 | `WHATSAPP_BRIDGE_BIN` | `whatsapp-bridge/whatsapp-bridge` | server | Bridge binary to run (and where the build is written) |
 | `WHATSAPP_BRIDGE_SRC` | `whatsapp-bridge` | server | Bridge source directory used for builds |
@@ -229,6 +229,6 @@ cd whatsapp-mcp-server && uv run pytest && uv run ruff check .
 - **QR code expired**: codes rotate about every 20 seconds; call `get_pairing_qr` again, or use `pair_with_phone_number`.
 - **Device limit reached**: remove a device in WhatsApp > Linked devices.
 - **No messages loading**: after pairing, history can take several minutes to arrive.
-- **Out of sync**: stop the bridge, delete `messages.db` and `whatsapp.db` in the store directory (this unlinks the device), restart and pair again.
+- **Out of sync**: stop the bridge, delete `messages.db*` and `whatsapp.db*` in the store directory (including the `-wal` and `-shm` files, which SQLite would otherwise replay; this unlinks the device), restart and pair again.
 
 For additional Claude Desktop integration troubleshooting, see the [MCP documentation](https://modelcontextprotocol.io/quickstart/server#claude-for-desktop-integration-issues).
