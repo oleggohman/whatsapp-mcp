@@ -5,3 +5,12 @@ whatsapp.log
 whatsapp-bridge/whatsapp-bridge
 *.srchash
 whatsapp-bridge/whatsapp-client
+
+# Bridge store: WhatsApp session, message bodies, media, token and logs
+whatsapp-bridge/store/
+*.db-wal
+*.db-shm
+*.db-journal
+bridge.token*
+bridge.log*
+bridge.lock
