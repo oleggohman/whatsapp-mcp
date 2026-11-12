@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -441,6 +442,11 @@ func TestStartRESTServerBindsLoopbackAndShutsDown(t *testing.T) {
 	}
 
 	url := "http://" + tcp.String() + "/api/send"
+	// No keep-alives: after a response whose body it did not read, a keep-alive Transport may
+	// open a fresh connection that never sends a request. http.Server.Shutdown counts such a
+	// StateNew connection as idle only once it is 5 s old, so a graceful Shutdown with a 5 s
+	// deadline would fail. That is client behaviour, not a server bug; production covers it
+	// with shutdownRESTServer (longer timeout, then Close).
 	httpc := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
 	resp, err := httpc.Post(url, "application/json", bytes.NewBufferString(`{"recipient":"1","message":"hi"}`))
 	if err != nil {
@@ -467,6 +473,33 @@ func TestStartRESTServerBindsLoopbackAndShutsDown(t *testing.T) {
 	}
 	if _, err := net.DialTimeout("tcp", tcp.String(), time.Second); err == nil {
 		t.Fatal("port still accepting after shutdown")
+	}
+}
+
+// A connection that never sends a request must not keep the bridge from exiting: after the
+// graceful timeout shutdownRESTServer closes it.
+func TestShutdownRESTServerClosesSilentConnections(t *testing.T) {
+	srv, bound, err := startRESTServer("127.0.0.1:0", http.NewServeMux())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := net.Dial("tcp", bound.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	time.Sleep(50 * time.Millisecond) // let the server accept it (StateNew)
+
+	start := time.Now()
+	if err := shutdownRESTServer(srv, 200*time.Millisecond); err == nil {
+		t.Fatal("expected the graceful shutdown to time out on a StateNew connection")
+	}
+	if d := time.Since(start); d > 3*time.Second {
+		t.Fatalf("shutdown took %v", d)
+	}
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("silent connection still open after shutdown: %v", err)
 	}
 }
 

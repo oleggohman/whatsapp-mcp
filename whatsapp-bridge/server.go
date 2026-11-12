@@ -520,6 +520,23 @@ func (a *apiServer) handleDownload(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// restShutdownTimeout bounds the graceful REST shutdown. http.Server.Shutdown only treats a
+// connection that never sent a request (StateNew) as idle once it is 5 s old, so anything
+// at or below 5 s can expire on such a connection.
+const restShutdownTimeout = 10 * time.Second
+
+// shutdownRESTServer shuts srv down gracefully within timeout and then force-closes whatever
+// is left, so no connection outlives the bridge's exit. It returns the graceful error.
+func shutdownRESTServer(srv *http.Server, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	err := srv.Shutdown(ctx)
+	if err != nil {
+		srv.Close()
+	}
+	return err
+}
+
 // startRESTServer binds addr synchronously (so bind errors surface) and serves handler
 // in the background. Call Shutdown on the returned server to stop it.
 func startRESTServer(addr string, handler http.Handler) (*http.Server, net.Addr, error) {
