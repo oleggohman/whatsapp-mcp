@@ -295,11 +295,18 @@ def test_env_token_wins_over_file(env, monkeypatch):
 # --- build -------------------------------------------------------------------------------------
 
 
-def make_fake_go(env, sleep: float = 0, fail: bool = False) -> Path:
-    """A fake `go` that records its args, sleeps, then writes the fake bridge to the -o path."""
+def make_fake_go(env, sleep: float = 0, fail: bool = False, events: Path | None = None) -> Path:
+    """A fake `go` that records its args, sleeps, then writes the fake bridge to the -o path.
+
+    With events, it also appends "go build" to that file (ordering against bridge requests).
+    """
     log = env["tmp"] / "go-args.log"
     body = f"""#!/bin/sh
 echo "$@" >> {log}
+"""
+    if events:
+        body += f'echo "go build" >> {events}\n'
+    body += f"""
 echo "go: noisy build output"
 sleep {sleep}
 """
@@ -582,8 +589,9 @@ def test_stale_daemon_is_reported(env, monkeypatch):
     assert status["restart_needed"] is True and "kill" in status["hint"]
 
 
-def test_daemon_older_than_updated_sources_is_reported(env):
+def test_daemon_older_than_updated_sources_is_reported(env, monkeypatch):
     """After a repo update the reused daemon is stale even though nothing rebuilt the binary."""
+    monkeypatch.setenv("WHATSAPP_GO_BIN", str(env["tmp"] / "no-go"))
     go_file = env["src"] / "main.go"
     go_file.write_text("package main\n")
     built = bridge_manager.source_hash(str(env["src"]))
@@ -596,7 +604,12 @@ def test_daemon_older_than_updated_sources_is_reported(env):
 
     go_file.write_text("package main\n\n// updated by git pull\n")
     status = mgr.status()
-    assert status["restart_needed"] is True and "kill" in status["hint"]
+    assert status["restart_needed"] is True and "kill" in status["hint"]  # no Go to rebuild
+
+    # With Go, a new MCP server process would rebuild and replace it on its first run.
+    monkeypatch.setenv("WHATSAPP_GO_BIN", str(make_fake_go(env)))
+    status = mgr.status()
+    assert status["restart_needed"] is True and "Reconnect the MCP server" in status["hint"]
 
 
 def test_release_binary_without_sidecar_is_never_stale(env):
@@ -625,3 +638,205 @@ def test_log_rotates_when_large(env, monkeypatch):
     BridgeManager().ensure_running()
     assert (env["store"] / "bridge.log.1").exists()
     assert log.stat().st_size < 1000
+
+
+# --- stale bridge replacement --------------------------------------------------------------------
+
+
+@pytest.fixture
+def stale(env, monkeypatch):
+    """Sources plus a supervisor-built binary for them; a hand-started bridge runs old code."""
+    seed_sources(env)
+    current = bridge_manager.source_hash(str(env["src"]))
+    Path(str(env["binary"]) + ".srchash").write_text(current)
+    monkeypatch.setenv("FAKE_VERSION", current)  # what a bridge spawned from now on reports
+    monkeypatch.setenv("WHATSAPP_GO_BIN", str(env["tmp"] / "no-go"))  # Go is not installed
+    env["current"] = current
+    return env
+
+
+def start_stale(env, **extra) -> subprocess.Popen:
+    proc = start_fake(env, **{"FAKE_VERSION": "old-hash", **extra})
+    env["old_pid"] = wait_health(env)["pid"]
+    return proc
+
+
+def requests(env, method_path: str) -> int:
+    log = env["store"] / "requests.log"
+    lines = log.read_text().splitlines() if log.exists() else []
+    return lines.count(method_path)
+
+
+def test_stale_bridge_is_replaced_on_first_run(stale):
+    old = start_stale(stale)
+    mgr = BridgeManager()
+    mgr.ensure_running()
+    assert mgr.state == "running" and mgr._done.is_set()
+    assert old.wait(10) == 0  # graceful exit through /api/shutdown
+    health = wait_health(stale)
+    assert health["version"] == stale["current"] and health["pid"] != stale["old_pid"]
+    assert requests(stale, "POST /api/shutdown") == 1
+    assert "restart_needed" not in mgr.status()
+
+
+def test_matching_bridge_is_reused_without_shutdown(stale):
+    start_fake(stale)  # reports the current version
+    wait_health(stale)
+    mgr = BridgeManager()
+    mgr.ensure_running()
+    assert mgr.state == "running" and spawns(stale["store"]) == 1
+    assert requests(stale, "POST /api/shutdown") == 0
+
+
+def test_prebuilt_binary_is_never_replaced(stale):
+    Path(str(stale["binary"]) + ".srchash").unlink()
+    start_stale(stale)
+    mgr = BridgeManager()
+    mgr.ensure_running()
+    assert mgr.state == "running" and requests(stale, "POST /api/shutdown") == 0
+    assert wait_health(stale)["pid"] == stale["old_pid"]
+
+
+def test_no_replace_when_go_missing_and_binary_is_older(stale):
+    Path(str(stale["binary"]) + ".srchash").write_text("older-sidecar")
+    start_stale(stale)
+    mgr = BridgeManager()
+    mgr.ensure_running()
+    assert mgr.state == "running" and requests(stale, "POST /api/shutdown") == 0
+    status = mgr.status()
+    assert status["restart_needed"] is True and f"kill {stale['old_pid']}" in status["hint"]
+
+
+def test_stale_sidecar_with_newer_mtime_forces_rebuild_before_shutdown(stale, monkeypatch):
+    """needs_build() says no (binary newer than sources), but the sidecar hash is old."""
+    Path(str(stale["binary"]) + ".srchash").write_text("older-sidecar")
+    future = time.time() + 100
+    os.utime(stale["binary"], (future, future))
+    assert not bridge_manager.needs_build(str(stale["binary"]), str(stale["src"]))
+    stale["store"].mkdir()
+    monkeypatch.setenv(
+        "WHATSAPP_GO_BIN", str(make_fake_go(stale, events=stale["store"] / "requests.log"))
+    )
+    old = start_stale(stale)
+    mgr = BridgeManager()
+    mgr.ensure_running()
+    assert old.wait(10) == 0 and mgr.state == "running"
+    assert bridge_manager.built_version() == stale["current"]
+    lines = (stale["store"] / "requests.log").read_text().splitlines()
+    assert lines.index("go build") < lines.index("POST /api/shutdown")  # build first
+    assert wait_health(stale)["version"] == stale["current"]
+
+
+def test_build_failure_keeps_the_old_bridge(stale, monkeypatch):
+    Path(str(stale["binary"]) + ".srchash").write_text("older-sidecar")
+    monkeypatch.setenv("WHATSAPP_GO_BIN", str(make_fake_go(stale, fail=True)))
+    start_stale(stale)
+    mgr = BridgeManager()
+    mgr.ensure_running()  # no BridgeError: the old bridge keeps serving
+    assert mgr.state == "running" and mgr.error is None
+    assert requests(stale, "POST /api/shutdown") == 0
+    assert wait_health(stale)["pid"] == stale["old_pid"]
+
+
+@pytest.mark.parametrize("pairing", ["qr", "code"])
+def test_no_replace_while_pairing(stale, pairing):
+    start_stale(stale, FAKE_PAIRING=pairing)
+    mgr = BridgeManager()
+    mgr.ensure_running()
+    assert requests(stale, "POST /api/shutdown") == 0
+    assert wait_health(stale)["pid"] == stale["old_pid"]
+    status = mgr.status()
+    assert status["restart_needed"] is True and "kill" in status["hint"]
+
+
+def test_no_replace_when_bridge_rejects_our_token(stale):
+    start_stale(stale, FAKE_TOKEN="not-our-token")
+    mgr = BridgeManager()
+    mgr.ensure_running()
+    assert mgr.state == "running" and requests(stale, "POST /api/shutdown") == 0
+    assert wait_health(stale)["pid"] == stale["old_pid"]
+
+
+def test_no_replace_on_non_posix(stale, monkeypatch):
+    monkeypatch.setattr(bridge_manager, "_is_posix", lambda: False)
+    start_stale(stale)
+    mgr = BridgeManager()
+    mgr.ensure_running()
+    assert requests(stale, "POST /api/shutdown") == 0
+    status = mgr.status()
+    assert status["restart_needed"] is True and "kill" in status["hint"]
+
+
+def test_replacement_waits_for_the_lock_of_the_exiting_bridge(stale, monkeypatch):
+    """The old bridge stops answering but holds the lock: the first spawn exits 75."""
+    monkeypatch.setattr(bridge_manager, "PEER_RESPAWN_SECONDS", 0.5)
+    old = start_stale(stale, FAKE_SHUTDOWN_HOLD="1.5")
+    procs = []
+    real_spawn = BridgeManager._spawn
+
+    def spy_spawn(self, binary):
+        proc = real_spawn(self, binary)
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(BridgeManager, "_spawn", spy_spawn)
+    mgr = BridgeManager()
+    mgr.ensure_running()
+    assert old.wait(10) == 0 and mgr.state == "running"
+    assert len(procs) >= 2 and procs[0].wait(10) == bridge_manager.EX_TEMPFAIL
+    assert spawns(stale["store"]) == 2  # only the old one and the new one took the lock
+    assert wait_health(stale)["version"] == stale["current"]
+
+
+def test_old_bridge_that_never_goes_away_is_reused(stale, monkeypatch):
+    monkeypatch.setattr(bridge_manager, "REPLACE_TIMEOUT", 0.5)
+    start_stale(stale, FAKE_SHUTDOWN="ignore")
+    mgr = BridgeManager()
+    mgr.ensure_running()  # no BridgeError
+    assert mgr.state == "running" and mgr.error is None
+    assert requests(stale, "POST /api/shutdown") == 1 and spawns(stale["store"]) == 1
+    assert mgr.status()["restart_needed"] is True
+
+
+def test_shutdown_conflict_reuses_the_answering_bridge(stale):
+    """409: the bridge that answered is not the one we checked (a peer replaced it)."""
+    start_stale(stale, FAKE_SHUTDOWN_VERSION="someone-else")
+    mgr = BridgeManager()
+    mgr.ensure_running()
+    assert mgr.state == "running" and requests(stale, "POST /api/shutdown") == 1
+    assert spawns(stale["store"]) == 1 and wait_health(stale)["pid"] == stale["old_pid"]
+
+
+def test_shutdown_transport_error_then_gone_spawns(stale):
+    old = start_stale(stale, FAKE_SHUTDOWN="drop")
+    mgr = BridgeManager()
+    mgr.ensure_running()
+    assert old.wait(10) == 0 and mgr.state == "running"
+    assert wait_health(stale)["version"] == stale["current"]
+
+
+def test_bridge_without_shutdown_endpoint_gets_sigterm(stale):
+    """A v0.2.0 bridge answers 404: it is stopped with a real SIGTERM after the pid check."""
+    old = start_stale(stale, FAKE_SHUTDOWN="missing")
+    mgr = BridgeManager()
+    mgr.ensure_running()
+    assert old.wait(10) == -signal.SIGTERM and mgr.state == "running"
+    health = wait_health(stale)
+    assert health["version"] == stale["current"] and health["pid"] != stale["old_pid"]
+
+
+def test_revive_run_never_replaces(stale, monkeypatch):
+    """Only the first run of a process replaces: a later run reuses a stale bridge."""
+    monkeypatch.setattr(bridge_manager, "FAILED_RETRY_SECONDS", 0.0)
+    start_fake(stale)  # current version: the first run reuses it
+    wait_health(stale)
+    mgr = BridgeManager()
+    mgr.ensure_running()
+    _kill_fake(stale)
+    start_stale(stale)  # an older session started its own (stale) bridge meanwhile
+    mgr.state, mgr._failed_at = "failed", -1e9
+    mgr._done.clear()
+    assert mgr.revive() is True
+    assert mgr._done.wait(30) and mgr.state == "running"
+    assert requests(stale, "POST /api/shutdown") == 0
+    assert wait_health(stale)["pid"] == stale["old_pid"]

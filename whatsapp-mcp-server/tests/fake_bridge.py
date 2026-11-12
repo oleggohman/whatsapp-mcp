@@ -9,6 +9,14 @@ Behaviour is driven by environment variables:
   FAKE_TOKEN              token required instead of <store>/bridge.token
   FAKE_LOGGED_IN=1        report an already paired account
   FAKE_REPLACED=1         start in pairing state "replaced" (another client took the login)
+  FAKE_PAIRING=<state>    start in this pairing state (e.g. "qr" or "code": pairing in progress)
+  FAKE_SHUTDOWN=<mode>    POST /api/shutdown behaviour: unset = graceful exit like the real
+                          bridge; "missing" = 404 (a v0.2.0 bridge without the endpoint);
+                          "ignore" = answer 200 but keep running; "drop" = exit without answering
+  FAKE_SHUTDOWN_VERSION   version /api/shutdown must be called with (default FAKE_VERSION); 409
+                          otherwise
+  FAKE_SHUTDOWN_HOLD=<s>  after a shutdown, hold the lock s seconds with the listener closed
+Every request is appended as "METHOD /path" to <store>/requests.log.
 The lock, store dir, address and token file follow the real bridge's rules.
 """
 
@@ -47,8 +55,10 @@ if not token:
         token = open(os.path.join(store, "bridge.token")).read().strip()
     except OSError:
         token = ""
+version = os.environ.get("FAKE_VERSION", "fakev")
 state = {
-    "pairing": "replaced" if os.environ.get("FAKE_REPLACED") == "1" else "idle",
+    "pairing": os.environ.get("FAKE_PAIRING")
+    or ("replaced" if os.environ.get("FAKE_REPLACED") == "1" else "idle"),
     "logged_in": os.environ.get("FAKE_LOGGED_IN") == "1",
 }
 
@@ -75,6 +85,10 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def _record(self):
+        with open(os.path.join(store, "requests.log"), "a") as f:
+            f.write(f"{self.command} {urlsplit(self.path).path}\n")
+
     def _send(self, code, body):
         data = json.dumps(body).encode()
         self.send_response(code)
@@ -90,13 +104,14 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def do_GET(self):
+        self._record()
         url = urlsplit(self.path)
         if url.path == "/api/health":
             return self._send(
                 200,
                 {
                     "service": "whatsapp-bridge",
-                    "version": os.environ.get("FAKE_VERSION", "fakev"),
+                    "version": version,
                     "store_dir": store,
                     "pid": os.getpid(),
                     "auth_required": bool(token),
@@ -112,6 +127,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, {"message": "not found"})
 
     def do_POST(self):
+        self._record()
         if not self._authed():
             return
         length = int(self.headers.get("Content-Length") or 0)
@@ -134,11 +150,33 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(409, {"success": False, "message": "not logged in"})
             state["pairing"] = "idle"
             return self._send(200, status_body())
+        if self.path == "/api/shutdown":
+            return self._shutdown(payload)
         if self.path == "/api/send":
             if not state["logged_in"]:
                 return self._send(200, {"success": False, "message": "Not connected to WhatsApp"})
             return self._send(200, {"success": True, "message": "sent"})
         self._send(404, {"message": "not found"})
+
+    def _shutdown(self, payload):
+        mode = os.environ.get("FAKE_SHUTDOWN", "")
+        if mode == "missing":
+            return self._send(404, {"message": "not found"})
+        if mode == "drop":
+            os._exit(0)
+        if payload.get("version") != os.environ.get("FAKE_SHUTDOWN_VERSION", version):
+            return self._send(409, {"message": "Version mismatch"})
+        self._send(200, {"success": True, "message": "Shutting down"})
+        if mode != "ignore":
+            threading.Thread(target=stop).start()
+
+
+def stop():
+    """Graceful exit: close the listener, keep the lock FAKE_SHUTDOWN_HOLD seconds, exit 0."""
+    server.shutdown()
+    server.server_close()
+    time.sleep(float(os.environ.get("FAKE_SHUTDOWN_HOLD", "0")))
+    os._exit(0)
 
 
 host, _, port = addr.rpartition(":")

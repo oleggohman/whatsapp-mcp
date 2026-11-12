@@ -8,10 +8,12 @@ stdout carries the MCP stdio transport, so everything here logs to stderr via lo
 
 import glob
 import hashlib
+import ipaddress
 import logging
 import os
 import secrets
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -42,6 +44,9 @@ FAILED_RETRY_SECONDS = 30.0  # a failed start is retried by the next bridge call
 # a peer that is shutting down has closed its listener but holds the lock for up to ~10s.
 PEER_RESPAWN_SECONDS = 2.0
 HEALTH_TIMEOUT = httpx.Timeout(3.0, connect=1.0)
+# How long a stale bridge may take to stop answering after a shutdown request or SIGTERM.
+REPLACE_TIMEOUT = 15.0
+PAIRING_IN_PROGRESS = ("qr", "code")
 API_TIMEOUT = httpx.Timeout(30.0, connect=3.0)
 
 GO_PROBE_PATHS = (
@@ -328,6 +333,28 @@ def _same_dir(a: str, b: str) -> bool:
     return os.path.realpath(a) == os.path.realpath(b)
 
 
+def _is_posix() -> bool:
+    """Auto-replace needs POSIX: Windows cannot replace a running executable (os.replace)."""
+    return os.name == "posix"
+
+
+def _is_loopback(host: str | None) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host or "").is_loopback
+    except ValueError:
+        return False
+
+
+def _current_source_hash() -> str | None:
+    """source_hash of the bridge sources; None when absent or changing mid-read (git pull)."""
+    try:
+        return source_hash(src_dir())
+    except OSError:
+        return None
+
+
 class BridgeManager:
     """Builds, starts and watches the bridge daemon. Thread-safe; blocking calls run in threads."""
 
@@ -338,6 +365,9 @@ class BridgeManager:
         self._thread: threading.Thread | None = None
         self._done = threading.Event()  # set once state is running or failed
         self._failed_at = 0.0  # time.monotonic() of the last failure
+        # Only the first supervision run of this process may replace a stale bridge, so
+        # sessions on different versions can never keep replacing each other.
+        self._first_run_done = False
 
     # -- http helpers --
 
@@ -461,13 +491,19 @@ class BridgeManager:
 
     def ensure_running(self) -> None:
         """Make sure a bridge for our store dir answers on the configured address."""
+        first_run, self._first_run_done = not self._first_run_done, True
         if not autostart_enabled():
             logger.info("bridge autostart disabled (WHATSAPP_BRIDGE_AUTOSTART=0)")
             return
         self.error = None
         ensure_token()  # before any spawn so every client shares the same token file
 
-        if self.health() is not None:
+        health = self.health()
+        if health is not None and first_run and self._replace_stale(health):
+            self.state = "running"
+            self._done.set()
+            return
+        if health is not None:
             logger.info("reusing bridge already running on %s", api_base_url())
             self.state = "running"
             self._done.set()
@@ -496,6 +532,141 @@ class BridgeManager:
         self._wait_for_health(proc, binary)
         self.state = "running"
         self._done.set()
+
+    # -- stale bridge replacement --
+
+    def _replacement_target(self, health: dict[str, Any]) -> str | None:
+        """The gate: the source hash to replace the running bridge with, or None to reuse it."""
+        if not _is_posix():
+            return None
+        current = _current_source_hash()
+        built = built_version()
+        # Only a supervisor-built binary (.srchash sidecar) is replaced, never a release binary.
+        if current is None or built is None or health.get("version") == current:
+            return None
+        if built != current and find_go() is None:
+            logger.warning(
+                "bridge (pid %s) is stale but Go is not installed to rebuild it; reusing it",
+                health.get("pid"),
+            )
+            return None
+        try:
+            st = self.api("GET", "status")  # ownership: it accepts our token
+        except BridgeError as e:
+            logger.warning("not replacing the stale bridge: %s", e)
+            return None
+        if st.get("pairing") in PAIRING_IN_PROGRESS:
+            logger.warning("not replacing the stale bridge: pairing in progress")
+            return None
+        return current
+
+    def _replace_stale(self, health: dict[str, Any]) -> bool:
+        """Replace a bridge built from older sources; True when the new one answers.
+
+        False means the old bridge is kept (see restart_needed in status). Only a failing
+        spawn after the old bridge stopped raises.
+        """
+        current = self._replacement_target(health)
+        if current is None:
+            return False
+        binary = bridge_bin()
+        if built_version() != current:
+            # Build while the old bridge still serves, so a failure costs no downtime.
+            self.state = "building"
+            try:
+                build_bridge(binary, src_dir())
+            except BridgeError as e:
+                logger.warning("could not rebuild the stale bridge; reusing it: %s", e)
+                return False
+        old = str(health.get("version"))
+        logger.info(
+            "replacing stale bridge pid %s (version %s, sources %s)",
+            health.get("pid"),
+            old,
+            current,
+        )
+        outcome = self._request_shutdown(old)
+        if outcome == "ok":
+            gone = self._wait_gone(REPLACE_TIMEOUT)
+        elif outcome == "unsupported":  # pre-0.3 bridge without /api/shutdown
+            gone = self._terminate_stale(health) and self._wait_gone(REPLACE_TIMEOUT)
+        elif outcome == "error":
+            gone = self._wait_gone(REPLACE_TIMEOUT) or (
+                self._terminate_stale(health) and self._wait_gone(REPLACE_TIMEOUT)
+            )
+        else:  # "conflict" (a peer replaced it already) or "refused": re-check who answers
+            logger.info("bridge declined the shutdown (%s)", outcome)
+            gone = not self._safe_health()
+        if not gone:
+            logger.warning("a bridge still answers on %s; reusing it", api_base_url())
+            return False
+        self.state = "starting"
+        proc = self._spawn(binary)
+        self._wait_for_health(proc, binary)
+        return True
+
+    def _request_shutdown(self, version: str) -> str:
+        """POST /api/shutdown; returns ok | conflict | unsupported | refused | error."""
+        try:
+            r = httpx.post(
+                f"{api_base_url()}/shutdown",
+                json={"version": version},
+                headers=self._headers(),
+                timeout=HEALTH_TIMEOUT,
+            )
+        except httpx.HTTPError as e:
+            logger.warning("shutdown request failed: %s", str(e) or type(e).__name__)
+            return "error"
+        if r.status_code == 200:
+            return "ok"
+        if r.status_code == 409:
+            return "conflict"
+        if r.status_code in (404, 405):
+            return "unsupported"
+        return "refused"
+
+    def _terminate_stale(self, health: dict[str, Any]) -> bool:
+        """SIGTERM a pre-0.3 bridge after checking it is still the same local process.
+
+        True when it was signalled or is already gone.
+        """
+        if not _is_loopback(urlsplit(api_base_url()).hostname):
+            logger.warning("not signalling the stale bridge: it is not on this machine")
+            return False
+        try:
+            now = self.health()
+        except BridgeError as e:  # something else took the port: nothing of ours to signal
+            logger.warning("not signalling the stale bridge: %s", e)
+            return False
+        if now is None:
+            return True
+        pid = health.get("pid")
+        if (
+            not isinstance(pid, int)
+            or pid <= 0
+            or now.get("pid") != pid
+            or now.get("version") != health.get("version")
+        ):
+            logger.warning("not signalling the stale bridge: it changed since it was checked")
+            return False
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return True
+        except OSError as e:
+            logger.warning("could not signal the stale bridge pid %s: %s", pid, e)
+            return False
+        logger.info("sent SIGTERM to the stale bridge pid %s", pid)
+        return True
+
+    def _wait_gone(self, timeout: float) -> bool:
+        """Poll health until nothing answers; False when it still answers after timeout."""
+        deadline = time.monotonic() + timeout
+        while self._safe_health():
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.2)
+        return True
 
     def _log_path(self) -> str:
         return os.path.join(store_dir(), "bridge.log")
@@ -593,22 +764,36 @@ class BridgeManager:
         # Only a supervisor-built binary (it has a .srchash sidecar) is compared; release
         # binaries report their tag. Compare with the current sources, not the sidecar: a
         # reused daemon is never rebuilt, so after a repo update the sidecar is just as old.
-        try:
-            current = source_hash(src_dir())
-        except OSError:  # a source file vanished mid-read (git checkout/pull): use the sidecar
-            current = None
+        current = _current_source_hash()  # None when sources change mid-read: use the sidecar
         expected = built_version() and (current or built_version())
         if expected and health.get("version") != expected:
             out["restart_needed"] = True
-            out["hint"] = (
-                f"The running bridge (pid {health.get('pid')}) was built from older sources. "
-                f"Stop it (kill {health.get('pid')}); the next bridge call spawns it again and "
-                "rebuilds it first if Go is available."
-            )
+            pid = health.get("pid")
+            if self._auto_replaceable(current, st):
+                out["hint"] = (
+                    f"The running bridge (pid {pid}) was built from older sources. "
+                    "Reconnect the MCP server to replace it automatically."
+                )
+            else:
+                out["hint"] = (
+                    f"The running bridge (pid {pid}) was built from older sources. "
+                    f"Stop it (kill {pid}); the next bridge call spawns it again and "
+                    "rebuilds it first if Go is available."
+                )
             logger.warning(
                 "bridge daemon is stale: running %s, built %s", health.get("version"), expected
             )
         return out
+
+    @staticmethod
+    def _auto_replaceable(current: str | None, st: dict[str, Any]) -> bool:
+        """Whether a new MCP server process would replace the stale bridge (the start gate)."""
+        return (
+            _is_posix()
+            and current is not None
+            and st.get("pairing") not in PAIRING_IN_PROGRESS
+            and (built_version() == current or find_go() is not None)
+        )
 
     def _safe_health(self) -> bool:
         try:

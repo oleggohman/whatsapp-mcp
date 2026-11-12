@@ -381,3 +381,185 @@ def test_binary_appearing_while_checking_sources_is_used(run_env, monkeypatch):
     mgr = BridgeManager()
     mgr.ensure_running()
     assert spawned == [str(binary)] and mgr.state == "running"
+
+
+# --- stale bridge replacement ------------------------------------------------------------------
+
+STALE = {"service": "whatsapp-bridge", "version": "old-hash", "pid": 4242}
+
+
+def test_is_loopback():
+    for host in ("localhost", "127.0.0.1", "127.0.0.2", "::1"):
+        assert bridge_manager._is_loopback(host) is True
+    for host in ("192.168.0.5", "example.test", "", None):
+        assert bridge_manager._is_loopback(host) is False
+
+
+def test_is_posix_follows_os_name(monkeypatch):
+    monkeypatch.setattr(bridge_manager.os, "name", "nt")
+    assert bridge_manager._is_posix() is False
+    monkeypatch.setattr(bridge_manager.os, "name", "posix")
+    assert bridge_manager._is_posix() is True
+
+
+@pytest.fixture
+def replace_env(run_env, monkeypatch):
+    """A stale supervisor-built bridge answers; spawning and shutdown requests are recorded."""
+    tmp_path, src = run_env
+    (src / "main.go").write_text("package main\n")
+    current = bridge_manager.source_hash(str(src))
+    binary = tmp_path / "bridge-bin"
+    binary.write_text("bin")
+    (tmp_path / "bridge-bin.srchash").write_text(current)
+    monkeypatch.setenv("WHATSAPP_API_BASE_URL", "http://127.0.0.1:9/api")
+    monkeypatch.setattr(BridgeManager, "api", lambda self, m, p, **kw: {"pairing": "idle"})
+    calls = {"spawned": [], "posts": [], "kills": []}
+    monkeypatch.setattr(
+        BridgeManager, "_spawn", lambda self, b: calls["spawned"].append(b) or "proc"
+    )
+    monkeypatch.setattr(BridgeManager, "_wait_for_health", lambda self, proc, b: None)
+    monkeypatch.setattr(bridge_manager.os, "kill", lambda pid, sig: calls["kills"].append(pid))
+    monkeypatch.setattr(bridge_manager.time, "sleep", lambda s: None)
+    monkeypatch.setattr(bridge_manager, "REPLACE_TIMEOUT", 0.0)
+    return calls
+
+
+def _post_answers(monkeypatch, calls, answer):
+    def post(url, **kwargs):
+        calls["posts"].append((url, kwargs))
+        if isinstance(answer, Exception):
+            raise answer
+        return httpx.Response(answer, json={})
+
+    monkeypatch.setattr(httpx, "post", post)
+
+
+def test_request_shutdown_outcomes(replace_env, monkeypatch):
+    monkeypatch.setenv("WHATSAPP_BRIDGE_TOKEN", "tok")
+    expected = {200: "ok", 409: "conflict", 404: "unsupported", 405: "unsupported"}
+    expected.update({401: "refused", 500: "refused"})
+    for code, outcome in expected.items():
+        _post_answers(monkeypatch, replace_env, code)
+        assert BridgeManager()._request_shutdown("old-hash") == outcome
+    url, kwargs = replace_env["posts"][0]
+    assert url == "http://127.0.0.1:9/api/shutdown" and kwargs["json"] == {"version": "old-hash"}
+    assert kwargs["headers"]["Authorization"] == "Bearer tok"
+    _post_answers(monkeypatch, replace_env, httpx.ConnectError(""))
+    assert BridgeManager()._request_shutdown("old-hash") == "error"
+
+
+def test_source_hash_oserror_means_no_replacement(replace_env, monkeypatch):
+    def vanished(src):
+        raise FileNotFoundError("main.go")
+
+    monkeypatch.setattr(bridge_manager, "source_hash", vanished)
+    monkeypatch.setattr(
+        BridgeManager, "api", lambda self, m, p, **kw: pytest.fail("gate must stop earlier")
+    )
+    _post_answers(monkeypatch, replace_env, 200)
+    _script_health(monkeypatch, [STALE])
+    mgr = BridgeManager()
+    mgr.ensure_running()
+    assert mgr.state == "running" and replace_env["posts"] == [] and replace_env["spawned"] == []
+
+
+def test_transport_error_then_still_answering_falls_back_to_sigterm(replace_env, monkeypatch):
+    _post_answers(monkeypatch, replace_env, httpx.RemoteProtocolError("dropped"))
+    # first run check, wait_gone (timeout 0: still there), pid re-check, then gone
+    _script_health(monkeypatch, [STALE, STALE, STALE, None])
+    mgr = BridgeManager()
+    mgr.ensure_running()
+    assert replace_env["kills"] == [4242] and replace_env["spawned"] != []
+    assert mgr.state == "running"
+
+
+def test_conflict_and_bridge_gone_on_recheck_spawns(replace_env, monkeypatch):
+    _post_answers(monkeypatch, replace_env, 409)
+    _script_health(monkeypatch, [STALE, None])
+    mgr = BridgeManager()
+    mgr.ensure_running()
+    assert replace_env["spawned"] != [] and replace_env["kills"] == []
+
+
+def test_refused_shutdown_reuses_bridge(replace_env, monkeypatch):
+    _post_answers(monkeypatch, replace_env, 401)
+    _script_health(monkeypatch, [STALE])
+    mgr = BridgeManager()
+    mgr.ensure_running()
+    assert mgr.state == "running" and replace_env["spawned"] == [] and replace_env["kills"] == []
+
+
+def test_unsupported_shutdown_and_refused_sigterm_reuses_bridge(replace_env, monkeypatch):
+    _post_answers(monkeypatch, replace_env, 404)
+    _script_health(monkeypatch, [STALE, dict(STALE, pid=999)])  # pid changed before the kill
+    mgr = BridgeManager()
+    mgr.ensure_running()
+    assert mgr.state == "running" and replace_env["kills"] == [] and replace_env["spawned"] == []
+
+
+@pytest.mark.parametrize(
+    "now",
+    [
+        dict(STALE, pid=999),  # another process now answers
+        dict(STALE, version="newer"),  # same pid reused by another build
+    ],
+)
+def test_terminate_refuses_when_bridge_changed(replace_env, monkeypatch, now):
+    _script_health(monkeypatch, [now])
+    assert BridgeManager()._terminate_stale(STALE) is False
+    assert replace_env["kills"] == []
+
+
+@pytest.mark.parametrize("pid", [None, "4242", 0, -1])
+def test_terminate_refuses_invalid_pid(replace_env, monkeypatch, pid):
+    _script_health(monkeypatch, [dict(STALE, pid=pid)])
+    assert BridgeManager()._terminate_stale(dict(STALE, pid=pid)) is False
+    assert replace_env["kills"] == []
+
+
+def test_terminate_refuses_remote_bridge(replace_env, monkeypatch):
+    monkeypatch.setenv("WHATSAPP_API_BASE_URL", "http://192.168.0.5:8080/api")
+    monkeypatch.setattr(BridgeManager, "health", lambda self: pytest.fail("no health re-read"))
+    assert BridgeManager()._terminate_stale(STALE) is False
+    assert replace_env["kills"] == []
+
+
+def test_terminate_refuses_when_port_taken_by_foreign_service(replace_env, monkeypatch):
+    def foreign(self):
+        raise BridgeError("in use by another service")
+
+    monkeypatch.setattr(BridgeManager, "health", foreign)
+    assert BridgeManager()._terminate_stale(STALE) is False
+    assert replace_env["kills"] == []
+
+
+def test_terminate_when_already_gone(replace_env, monkeypatch):
+    _script_health(monkeypatch, [None])
+    assert BridgeManager()._terminate_stale(STALE) is True
+    assert replace_env["kills"] == []
+
+
+def test_terminate_sends_sigterm(replace_env, monkeypatch):
+    sent = []
+    monkeypatch.setattr(bridge_manager.os, "kill", lambda pid, sig: sent.append((pid, sig)))
+    _script_health(monkeypatch, [STALE])
+    assert BridgeManager()._terminate_stale(STALE) is True
+    assert sent == [(4242, bridge_manager.signal.SIGTERM)]
+
+
+def test_terminate_process_lookup_error_means_gone(replace_env, monkeypatch):
+    def gone(pid, sig):
+        raise ProcessLookupError(pid)
+
+    monkeypatch.setattr(bridge_manager.os, "kill", gone)
+    _script_health(monkeypatch, [STALE])
+    assert BridgeManager()._terminate_stale(STALE) is True
+
+
+def test_terminate_permission_error_refuses(replace_env, monkeypatch):
+    def denied(pid, sig):
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(bridge_manager.os, "kill", denied)
+    _script_health(monkeypatch, [STALE])
+    assert BridgeManager()._terminate_stale(STALE) is False
