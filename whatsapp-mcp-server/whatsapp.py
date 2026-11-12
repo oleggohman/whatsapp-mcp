@@ -7,12 +7,11 @@ from typing import Any, Iterator, Optional, List, Tuple
 import os.path
 import httpx
 import audio
+import bridge_manager
 
 # stdout is the MCP stdio transport: all diagnostics go through logging (stderr).
 logger = logging.getLogger(__name__)
 
-DEFAULT_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-DEFAULT_API_BASE_URL = "http://localhost:8080/api"
 HTTP_TIMEOUT = httpx.Timeout(60.0, connect=5.0)
 
 # Test hook: when set, used as the httpx transport (e.g. httpx.MockTransport).
@@ -20,16 +19,17 @@ _http_transport: Optional[httpx.BaseTransport] = None
 
 
 def _db_path() -> str:
-    """Path of messages.db (WHATSAPP_DB_PATH, default: the bridge store next to this server)."""
-    return os.environ.get("WHATSAPP_DB_PATH") or DEFAULT_DB_PATH
+    """Path of messages.db: WHATSAPP_DB_PATH, else <WHATSAPP_STORE_DIR>/messages.db."""
+    return os.environ.get("WHATSAPP_DB_PATH") or os.path.join(bridge_manager.store_dir(), "messages.db")
 
 
 def _api_base_url() -> str:
-    return (os.environ.get("WHATSAPP_API_BASE_URL") or DEFAULT_API_BASE_URL).rstrip("/")
+    return bridge_manager.api_base_url()
 
 
 def _bridge_token() -> Optional[str]:
-    return os.environ.get("WHATSAPP_BRIDGE_TOKEN") or None
+    """Bearer token: WHATSAPP_BRIDGE_TOKEN, else <store>/bridge.token when it exists."""
+    return bridge_manager.read_token()
 
 
 @contextmanager

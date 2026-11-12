@@ -15,8 +15,9 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 )
 
-// bridgeVersion is reported by /api/health.
-const bridgeVersion = "0.2.0"
+// bridgeVersion is reported by /api/health. The MCP supervisor overrides it at build time
+// (-ldflags "-X main.bridgeVersion=<source hash>") to detect daemons running stale code.
+var bridgeVersion = "0.2.0"
 
 // Pairing states reported in /api/status ("replaced" is derived from the replaced flag).
 const (

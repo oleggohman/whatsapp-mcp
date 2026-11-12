@@ -1,0 +1,479 @@
+"""Supervisor for the Go bridge: build, spawn and health-check a shared per-store daemon.
+
+Lifecycle model: the bridge is a daemon, one per store dir. Any MCP client spawns it when it is
+absent and none of them ever stops it (it exits via WHATSAPP_BRIDGE_IDLE_EXIT, kill or reboot).
+stdout carries the MCP stdio transport, so everything here logs to stderr via logging.
+"""
+
+import glob
+import hashlib
+import logging
+import os
+import secrets
+import shutil
+import subprocess
+import threading
+import time
+import uuid
+from typing import Any, Optional
+from urllib.parse import urlsplit
+
+import httpx
+
+logger = logging.getLogger(__name__)
+
+SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_STORE_DIR = os.path.join(SERVER_DIR, "..", "whatsapp-bridge", "store")
+DEFAULT_SRC_DIR = os.path.join(SERVER_DIR, "..", "whatsapp-bridge")
+DEFAULT_BIN = os.path.join(DEFAULT_SRC_DIR, "whatsapp-bridge")
+DEFAULT_API_BASE_URL = "http://localhost:8080/api"
+
+EX_TEMPFAIL = 75  # bridge exit code: a peer bridge holds the store lock (running or starting)
+LOG_ROTATE_BYTES = 5 * 1024 * 1024
+LOG_TAIL_BYTES = 4096
+HEALTH_TIMEOUT = httpx.Timeout(3.0, connect=1.0)
+API_TIMEOUT = httpx.Timeout(30.0, connect=3.0)
+
+GO_PROBE_PATHS = (
+    "/opt/homebrew/bin/go",
+    "/usr/local/go/bin/go",
+    "/usr/local/bin/go",
+    "~/go/bin/go",
+    "~/sdk/*/bin/go",
+)
+
+
+class BridgeError(RuntimeError):
+    """A bridge supervision failure with a user-facing message."""
+
+
+# --- configuration (read at call time so tests and clients can change the env) ---------------
+
+
+def store_dir() -> str:
+    """Absolute store dir shared by the bridge and this server (WHATSAPP_STORE_DIR)."""
+    return os.path.abspath(os.environ.get("WHATSAPP_STORE_DIR") or DEFAULT_STORE_DIR)
+
+
+def api_base_url() -> str:
+    return (os.environ.get("WHATSAPP_API_BASE_URL") or DEFAULT_API_BASE_URL).rstrip("/")
+
+
+def bridge_addr() -> Optional[str]:
+    """Listen address handed to the child: WHATSAPP_BRIDGE_ADDR, else derived from the API URL."""
+    addr = os.environ.get("WHATSAPP_BRIDGE_ADDR")
+    if addr:
+        return addr
+    parts = urlsplit(api_base_url())
+    host = parts.hostname or "127.0.0.1"
+    if host == "localhost":
+        host = "127.0.0.1"
+    return f"{host}:{parts.port or 80}"
+
+
+def autostart_enabled() -> bool:
+    return os.environ.get("WHATSAPP_BRIDGE_AUTOSTART", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def bridge_bin() -> str:
+    return os.path.abspath(os.environ.get("WHATSAPP_BRIDGE_BIN") or DEFAULT_BIN)
+
+
+def src_dir() -> str:
+    return os.path.abspath(os.environ.get("WHATSAPP_BRIDGE_SRC") or DEFAULT_SRC_DIR)
+
+
+def start_timeout() -> float:
+    try:
+        return float(os.environ.get("WHATSAPP_BRIDGE_START_TIMEOUT", "60"))
+    except ValueError:
+        return 60.0
+
+
+# --- token ---------------------------------------------------------------------------------
+
+
+def token_path() -> str:
+    return os.path.join(store_dir(), "bridge.token")
+
+
+def read_token() -> Optional[str]:
+    """Token from WHATSAPP_BRIDGE_TOKEN, else <store>/bridge.token; None when neither exists."""
+    env = (os.environ.get("WHATSAPP_BRIDGE_TOKEN") or "").strip()
+    if env:
+        return env
+    try:
+        with open(token_path(), encoding="utf-8") as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def ensure_token() -> str:
+    """Return the token, creating <store>/bridge.token atomically (O_EXCL, 0600) if needed."""
+    existing = read_token()
+    if existing:
+        return existing
+    path = token_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    token = secrets.token_hex(32)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        # A peer won the race; its write may still be in flight, so retry briefly.
+        for _ in range(50):
+            existing = read_token()
+            if existing:
+                return existing
+            time.sleep(0.05)
+        raise BridgeError(f"token file {path} exists but is empty") from None
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(token)
+    return token
+
+
+# --- build ---------------------------------------------------------------------------------
+
+
+def find_go() -> Optional[str]:
+    """Locate the go tool: WHATSAPP_GO_BIN, PATH, then common install locations."""
+    explicit = os.environ.get("WHATSAPP_GO_BIN")
+    if explicit:
+        return shutil.which(explicit) or (explicit if os.path.isfile(explicit) else None)
+    found = shutil.which("go")
+    if found:
+        return found
+    for pattern in GO_PROBE_PATHS:
+        for candidate in sorted(glob.glob(os.path.expanduser(pattern))):
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+    return None
+
+
+def _source_files(src: str) -> list[str]:
+    files = [f for f in glob.glob(os.path.join(src, "*.go")) if not f.endswith("_test.go")]
+    files.append(os.path.join(src, "go.sum"))
+    return sorted(f for f in files if os.path.isfile(f))
+
+
+def source_hash(src: str) -> Optional[str]:
+    """Short hash of the bridge sources (*.go without tests, go.sum); None without sources."""
+    files = _source_files(src)
+    if not files:
+        return None
+    h = hashlib.sha256()
+    for f in files:
+        h.update(os.path.basename(f).encode())
+        with open(f, "rb") as fh:
+            h.update(fh.read())
+    return h.hexdigest()[:12]
+
+
+def _hash_sidecar(binary: str) -> str:
+    return binary + ".srchash"
+
+
+def built_version(binary: Optional[str] = None) -> Optional[str]:
+    """Source hash stamped into the binary this supervisor built (None if it did not build it)."""
+    try:
+        with open(_hash_sidecar(binary or bridge_bin()), encoding="utf-8") as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def needs_build(binary: str, src: str) -> bool:
+    if not os.path.isfile(binary):
+        return True
+    files = _source_files(src)
+    if not files:
+        return False
+    return max(os.path.getmtime(f) for f in files) > os.path.getmtime(binary)
+
+
+def _tail(text: str, limit: int = LOG_TAIL_BYTES) -> str:
+    return text[-limit:].strip()
+
+
+_build_lock = threading.Lock()
+
+
+def build_bridge(binary: str, src: str) -> None:
+    """go build into a temp file, then atomically replace the binary. Output is captured."""
+    go = find_go()
+    if go is None:
+        raise BridgeError(
+            "Go toolchain not found. Install Go (https://go.dev/dl/), or set WHATSAPP_GO_BIN, "
+            "or point WHATSAPP_BRIDGE_BIN at a prebuilt bridge binary."
+        )
+    version = source_hash(src) or "unknown"
+    env = dict(os.environ, CGO_ENABLED="1")
+    os.makedirs(os.path.dirname(binary), exist_ok=True)
+    tmp = f"{binary}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+    cmd = [go, "build", "-ldflags", f"-X main.bridgeVersion={version}", "-o", tmp, "."]
+    logger.info("building bridge: %s (cwd %s)", " ".join(cmd), src)
+    try:
+        with _build_lock:
+            proc = subprocess.run(
+                cmd, cwd=src, env=env, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, errors="replace", timeout=900, check=False,
+            )
+        if proc.returncode != 0:
+            raise BridgeError(f"go build failed (exit {proc.returncode}):\n{_tail(proc.stdout or '')}")
+        os.replace(tmp, binary)
+        with open(_hash_sidecar(binary), "w", encoding="utf-8") as f:
+            f.write(version)
+    except subprocess.TimeoutExpired as e:
+        raise BridgeError("go build timed out after 15 minutes") from e
+    except OSError as e:
+        raise BridgeError(f"go build could not run: {e}") from e
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+# --- manager -------------------------------------------------------------------------------
+
+
+def _same_dir(a: str, b: str) -> bool:
+    return os.path.realpath(a) == os.path.realpath(b)
+
+
+class BridgeManager:
+    """Builds, starts and watches the bridge daemon. Thread-safe; blocking calls run in threads."""
+
+    def __init__(self) -> None:
+        self.state = "idle"  # idle | building | starting | running | failed
+        self.error: Optional[str] = None
+        self._lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+        self._done = threading.Event()  # set once state is running or failed
+
+    # -- http helpers --
+
+    def _headers(self) -> dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        token = read_token()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        return headers
+
+    def health(self) -> Optional[dict[str, Any]]:
+        """GET /api/health; None when nothing answers. A non-bridge answer raises BridgeError."""
+        try:
+            r = httpx.get(f"{api_base_url()}/health", timeout=HEALTH_TIMEOUT)
+        except httpx.HTTPError:
+            return None
+        try:
+            body = r.json() if r.status_code == 200 else None
+        except ValueError:
+            body = None
+        if not isinstance(body, dict) or body.get("service") != "whatsapp-bridge":
+            if r.status_code == 200 and body is not None:
+                raise BridgeError(f"{api_base_url()} is in use by another service, not the WhatsApp bridge")
+            return None
+        if not _same_dir(str(body.get("store_dir", "")), store_dir()):
+            raise BridgeError(
+                f"port in use by another bridge/store: it serves {body.get('store_dir')!r}, "
+                f"this server uses {store_dir()!r}. Set WHATSAPP_STORE_DIR / WHATSAPP_BRIDGE_ADDR consistently."
+            )
+        return body
+
+    def api(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        """Authenticated bridge call; returns the JSON body. Raises BridgeError on failure."""
+        try:
+            r = httpx.request(
+                method, f"{api_base_url()}/{path.lstrip('/')}",
+                headers=self._headers(), timeout=API_TIMEOUT, **kwargs,
+            )
+        except httpx.HTTPError as e:
+            raise BridgeError(f"bridge request failed: {str(e) or type(e).__name__}") from e
+        if r.status_code == 401:
+            raise BridgeError(
+                "bridge running with unknown token: set WHATSAPP_BRIDGE_TOKEN to the token it "
+                f"was started with, or stop it (kill the pid from {api_base_url()}/health)"
+            )
+        try:
+            body = r.json()
+        except ValueError:
+            body = None
+        if not isinstance(body, dict):
+            raise BridgeError(f"bridge returned HTTP {r.status_code}: {_tail(r.text, 300)}")
+        if r.status_code >= 400:
+            raise BridgeError(str(body.get("message") or f"bridge returned HTTP {r.status_code}"))
+        return body
+
+    # -- lifecycle --
+
+    def start_background(self) -> None:
+        """Start ensure_running in a daemon thread (idempotent). Returns immediately."""
+        with self._lock:
+            if self._thread is not None:
+                return
+            self._thread = threading.Thread(target=self._run, name="bridge-supervisor", daemon=True)
+            self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            self.ensure_running()
+        except Exception as e:  # noqa: BLE001 - surfaced through status, never raised into the loop
+            self._fail(str(e) or type(e).__name__)
+
+    def _fail(self, message: str) -> None:
+        logger.error("bridge supervisor: %s", message)
+        self.state, self.error = "failed", message
+        self._done.set()
+
+    def wait_ready(self, timeout: float) -> str:
+        """Block up to timeout for the supervisor; returns the state (running|failed|building|...)."""
+        if not autostart_enabled():
+            return "running"  # manual mode: the user manages the bridge
+        self.start_background()
+        self._done.wait(timeout)
+        return self.state
+
+    def ensure_running(self) -> None:
+        """Make sure a bridge for our store dir answers on the configured address."""
+        if not autostart_enabled():
+            logger.info("bridge autostart disabled (WHATSAPP_BRIDGE_AUTOSTART=0)")
+            return
+        self.error = None
+        ensure_token()  # before any spawn so every client shares the same token file
+
+        if self.health() is not None:
+            logger.info("reusing bridge already running on %s", api_base_url())
+            self.state = "running"
+            self._done.set()
+            return
+
+        binary, src = bridge_bin(), src_dir()
+        if needs_build(binary, src):
+            self.state = "building"
+            if os.path.isdir(src) and _source_files(src):
+                if find_go() is None and os.path.isfile(binary):
+                    logger.warning("sources are newer than %s but Go is not installed; using it as is", binary)
+                else:
+                    build_bridge(binary, src)
+            elif not os.path.isfile(binary):
+                raise BridgeError(f"bridge binary {binary} not found and no sources in {src}")
+
+        self.state = "starting"
+        # Re-check: a peer may have started it while we were building.
+        if self.health() is not None:
+            self.state = "running"
+            self._done.set()
+            return
+        proc = self._spawn(binary)
+        self._wait_for_health(proc)
+        self.state = "running"
+        self._done.set()
+
+    def _log_path(self) -> str:
+        return os.path.join(store_dir(), "bridge.log")
+
+    def _spawn(self, binary: str) -> "subprocess.Popen[bytes]":
+        os.makedirs(store_dir(), exist_ok=True)
+        log = self._log_path()
+        try:
+            if os.path.getsize(log) > LOG_ROTATE_BYTES:
+                os.replace(log, log + ".1")
+        except OSError:
+            pass
+        env = dict(os.environ, WHATSAPP_STORE_DIR=store_dir())
+        addr = bridge_addr()
+        if addr:
+            env["WHATSAPP_BRIDGE_ADDR"] = addr
+        logger.info("starting bridge %s (store %s, addr %s)", binary, store_dir(), addr)
+        with open(log, "ab") as logf:
+            return subprocess.Popen(  # noqa: S603 - our own binary
+                [binary], cwd=store_dir(), env=env, stdin=subprocess.DEVNULL,
+                stdout=logf, stderr=logf, start_new_session=True,
+            )
+
+    def _wait_for_health(self, proc: "Optional[subprocess.Popen[bytes]]") -> None:
+        deadline = time.monotonic() + start_timeout()
+        while time.monotonic() < deadline:
+            if self.health() is not None:
+                return
+            if proc is not None:
+                code = proc.poll()
+                if code == EX_TEMPFAIL:
+                    logger.info("bridge peer holds the store lock; waiting for it to answer")
+                    proc = None  # a peer won the race: keep polling health
+                elif code is not None:
+                    raise BridgeError(f"bridge exited with code {code}:\n{self.log_tail()}")
+            time.sleep(0.2)
+        raise BridgeError(f"bridge did not answer within {start_timeout():.0f}s:\n{self.log_tail()}")
+
+    def log_tail(self) -> str:
+        try:
+            with open(self._log_path(), "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - LOG_TAIL_BYTES))
+                return f.read().decode("utf-8", "replace").strip()
+        except OSError:
+            return ""
+
+    # -- status for tools --
+
+    def status(self) -> dict[str, Any]:
+        """Snapshot for get_connection_status: supervisor state plus the bridge's own status."""
+        out: dict[str, Any] = {"state": self.state}
+        if self.state == "idle" and not autostart_enabled():
+            out["state"] = "running" if self._safe_health() else "failed"
+            if out["state"] == "failed":
+                out["error"] = "autostart is disabled (WHATSAPP_BRIDGE_AUTOSTART=0) and no bridge answers"
+        if self.error:
+            out["error"] = self.error
+        if out["state"] == "failed":
+            out["log_tail"] = self.log_tail()
+            return out
+        if out["state"] != "running":
+            return out
+        try:
+            health = self.health()
+            if health is None:
+                out.update(state="failed", error="bridge stopped answering", log_tail=self.log_tail())
+                return out
+            st = self.api("GET", "status")
+        except BridgeError as e:
+            out["error"] = str(e)
+            return out
+        out.update({k: st.get(k) for k in ("connected", "logged_in", "pairing")})
+        if st.get("pairing_error"):
+            out["pairing_error"] = st["pairing_error"]
+        expected = built_version()
+        if expected and health.get("version") != expected:
+            out["restart_needed"] = True
+            out["hint"] = (
+                f"The running bridge (pid {health.get('pid')}) was built from older sources. "
+                f"Stop it (kill {health.get('pid')}); the next MCP start spawns the new build."
+            )
+            logger.warning("bridge daemon is stale: running %s, built %s", health.get("version"), expected)
+        return out
+
+    def _safe_health(self) -> bool:
+        try:
+            return self.health() is not None
+        except BridgeError:
+            return False
+
+
+_manager: Optional[BridgeManager] = None
+_manager_lock = threading.Lock()
+
+
+def get_manager() -> BridgeManager:
+    global _manager
+    with _manager_lock:
+        if _manager is None:
+            _manager = BridgeManager()
+        return _manager
+
+
+def reset_manager() -> None:
+    """Drop the singleton (tests)."""
+    global _manager
+    with _manager_lock:
+        _manager = None

@@ -1,3 +1,6 @@
 *.db
 claude_desktop_config.json
 whatsapp.log
+# Locally built bridge binary and its source-hash sidecar
+whatsapp-bridge/whatsapp-bridge
+*.srchash

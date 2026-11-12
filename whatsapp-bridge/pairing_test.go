@@ -426,6 +426,15 @@ func TestHealthAndStatusAuth(t *testing.T) {
 		t.Fatalf("health = %+v (want store_dir %s)", hr, abs)
 	}
 
+	// bridgeVersion is a var so the supervisor can stamp it with -ldflags; health reports it.
+	old := bridgeVersion
+	bridgeVersion = "stamped-abc123"
+	t.Cleanup(func() { bridgeVersion = old })
+	rec = do(h, http.MethodGet, "/api/health", "")
+	if hr := decode[healthResponse](t, rec.Body.String()); hr.Version != "stamped-abc123" {
+		t.Fatalf("health version = %q, want stamped value", hr.Version)
+	}
+
 	if rec := do(h, http.MethodGet, "/api/status", ""); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status without token = %d, want 401", rec.Code)
 	}

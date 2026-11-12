@@ -198,6 +198,7 @@ def _normalize(schema: dict) -> dict:
 async def test_tool_schemas_match_baseline():
     baseline = json.loads(BASELINE.read_text())
     tools = {t.name: t.inputSchema for t in await main.mcp.list_tools()}
-    assert set(tools) == set(baseline)
+    # The baseline tools stay unchanged; Task 9a adds exactly these pairing/status tools.
+    assert set(tools) == set(baseline) | {"get_connection_status", "get_pairing_qr", "pair_with_phone_number"}
     for name, schema in baseline.items():
         assert _normalize(tools[name]) == _normalize(schema), name

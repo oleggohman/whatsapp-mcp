@@ -79,12 +79,27 @@ def make_whatsapp_db(path: Path) -> None:
     conn.close()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_bridge_env(tmp_path_factory, monkeypatch):
+    """Never touch a real store or bridge: manual mode, private store dir, fresh manager."""
+    import bridge_manager
+
+    monkeypatch.setenv("WHATSAPP_BRIDGE_AUTOSTART", "0")
+    monkeypatch.setenv("WHATSAPP_STORE_DIR", str(tmp_path_factory.mktemp("store")))
+    for var in ("WHATSAPP_BRIDGE_ADDR", "WHATSAPP_BRIDGE_BIN", "WHATSAPP_BRIDGE_SRC", "WHATSAPP_GO_BIN"):
+        monkeypatch.delenv(var, raising=False)
+    bridge_manager.reset_manager()
+    yield
+    bridge_manager.reset_manager()
+
+
 @pytest.fixture
 def store_dir(tmp_path, monkeypatch):
     """Temp store dir with messages.db (WAL) and whatsapp.db; env points the server at it."""
     make_messages_db(tmp_path / "messages.db")
     make_whatsapp_db(tmp_path / "whatsapp.db")
     monkeypatch.setenv("WHATSAPP_DB_PATH", str(tmp_path / "messages.db"))
+    monkeypatch.setenv("WHATSAPP_STORE_DIR", str(tmp_path))
     monkeypatch.delenv("WHATSAPP_API_BASE_URL", raising=False)
     monkeypatch.delenv("WHATSAPP_BRIDGE_TOKEN", raising=False)
     return tmp_path
