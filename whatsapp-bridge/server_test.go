@@ -26,23 +26,37 @@ type fakeClient struct {
 	sends     []types.JID
 	downloads int
 	data      []byte
+
+	// Failure injection and recorded calls
+	uploadErr   error
+	sendErr     error
+	downloadErr error
+	uploadTypes []whatsmeow.MediaType
+	msgs        []*waE2E.Message
+	dlMsgs      []whatsmeow.DownloadableMessage
 }
 
 func (f *fakeClient) IsConnected() bool { return f.connected }
 
-func (f *fakeClient) Upload(_ context.Context, b []byte, _ whatsmeow.MediaType) (whatsmeow.UploadResponse, error) {
+func (f *fakeClient) Upload(_ context.Context, b []byte, mt whatsmeow.MediaType) (whatsmeow.UploadResponse, error) {
 	f.uploads++
+	f.uploadTypes = append(f.uploadTypes, mt)
+	if f.uploadErr != nil {
+		return whatsmeow.UploadResponse{}, f.uploadErr
+	}
 	return whatsmeow.UploadResponse{URL: "u", DirectPath: "/d", FileLength: uint64(len(b))}, nil
 }
 
-func (f *fakeClient) SendMessage(_ context.Context, to types.JID, _ *waE2E.Message, _ ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
+func (f *fakeClient) SendMessage(_ context.Context, to types.JID, m *waE2E.Message, _ ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
 	f.sends = append(f.sends, to)
-	return whatsmeow.SendResponse{}, nil
+	f.msgs = append(f.msgs, m)
+	return whatsmeow.SendResponse{}, f.sendErr
 }
 
-func (f *fakeClient) Download(_ context.Context, _ whatsmeow.DownloadableMessage) ([]byte, error) {
+func (f *fakeClient) Download(_ context.Context, m whatsmeow.DownloadableMessage) ([]byte, error) {
 	f.downloads++
-	return f.data, nil
+	f.dlMsgs = append(f.dlMsgs, m)
+	return f.data, f.downloadErr
 }
 
 func newTestAPI(t *testing.T, fc *fakeClient, token string) (*apiServer, http.Handler) {
