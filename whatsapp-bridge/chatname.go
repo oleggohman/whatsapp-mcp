@@ -217,6 +217,18 @@ func (r *chatResolver) mergeIfMapped(ctx context.Context, orig, norm types.JID) 
 	}
 }
 
+// lockChat takes the repair lock for a chat a repair may merge (anything but a group) and
+// returns the unlock func. Holding it from StoreChat to StoreMessage keeps a repair from
+// deleting the LID chat in between, which would fail the message insert (foreign key).
+// Groups are never merged, and resolving their names may need the network.
+func (r *chatResolver) lockChat(jid types.JID) func() {
+	if jid.Server == types.GroupServer {
+		return func() {}
+	}
+	r.runMu.Lock()
+	return r.runMu.Unlock
+}
+
 func (r *chatResolver) chatExists(jid string) bool {
 	var n int
 	return r.store.db.QueryRow("SELECT 1 FROM chats WHERE jid = ?", jid).Scan(&n) == nil

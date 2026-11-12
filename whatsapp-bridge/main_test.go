@@ -104,3 +104,66 @@ func TestHistorySyncLogsNoBody(t *testing.T) {
 	}
 	assertNoSecrets(t, logs)
 }
+
+// A DM must be stored while holding the repair lock: a repair that merges (deletes) the
+// LID chat between StoreChat and StoreMessage would make the insert fail and drop it.
+func TestMessageStoreWaitsForRepair(t *testing.T) {
+	r, ms := newTestResolver(t, nil, newFakeLIDs(), nil)
+	logger := newStderrLogger("Test", "ERROR")
+	evt := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{Chat: lidJID(testLID), Sender: lidJID(testLID)},
+			ID:            "m1",
+			Timestamp:     time.Now(),
+		},
+		Message: &waE2E.Message{Conversation: proto.String("hi")},
+	}
+	hs := &events.HistorySync{Data: &waHistorySync.HistorySync{Conversations: []*waHistorySync.Conversation{{
+		ID: proto.String(lidJID(testLID2).String()),
+		Messages: []*waHistorySync.HistorySyncMsg{{Message: &waWeb.WebMessageInfo{
+			Key:              &waCommon.MessageKey{RemoteJID: proto.String(lidJID(testLID2).String()), ID: proto.String("h1")},
+			Message:          &waE2E.Message{Conversation: proto.String("hi")},
+			MessageTimestamp: proto.Uint64(uint64(time.Now().Unix())),
+		}}},
+	}}}}
+
+	r.runMu.Lock() // a repair pass is running
+	done := make(chan struct{}, 2)
+	go func() { handleMessage(r, ms, evt, logger); done <- struct{}{} }()
+	go func() { handleHistorySync(r, testMyPN, ms, hs, logger); done <- struct{}{} }()
+	time.Sleep(50 * time.Millisecond)
+	stored := countMsgs(t, ms, lidJID(testLID).String()) + countMsgs(t, ms, lidJID(testLID2).String())
+	r.runMu.Unlock()
+	for i := 0; i < 2; i++ {
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("handler did not finish after the repair released the lock")
+		}
+	}
+	if stored != 0 {
+		t.Fatalf("%d message(s) stored while a repair held the lock", stored)
+	}
+	if countMsgs(t, ms, lidJID(testLID).String()) != 1 || countMsgs(t, ms, lidJID(testLID2).String()) != 1 {
+		t.Fatal("messages not stored after the repair finished")
+	}
+
+	// Group messages never wait for the repair lock.
+	r.runMu.Lock()
+	defer r.runMu.Unlock()
+	group := types.NewJID("120363000000000001", types.GroupServer)
+	gEvt := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{Chat: group, Sender: pnJID(testPN), IsGroup: true},
+			ID:            "g1",
+			Timestamp:     time.Now(),
+		},
+		Message: &waE2E.Message{Conversation: proto.String("hi")},
+	}
+	go func() { handleMessage(r, ms, gEvt, logger); done <- struct{}{} }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("group message blocked on the repair lock")
+	}
+}

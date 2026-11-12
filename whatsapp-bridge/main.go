@@ -24,6 +24,7 @@ import (
 // Handle regular incoming messages with media support
 func handleMessage(r *chatResolver, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
 	ctx := context.Background()
+	defer r.lockChat(msg.Info.Chat)()
 
 	// Normalize LID addressing to phone numbers where a mapping is known
 	chat := messageChatJID(ctx, r.lidStore(), &msg.Info)
@@ -271,6 +272,10 @@ func handleHistorySync(r *chatResolver, self string, messageStore *MessageStore,
 	logf("Received history sync event with %d conversations\n", len(historySync.Data.Conversations))
 
 	ctx := context.Background()
+	// Hold the repair lock for the whole sync so a repair cannot merge a LID chat between
+	// its StoreChat and StoreMessage calls (see lockChat).
+	r.runMu.Lock()
+	defer r.runMu.Unlock()
 	syncedCount := 0
 	for _, conversation := range historySync.Data.Conversations {
 		// Parse JID from the conversation
