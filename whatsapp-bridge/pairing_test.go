@@ -771,7 +771,7 @@ func TestQRTeardownDoesNotKillNewSession(t *testing.T) {
 	}()
 	time.Sleep(50 * time.Millisecond)
 	// StartPairing finishes arming the next session before releasing startMu.
-	s2 := &pairSession{client: fw, cancel: func() {}, firstCode: make(chan struct{})}
+	s2 := &pairSession{client: fw, cancel: func() {}, firstCode: make(chan struct{}), done: make(chan struct{})}
 	pm.mu.Lock()
 	pm.sess = s2
 	pm.mu.Unlock()
@@ -791,4 +791,40 @@ func TestQRTeardownDoesNotKillNewSession(t *testing.T) {
 	if !active {
 		t.Fatal("stale teardown ended the new session")
 	}
+}
+
+// whatsmeow keeps the QR channel open after some failures (error items from a failed passkey
+// confirmation); the consumer must still release the session and cancel the channel context.
+func TestConsumeQREndsOnNonTerminalErrorWithOpenChannel(t *testing.T) {
+	fw := newFakeWA(false)
+	pm := newTestPairing(fw, nil)
+	if _, err := pm.StartPairing(); err != nil {
+		t.Fatal(err)
+	}
+	fw.mu.Lock()
+	ctx := fw.qrCtx
+	fw.mu.Unlock()
+	// The channel is never closed, like whatsmeow after our own Disconnect.
+	fw.send(whatsmeow.QRChannelItem{Event: "error", Error: errors.New("passkey failed")})
+	waitFor(t, "QR context cancelled without a channel close", func() bool { return ctx.Err() != nil })
+	if st := pm.Status(); st.Pairing != pairIdle {
+		t.Fatalf("pairing = %q, want idle", st.Pairing)
+	}
+	if _, d, _ := fw.counts(); d != 1 {
+		t.Fatalf("disconnects = %d, want 1", d)
+	}
+}
+
+// A session ended by a logout (no pairing) is released even though the channel stays open.
+func TestConsumeQREndsWhenSessionEndsElsewhere(t *testing.T) {
+	fw := newFakeWA(false)
+	pm := newTestPairing(fw, newFakeWA(false))
+	if _, err := pm.StartPairing(); err != nil {
+		t.Fatal(err)
+	}
+	fw.mu.Lock()
+	ctx := fw.qrCtx
+	fw.mu.Unlock()
+	pm.handleEvent(fw, &events.LoggedOut{})
+	waitFor(t, "QR context cancelled after the session ended", func() bool { return ctx.Err() != nil })
 }
