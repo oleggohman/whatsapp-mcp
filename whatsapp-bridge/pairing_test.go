@@ -182,7 +182,7 @@ func TestQRTimeoutGoesIdleAndRearms(t *testing.T) {
 	}
 	// Re-arm on demand through the API
 	h := newPairAPI(t, pm, "")
-	rec := do(h, http.MethodGet, "/api/status?start_pairing=1", "")
+	rec := do(h, http.MethodPost, "/api/start-pairing", "{}")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d %s", rec.Code, rec.Body)
 	}
@@ -217,7 +217,7 @@ func TestQRSuccessWithOpenChannel(t *testing.T) {
 	}
 	// API is ready: status answers and further pairing is refused
 	h := newPairAPI(t, pm, "")
-	if rec := do(h, http.MethodGet, "/api/status?start_pairing=1", ""); rec.Code != http.StatusOK {
+	if rec := do(h, http.MethodPost, "/api/start-pairing", "{}"); rec.Code != http.StatusOK {
 		t.Fatalf("status = %d", rec.Code)
 	}
 	if _, err := pm.StartPairing(); err != errAlreadyPaired {
@@ -284,7 +284,7 @@ func TestStreamReplacedNoAutoReconnect(t *testing.T) {
 	}
 	// Only an explicit request reconnects
 	h := newPairAPI(t, pm, "")
-	rec := do(h, http.MethodGet, "/api/status?reconnect=1", "")
+	rec := do(h, http.MethodPost, "/api/reconnect", "{}")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d %s", rec.Code, rec.Body)
 	}
@@ -565,4 +565,49 @@ func TestIdleExit(t *testing.T) {
 			t.Fatal("invalid must disable")
 		}
 	})
+}
+
+// A cross-site <img> or navigation GET carries no Origin and, without a token, no auth:
+// GET /api/status must never start pairing or reconnect. The POST replacements are guarded.
+func TestStatusGETCannotChangeState(t *testing.T) {
+	unpaired := newFakeWA(false)
+	pm := newTestPairing(unpaired, nil)
+	h := newPairAPI(t, pm, "")
+	for _, q := range []string{"?start_pairing=1", "?reconnect=1", "?start_pairing=1&reconnect=1"} {
+		if rec := do(h, http.MethodGet, "/api/status"+q, ""); rec.Code != http.StatusBadRequest {
+			t.Fatalf("GET /api/status%s = %d, want 400", q, rec.Code)
+		}
+	}
+	if c, _, qr := unpaired.counts(); c != 0 || qr != 0 {
+		t.Fatalf("GET changed state: connects=%d qrCalls=%d", c, qr)
+	}
+	for _, p := range []string{"/api/start-pairing", "/api/reconnect"} {
+		if rec := do(h, http.MethodGet, p, ""); rec.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("GET %s = %d, want 405", p, rec.Code)
+		}
+		// Browser form posts: wrong content type, or any Origin, are refused before the handler
+		if rec := do(h, http.MethodPost, p, "", func(r *http.Request) { r.Header.Set("Content-Type", "text/plain") }); rec.Code != http.StatusUnsupportedMediaType {
+			t.Fatalf("text/plain POST %s = %d, want 415", p, rec.Code)
+		}
+		if rec := do(h, http.MethodPost, p, "{}", func(r *http.Request) { r.Header.Set("Origin", "https://evil.example") }); rec.Code != http.StatusForbidden {
+			t.Fatalf("cross-origin POST %s = %d, want 403", p, rec.Code)
+		}
+	}
+	if c, _, qr := unpaired.counts(); c != 0 || qr != 0 {
+		t.Fatalf("rejected POSTs changed state: connects=%d qrCalls=%d", c, qr)
+	}
+	// Plain GET status still works
+	if rec := do(h, http.MethodGet, "/api/status", ""); rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/status = %d", rec.Code)
+	}
+	// Reconnect on an unpaired client is a 409, start-pairing arms a session
+	if rec := do(h, http.MethodPost, "/api/reconnect", "{}"); rec.Code != http.StatusConflict {
+		t.Fatalf("POST /api/reconnect unpaired = %d, want 409", rec.Code)
+	}
+	if rec := do(h, http.MethodPost, "/api/start-pairing", "{}"); rec.Code != http.StatusOK {
+		t.Fatalf("POST /api/start-pairing = %d %s", rec.Code, rec.Body)
+	}
+	if _, _, qr := unpaired.counts(); qr != 1 {
+		t.Fatalf("start-pairing qrCalls = %d, want 1", qr)
+	}
 }

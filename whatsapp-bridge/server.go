@@ -307,6 +307,8 @@ func (a *apiServer) routes() []route {
 	return []route{
 		{pattern: "/api/health", handler: a.handleHealth, auth: false},
 		{pattern: "/api/status", handler: a.handleStatus, auth: true},
+		{pattern: "/api/start-pairing", handler: a.handleStartPairing, auth: true},
+		{pattern: "/api/reconnect", handler: a.handleReconnect, auth: true},
 		{pattern: "/api/pair-phone", handler: a.handlePairPhone, auth: true},
 		{pattern: "/api/send", handler: a.handleSend, auth: true},
 		{pattern: "/api/download", handler: a.handleDownload, auth: true},

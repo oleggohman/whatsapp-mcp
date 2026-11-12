@@ -79,7 +79,7 @@ Ask the assistant to pair your account; it uses these tools:
 
 - `get_pairing_qr` returns a QR code image. Scan it in WhatsApp > Linked devices > Link a device. The QR code rotates about every 20 seconds; call the tool again if the scan fails.
 - `pair_with_phone_number` takes your number (country code, digits only) and returns a code. Enter it in WhatsApp > Linked devices > Link a device > Link with phone number instead.
-- `get_connection_status` shows `state`, `connected`, `logged_in` and `pairing` (`idle`, `qr`, `code`, `replaced`).
+- `get_connection_status` shows `state`, `connected`, `logged_in` and `pairing` (`idle`, `qr`, `code`, `replaced`). With `reconnect: true` it first takes the login back after `replaced`.
 
 Message history loads for several minutes after pairing. WhatsApp may ask you to re-authenticate after about 20 days.
 
@@ -89,7 +89,7 @@ The bridge is a shared daemon, one per store directory. Any MCP client spawns it
 
 - **Stop it** by setting `WHATSAPP_BRIDGE_IDLE_EXIT` (for example `30m`) so it exits after that long without API activity, or by killing it: `curl -s http://127.0.0.1:8080/api/health` shows its `pid`, then `kill <pid>`. The next MCP start spawns a new one.
 - **After updating the repository**, the supervisor rebuilds the binary but does not replace a running daemon. `get_connection_status` then shows `restart_needed: true`; kill the daemon as above.
-- **One bridge per WhatsApp login.** The bridge takes a lock on `<store>/bridge.lock` and exits with code 75 when another bridge already holds it for the same store directory (the supervisor treats that as "a peer is starting"). The lock does not protect *copies* of a store: if a second process connects with the same WhatsApp device, WhatsApp kicks the first one off. The bridge then reports `pairing: "replaced"` and does **not** reconnect on its own (two bridges would kick each other forever); call `GET /api/status?reconnect=1` to take the login back.
+- **One bridge per WhatsApp login.** The bridge takes a lock on `<store>/bridge.lock` and exits with code 75 when another bridge already holds it for the same store directory (the supervisor treats that as "a peer is starting"). The lock does not protect *copies* of a store: if a second process connects with the same WhatsApp device, WhatsApp kicks the first one off. The bridge then reports `pairing: "replaced"` and does **not** reconnect on its own (two bridges would kick each other forever); stop the other process, then call `get_connection_status` with `reconnect: true` to take the login back (the tool sends `POST /api/reconnect`).
 
 ## Environment variables
 
@@ -112,7 +112,7 @@ Bridge (Go) and MCP server (Python) read the same names. When the server spawns 
 
 ## Security model
 
-- The REST API binds to `127.0.0.1` and only answers requests whose `Host` is localhost, a loopback IP or the configured bind host (DNS-rebinding defence). Requests carrying an `Origin` header (any browser) are rejected, and `POST` bodies must be `application/json`.
+- The REST API binds to `127.0.0.1` and only answers requests whose `Host` is localhost, a loopback IP or the configured bind host (DNS-rebinding defence). Requests carrying an `Origin` header (any browser) are rejected, and `POST` bodies must be `application/json`. `GET` requests never change state (pairing and reconnect are `POST` only), so a cross-site link or image cannot trigger them.
 - Every endpoint except `/api/health` requires a bearer token. The MCP server generates it on first start as `<store>/bridge.token` (mode `0600`, created atomically) and all clients of the same store share it. `WHATSAPP_BRIDGE_TOKEN` overrides the file. A bridge started by hand without a token file has authentication disabled.
 - Downloaded media is written below `<store>/<chat>/` only; chat names and the remote-controlled file names are reduced to a bare, safe name so a sender cannot write outside the store.
 - Message bodies are not logged.
@@ -141,7 +141,7 @@ On Windows enable cgo once with `go env -w CGO_ENABLED=1` (a missing C compiler 
 
 ## Architecture Overview
 
-1. **Go WhatsApp Bridge** (`whatsapp-bridge/`): connects to the WhatsApp web multidevice API, handles pairing, and keeps message history in SQLite (`messages.db`) in the store directory. It serves a small authenticated REST API (`/api/health`, `/api/status`, `/api/pair-phone`, `/api/send`, `/api/download`).
+1. **Go WhatsApp Bridge** (`whatsapp-bridge/`): connects to the WhatsApp web multidevice API, handles pairing, and keeps message history in SQLite (`messages.db`) in the store directory. It serves a small authenticated REST API (`/api/health`, `/api/status`, `/api/start-pairing`, `/api/reconnect`, `/api/pair-phone`, `/api/send`, `/api/download`). `GET /api/status` is read-only; every state change is a `POST`.
 2. **Python MCP Server** (`whatsapp-mcp-server/`): implements the MCP tools. It reads `messages.db` read-only, calls the bridge for sending, downloading and pairing, and supervises the bridge process.
 
 ## Usage
@@ -200,7 +200,7 @@ cd whatsapp-mcp-server && uv run pytest && uv run ruff check .
 - **Stuck on `building`**: the first build takes 1-2 minutes; later starts reuse the binary.
 - **"port in use by another bridge/store"**: another bridge serves a different store on the same port. Set `WHATSAPP_STORE_DIR` and `WHATSAPP_BRIDGE_ADDR` (with a matching `WHATSAPP_API_BASE_URL`) consistently for all clients.
 - **"bridge running with unknown token"**: the running bridge was started with a different token. Set `WHATSAPP_BRIDGE_TOKEN` to it, or kill the bridge (pid from `/api/health`) and let the server restart it.
-- **`pairing: "replaced"`**: another process connected with the same WhatsApp login. Stop the other one, then call `/api/status?reconnect=1`.
+- **`pairing: "replaced"`**: another process connected with the same WhatsApp login. Stop the other one, then call `get_connection_status` with `reconnect: true` (without MCP: `curl -s -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $(cat <store>/bridge.token)" -d "{}" http://127.0.0.1:8080/api/reconnect`).
 - **QR code expired**: codes rotate about every 20 seconds; call `get_pairing_qr` again, or use `pair_with_phone_number`.
 - **Device limit reached**: remove a device in WhatsApp > Linked devices.
 - **No messages loading**: after pairing, history can take several minutes to arrive.

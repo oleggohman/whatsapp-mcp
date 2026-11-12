@@ -372,6 +372,40 @@ async def test_pairing_tools_through_mcp(env):
     assert ok["success"] is True and ok["code"] == "ABCD-EFGH" and "Linked devices" in ok["message"]
 
 
+async def test_reconnect_through_status_tool(env, monkeypatch):
+    monkeypatch.setenv("FAKE_LOGGED_IN", "1")
+    monkeypatch.setenv("FAKE_REPLACED", "1")
+    mgr = bridge_manager.get_manager()
+    mgr.start_background()
+    assert mgr._done.wait(30)
+    status = _data(await main.mcp.call_tool("get_connection_status", {}))
+    assert status["pairing"] == "replaced" and status["connected"] is False
+    # The read-only status call never reconnects; only the explicit flag does (via POST).
+    status = _data(await main.mcp.call_tool("get_connection_status", {}))
+    assert status["pairing"] == "replaced"
+    status = _data(await main.mcp.call_tool("get_connection_status", {"reconnect": True}))
+    assert status["pairing"] == "idle" and status["connected"] is True
+    assert "reconnect_error" not in status
+
+
+async def test_reconnect_when_not_logged_in_reports_error(env):
+    mgr = bridge_manager.get_manager()
+    mgr.start_background()
+    assert mgr._done.wait(30)
+    status = _data(await main.mcp.call_tool("get_connection_status", {"reconnect": True}))
+    assert status["logged_in"] is False and "not logged in" in status["reconnect_error"]
+
+
+def test_status_get_is_read_only(env):
+    """GET /api/status must not accept the old state-changing query actions."""
+    mgr = BridgeManager()
+    mgr.ensure_running()
+    with pytest.raises(BridgeError):
+        mgr.api("GET", "status?start_pairing=1")
+    assert mgr.api("GET", "status")["pairing"] == "idle"
+    assert mgr.api("POST", "start-pairing", json={})["pairing"] == "qr"
+
+
 async def test_send_when_not_logged_in_says_not_paired(env):
     mgr = bridge_manager.get_manager()
     mgr.start_background()

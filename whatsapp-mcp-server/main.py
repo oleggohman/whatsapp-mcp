@@ -292,15 +292,37 @@ async def download_media(message_id: str, chat_jid: str) -> dict[str, Any]:
         return {"success": False, "message": "Failed to download media"}
 
 
+def _connection_status(reconnect: bool) -> dict[str, Any]:
+    """Blocking part of get_connection_status."""
+    mgr = bridge_manager.get_manager()
+    status = mgr.status()
+    if not reconnect:
+        return status
+    if status.get("state") != "running":
+        status["reconnect_error"] = "bridge is not running"
+        return status
+    try:
+        mgr.api("POST", "reconnect", json={})
+    except BridgeError as e:
+        status["reconnect_error"] = str(e)
+        return status
+    return mgr.status()
+
+
 @mcp.tool()
-async def get_connection_status() -> dict[str, Any]:
+async def get_connection_status(reconnect: bool = False) -> dict[str, Any]:
     """Get the state of the WhatsApp bridge and the WhatsApp login.
 
     Returns state (building, starting, running or failed), plus connected, logged_in and
     pairing (idle, qr, code, replaced) once running. When state is failed, log_tail holds the
     bridge log. restart_needed is true when the running bridge is older than the sources.
+
+    Args:
+        reconnect: Take the WhatsApp login back when pairing is "replaced" (another process
+                   connected with the same login). Stop that other process first, or the two
+                   will keep kicking each other off. Failures are reported in reconnect_error.
     """  # noqa: E501  # tool description is user-facing text; wrapping would change the schema
-    return await asyncio.to_thread(bridge_manager.get_manager().status)
+    return await asyncio.to_thread(_connection_status, reconnect)
 
 
 def _qr_png(data: str) -> bytes:
@@ -318,7 +340,7 @@ def _fetch_qr() -> list[Any]:
     if st.get("logged_in"):
         return ["WhatsApp is already paired (logged in). No QR code needed."]
     if st.get("pairing") != "qr" or not st.get("qr"):
-        st = mgr.api("GET", "status?start_pairing=1")
+        st = mgr.api("POST", "start-pairing", json={})
         deadline = time.monotonic() + 8.0
         while (st.get("pairing") != "qr" or not st.get("qr")) and time.monotonic() < deadline:
             if st.get("logged_in"):

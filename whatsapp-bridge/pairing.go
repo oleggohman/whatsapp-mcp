@@ -271,7 +271,7 @@ func (pm *pairingManager) handleEvent(src waClient, evt any) {
 			pm.replaced = true
 		}
 		pm.mu.Unlock()
-		logln("Stream replaced by another client; not reconnecting. Use /api/status?reconnect=1 to take it back.")
+		logln("Stream replaced by another client; not reconnecting. Use POST /api/reconnect to take it back.")
 	case *events.LoggedOut:
 		pm.onLoggedOut(src)
 	}
@@ -451,7 +451,8 @@ func writePairError(w http.ResponseWriter, err error) {
 	writeJSON(w, status, pairPhoneResponse{Success: false, Message: err.Error()})
 }
 
-// handleStatus handles GET /api/status[?start_pairing=1][&reconnect=1].
+// handleStatus handles GET /api/status. It is read-only: state changes need a POST, which a
+// browser cannot send cross-site without an Origin header (rejected by the guard).
 func (a *apiServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -462,18 +463,46 @@ func (a *apiServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
-	if q.Get("reconnect") == "1" {
-		if err := a.pairing.Reconnect(); err != nil {
-			writePairError(w, err)
-			return
-		}
+	if q.Has("reconnect") || q.Has("start_pairing") {
+		writePairError(w, &pairError{status: http.StatusBadRequest,
+			msg: "GET /api/status is read-only; use POST /api/reconnect or POST /api/start-pairing"})
+		return
 	}
-	if q.Get("start_pairing") == "1" {
-		// Already being logged in is not an error for a status poll; just report it.
-		if _, err := a.pairing.StartPairing(); err != nil && !errors.Is(err, errAlreadyPaired) {
-			writePairError(w, err)
-			return
-		}
+	writeJSON(w, http.StatusOK, a.pairing.Status())
+}
+
+// handleStartPairing handles POST /api/start-pairing: arms a QR session if none is active
+// and answers with the status. Being logged in already is not an error.
+func (a *apiServer) handleStartPairing(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if a.pairing == nil {
+		writePairError(w, errNoPairing)
+		return
+	}
+	if _, err := a.pairing.StartPairing(); err != nil && !errors.Is(err, errAlreadyPaired) {
+		writePairError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, a.pairing.Status())
+}
+
+// handleReconnect handles POST /api/reconnect: reconnects a paired client (the way out of
+// "replaced") and answers with the status.
+func (a *apiServer) handleReconnect(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if a.pairing == nil {
+		writePairError(w, errNoPairing)
+		return
+	}
+	if err := a.pairing.Reconnect(); err != nil {
+		writePairError(w, err)
+		return
 	}
 	writeJSON(w, http.StatusOK, a.pairing.Status())
 }

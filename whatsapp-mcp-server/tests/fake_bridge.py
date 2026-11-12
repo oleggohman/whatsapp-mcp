@@ -6,6 +6,7 @@ Behaviour is driven by environment variables:
   FAKE_VERSION            version reported by /api/health (default "fakev")
   FAKE_TOKEN              token required instead of <store>/bridge.token
   FAKE_LOGGED_IN=1        report an already paired account
+  FAKE_REPLACED=1         start in pairing state "replaced" (another client took the login)
 The lock, store dir, address and token file follow the real bridge's rules.
 """
 
@@ -44,7 +45,22 @@ if not token:
         token = open(os.path.join(store, "bridge.token")).read().strip()
     except OSError:
         token = ""
-state = {"pairing": "idle", "logged_in": os.environ.get("FAKE_LOGGED_IN") == "1"}
+state = {
+    "pairing": "replaced" if os.environ.get("FAKE_REPLACED") == "1" else "idle",
+    "logged_in": os.environ.get("FAKE_LOGGED_IN") == "1",
+}
+
+
+def status_body():
+    body = {
+        "connected": state["logged_in"] and state["pairing"] != "replaced",
+        "logged_in": state["logged_in"],
+        "pairing": state["pairing"],
+    }
+    if state["pairing"] == "qr":
+        body["qr"] = "2@fakeqrpayload,abc,def"
+    return body
+
 
 time.sleep(float(os.environ.get("FAKE_START_DELAY", "0")))
 
@@ -83,16 +99,10 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/api/status":
             if not self._authed():
                 return
-            if parse_qs(url.query).get("start_pairing") == ["1"] and not state["logged_in"]:
-                state["pairing"] = "qr"
-            body = {
-                "connected": state["logged_in"],
-                "logged_in": state["logged_in"],
-                "pairing": state["pairing"],
-            }
-            if state["pairing"] == "qr":
-                body["qr"] = "2@fakeqrpayload,abc,def"
-            return self._send(200, body)
+            query = parse_qs(url.query)
+            if "start_pairing" in query or "reconnect" in query:
+                return self._send(400, {"success": False, "message": "status is read-only"})
+            return self._send(200, status_body())
         self._send(404, {"message": "not found"})
 
     def do_POST(self):
@@ -107,6 +117,17 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400, {"success": False, "message": "invalid phone number"})
             state["pairing"] = "code"
             return self._send(200, {"success": True, "code": "ABCD-EFGH"})
+        if self.headers.get("Content-Type") != "application/json":
+            return self._send(415, {"message": "Content-Type must be application/json"})
+        if self.path == "/api/start-pairing":
+            if not state["logged_in"]:
+                state["pairing"] = "qr"
+            return self._send(200, status_body())
+        if self.path == "/api/reconnect":
+            if not state["logged_in"]:
+                return self._send(409, {"success": False, "message": "not logged in"})
+            state["pairing"] = "idle"
+            return self._send(200, status_body())
         if self.path == "/api/send":
             if not state["logged_in"]:
                 return self._send(200, {"success": False, "message": "Not connected to WhatsApp"})
