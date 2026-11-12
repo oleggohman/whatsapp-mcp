@@ -190,7 +190,7 @@ func (r *chatResolver) mergeIfMapped(ctx context.Context, orig, norm types.JID) 
 		return
 	}
 	if err := r.store.mergeChat(ctx, lid, norm.ToNonAD().String(), r.lids); err != nil {
-		fmt.Printf("Failed to merge chat %s into %s: %v\n", lid, norm, err)
+		logf("Failed to merge chat %s into %s: %v\n", lid, norm, err)
 	}
 }
 
@@ -260,7 +260,7 @@ func (r *chatResolver) trigger() {
 		r.lastRun = r.now()
 		r.mu.Unlock()
 		if err := r.repair(context.Background()); err != nil {
-			fmt.Printf("LID chat repair failed: %v\n", err)
+			logf("LID chat repair failed: %v\n", err)
 		}
 	})
 }

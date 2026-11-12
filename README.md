@@ -167,6 +167,10 @@ By default, just the metadata of the media is stored in the local database. The 
 4. Data flows back through the chain to Claude
 5. When sending messages, the request flows from Claude through the MCP server to the Go bridge and to WhatsApp
 
+### One bridge per WhatsApp login
+
+The bridge takes a lock on `<store>/bridge.lock` and exits with code 75 when another bridge already holds it for the same store directory. The lock does not protect *copies* of a store: if a second process connects with the same WhatsApp device, WhatsApp kicks the first one off. The bridge then reports `pairing: "replaced"` in `/api/status` and does **not** reconnect on its own (two bridges would kick each other forever); call `/api/status?reconnect=1` to take the login back. Run only one bridge per WhatsApp login.
+
 ## Troubleshooting
 
 - If you encounter permission issues when running uv, you may need to add it to your PATH or use the full path to the executable.

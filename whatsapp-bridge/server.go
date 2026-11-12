@@ -142,7 +142,7 @@ func sendWhatsAppMessage(client bridgeClient, recipient string, message string, 
 			return false, fmt.Sprintf("Error uploading media: %v", err)
 		}
 
-		fmt.Printf("Media uploaded (%d bytes)\n", resp.FileLength)
+		logf("Media uploaded (%d bytes)\n", resp.FileLength)
 
 		// Create the appropriate message type based on media type
 		switch mediaType {
@@ -172,7 +172,7 @@ func sendWhatsAppMessage(client bridgeClient, recipient string, message string, 
 					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)
 				}
 			} else {
-				fmt.Printf("Not an Ogg Opus file: %s\n", mimeType)
+				logf("Not an Ogg Opus file: %s\n", mimeType)
 			}
 
 			msg.AudioMessage = &waE2E.AudioMessage{
@@ -272,6 +272,10 @@ type apiServer struct {
 	messageStore *MessageStore
 	token        string   // optional bearer token; empty disables auth
 	extraHosts   []string // additional allowed Host names (configured bind host)
+
+	pairing     *pairingManager // status/pairing endpoints; nil answers 503
+	idle        *idleTracker    // optional; touched by authenticated non-health requests
+	storeDirAbs string          // absolute store dir reported by /api/health
 }
 
 // route is one API endpoint plus its guard policy.
@@ -285,6 +289,11 @@ type route struct {
 // (when it is a concrete name/IP) joins the Host allowlist.
 func newAPIServer(client func() bridgeClient, store *MessageStore, token, addr string) *apiServer {
 	a := &apiServer{client: client, messageStore: store, token: token}
+	if abs, err := filepath.Abs(storeDir()); err == nil {
+		a.storeDirAbs = abs
+	} else {
+		a.storeDirAbs = storeDir()
+	}
 	if host, _, err := net.SplitHostPort(addr); err == nil && host != "" {
 		if ip := net.ParseIP(host); ip == nil || !ip.IsUnspecified() {
 			a.extraHosts = append(a.extraHosts, strings.ToLower(host))
@@ -296,6 +305,9 @@ func newAPIServer(client func() bridgeClient, store *MessageStore, token, addr s
 // routes lists all endpoints; later tasks add entries here with their own auth flag.
 func (a *apiServer) routes() []route {
 	return []route{
+		{pattern: "/api/health", handler: a.handleHealth, auth: false},
+		{pattern: "/api/status", handler: a.handleStatus, auth: true},
+		{pattern: "/api/pair-phone", handler: a.handlePairPhone, auth: true},
 		{pattern: "/api/send", handler: a.handleSend, auth: true},
 		{pattern: "/api/download", handler: a.handleDownload, auth: true},
 	}
@@ -357,6 +369,10 @@ func (a *apiServer) guard(auth bool, next http.HandlerFunc) http.HandlerFunc {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
+		// Health polls (liveness checks by the supervisor) must not keep an idle bridge alive
+		if a.idle != nil && r.URL.Path != "/api/health" {
+			a.idle.Touch()
+		}
 		// Only requests with bodies need the JSON content type; it forces a CORS preflight in browsers
 		if r.Method == http.MethodPost {
 			mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
@@ -375,7 +391,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(v); err != nil {
-		fmt.Printf("Failed to write response: %v\n", err)
+		logf("Failed to write response: %v\n", err)
 	}
 }
 
@@ -413,11 +429,11 @@ func (a *apiServer) handleSend(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Log metadata only, never message bodies
-	fmt.Printf("Received request to send message (text %d bytes, media %t)\n", len(req.Message), req.MediaPath != "")
+	logf("Received request to send message (text %d bytes, media %t)\n", len(req.Message), req.MediaPath != "")
 
 	// Send the message
 	success, message := sendWhatsAppMessage(a.client(), req.Recipient, req.Message, req.MediaPath)
-	fmt.Println("Message sent", success)
+	logln("Message sent", success)
 
 	status := http.StatusOK
 	if !success {
@@ -483,10 +499,10 @@ func startRESTServer(addr string, handler http.Handler) (*http.Server, net.Addr,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 	}
-	fmt.Printf("Starting REST API server on %s...\n", ln.Addr())
+	logf("Starting REST API server on %s...\n", ln.Addr())
 	go func() {
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			fmt.Printf("REST API server error: %v\n", err)
+			logf("REST API server error: %v\n", err)
 		}
 	}()
 	return srv, ln.Addr(), nil

@@ -172,7 +172,7 @@ func downloadMedia(client bridgeClient, messageStore *MessageStore, messageID, c
 		return false, "", "", "", fmt.Errorf("incomplete media information for download")
 	}
 
-	fmt.Printf("Attempting to download media for message %s...\n", messageID)
+	logf("Attempting to download media for message %s...\n", messageID)
 
 	// Extract direct path from URL
 	directPath := extractDirectPathFromURL(url)
@@ -213,7 +213,7 @@ func downloadMedia(client bridgeClient, messageStore *MessageStore, messageID, c
 		return false, "", "", "", fmt.Errorf("failed to save media file: %v", err)
 	}
 
-	fmt.Printf("Successfully downloaded %s media to %s (%d bytes)\n", mediaType, absPath, len(mediaData))
+	logf("Successfully downloaded %s media to %s (%d bytes)\n", mediaType, absPath, len(mediaData))
 	return true, mediaType, filename, absPath, nil
 }
 

@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
-	"fmt"
+	"errors"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -14,6 +14,7 @@ import (
 	"github.com/mdp/qrterminal"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -86,97 +87,128 @@ func handleMessage(r *chatResolver, messageStore *MessageStore, msg *events.Mess
 
 		// Log based on message type
 		if mediaType != "" {
-			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
+			logf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
 		} else if content != "" {
-			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
+			logf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
 	}
 }
 
 func main() {
-	// Set up logger
-	logger := waLog.Stdout("Client", "INFO", true)
-	logger.Infof("Starting WhatsApp client...")
+	os.Exit(run())
+}
 
-	// Create database connection for storing session data
-	dbLog := waLog.Stdout("Database", "INFO", true)
+// run starts the bridge and returns the process exit code.
+func run() int {
+	// Headless daemon: all logs go to stderr
+	logger := newStderrLogger("Client", "INFO")
+	logger.Infof("Starting WhatsApp client...")
+	dbLog := newStderrLogger("Database", "INFO")
 
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll(storeDir(), 0750); err != nil {
+	dir := storeDir()
+	if err := os.MkdirAll(dir, 0750); err != nil {
 		logger.Errorf("Failed to create store directory: %v", err)
-		return
+		return 1
 	}
 
-	container, err := sqlstore.New(context.Background(), "sqlite3", sqliteDSN(filepath.Join(storeDir(), "whatsapp.db")), dbLog)
+	// One bridge per store dir; a peer that holds the lock is running or starting
+	lock, err := acquireLock(filepath.Join(dir, "bridge.lock"))
+	if errors.Is(err, errLockHeld) {
+		logger.Errorf("Another bridge is already running for store %s", dir)
+		return exitPeerRunning
+	}
+	if err != nil {
+		logger.Errorf("Failed to take the store lock: %v", err)
+		return 1
+	}
+	defer lock.Release()
+
+	token, err := loadToken(dir)
+	if err != nil {
+		logger.Errorf("Failed to load API token: %v", err)
+		return 1
+	}
+
+	container, err := sqlstore.New(context.Background(), "sqlite3", sqliteDSN(filepath.Join(dir, "whatsapp.db")), dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
-		return
+		return 1
 	}
 
 	// Get device store - This contains session information
 	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			// No device exists, create one
 			deviceStore = container.NewDevice()
 			logger.Infof("Created new device")
 		} else {
 			logger.Errorf("Failed to get device: %v", err)
-			return
+			return 1
 		}
-	}
-
-	// Create client instance
-	client := whatsmeow.NewClient(deviceStore, logger)
-	if client == nil {
-		logger.Errorf("Failed to create WhatsApp client")
-		return
 	}
 
 	// Initialize message store
 	messageStore, err := NewMessageStore()
 	if err != nil {
 		logger.Errorf("Failed to initialize message store: %v", err)
-		return
+		return 1
 	}
 	defer messageStore.Close()
 
-	resolver := newChatResolver(messageStore, client.Store.Contacts, client.Store.LIDs,
-		func(ctx context.Context, jid types.JID) (string, error) {
-			info, err := client.GetGroupInfo(ctx, jid)
-			if err != nil {
-				return "", err
+	var pm *pairingManager
+	// buildClient creates a client for a device store and attaches all event handlers.
+	// It is also used after a logout to build the replacement client.
+	buildClient := func(dev *store.Device) waClient {
+		c := whatsmeow.NewClient(dev, logger)
+		c.InitialAutoReconnect = true
+		rc := realClient{c}
+		resolver := newChatResolver(messageStore, c.Store.Contacts, c.Store.LIDs,
+			func(ctx context.Context, jid types.JID) (string, error) {
+				info, err := c.GetGroupInfo(ctx, jid)
+				if err != nil {
+					return "", err
+				}
+				return info.Name, nil
+			})
+		c.AddEventHandler(func(evt interface{}) {
+			// Pairing/login state machine first, then message processing
+			pm.handleEvent(rc, evt)
+			switch v := evt.(type) {
+			case *events.Message:
+				handleMessage(resolver, messageStore, v, logger)
+			case *events.HistorySync:
+				handleHistorySync(resolver, selfUser(c), messageStore, v, logger)
+				resolver.trigger()
+			case *events.Connected:
+				logger.Infof("Connected to WhatsApp")
+				resolver.trigger()
+			case *events.LoggedOut:
+				logger.Warnf("Device logged out; start pairing again to log in")
 			}
-			return info.Name, nil
 		})
-
-	// Setup event handling for messages and history sync
-	client.AddEventHandler(func(evt interface{}) {
-		switch v := evt.(type) {
-		case *events.Message:
-			// Process regular messages
-			handleMessage(resolver, messageStore, v, logger)
-
-		case *events.HistorySync:
-			// Process history sync events
-			handleHistorySync(resolver, selfUser(client), messageStore, v, logger)
-			resolver.trigger()
-
-		case *events.Connected:
-			logger.Infof("Connected to WhatsApp")
-			resolver.trigger()
-
-		case *events.LoggedOut:
-			logger.Warnf("Device logged out, please scan QR code to log in again")
-		}
+		return rc
+	}
+	pm = newPairingManager(buildClient(deviceStore), func() (waClient, error) {
+		return buildClient(container.NewDevice()), nil
 	})
+	if stderrIsTTY() {
+		pm.printQR = func(code string) {
+			logln("\nScan this QR code with your WhatsApp app:")
+			qrterminal.GenerateHalfBlock(code, qrterminal.L, os.Stderr)
+		}
+	}
 
 	// Start the REST API before connecting; handlers answer "Not connected" until the client is up
-	api := newAPIServer(func() bridgeClient { return client }, messageStore, os.Getenv("WHATSAPP_BRIDGE_TOKEN"), bridgeAddr())
+	idle := newIdleTracker()
+	api := newAPIServer(pm.Client, messageStore, token, bridgeAddr())
+	api.pairing = pm
+	api.idle = idle
 	restServer, _, err := startRESTServer(bridgeAddr(), api.handler())
 	if err != nil {
 		logger.Errorf("Failed to start REST API server: %v", err)
-		return
+		return 1
 	}
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -186,70 +218,40 @@ func main() {
 		}
 	}()
 
-	// Create channel to track connection success
-	connected := make(chan bool, 1)
-
-	// Connect to WhatsApp
-	if client.Store.ID == nil {
-		// No ID stored, this is a new client, need to pair with phone
-		qrChan, _ := client.GetQRChannel(context.Background())
-		err = client.Connect()
-		if err != nil {
+	if c := pm.current(); c.Paired() {
+		// Already logged in, just connect; failures stay visible in /api/status
+		if err := c.Connect(); err != nil {
 			logger.Errorf("Failed to connect: %v", err)
-			return
 		}
-
-		// Print QR code for pairing with phone
-		for evt := range qrChan {
-			if evt.Event == "code" {
-				fmt.Println("\nScan this QR code with your WhatsApp app:")
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-			} else if evt.Event == "success" {
-				connected <- true
-				break
-			}
+	} else if stderrIsTTY() {
+		// Interactive run: show a QR code right away. Headless runs wait for an explicit request.
+		if _, err := pm.StartPairing(); err != nil {
+			logger.Errorf("Failed to start pairing: %v", err)
 		}
-
-		// Wait for connection
-		select {
-		case <-connected:
-			fmt.Println("\nSuccessfully connected and authenticated!")
-		case <-time.After(3 * time.Minute):
-			logger.Errorf("Timeout waiting for QR code scan")
-			return
-		}
-	} else {
-		// Already logged in, just connect
-		err = client.Connect()
-		if err != nil {
-			logger.Errorf("Failed to connect: %v", err)
-			return
-		}
-		connected <- true
 	}
 
-	// Wait a moment for connection to stabilize
-	time.Sleep(2 * time.Second)
-
-	if !client.IsConnected() {
-		logger.Errorf("Failed to establish stable connection")
-		return
-	}
-
-	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
-
-	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
 	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
+	idleCtx, stopIdle := context.WithCancel(context.Background())
+	defer stopIdle()
+	idleExit := make(chan struct{}, 1)
+	watchIdle(idleCtx, idle, idleExitDuration(), func() {
+		select {
+		case idleExit <- struct{}{}:
+		default:
+		}
+	})
 
-	fmt.Println("REST server is running. Press Ctrl+C to disconnect and exit.")
+	logln("REST server is running. Press Ctrl+C to disconnect and exit.")
+	select {
+	case <-exitChan:
+	case <-idleExit:
+		logger.Infof("No API activity for %s; exiting", idleExitDuration())
+	}
 
-	// Wait for termination signal
-	<-exitChan
-
-	fmt.Println("Disconnecting...")
-	// Disconnect client
-	client.Disconnect()
+	logln("Disconnecting...")
+	pm.current().Disconnect()
+	return 0
 }
 
 // selfUser returns the bare user digits of the logged-in account ("" before pairing).
@@ -270,7 +272,7 @@ func conversationName(conv *waHistorySync.Conversation) string {
 
 // Handle history sync events
 func handleHistorySync(r *chatResolver, self string, messageStore *MessageStore, historySync *events.HistorySync, logger waLog.Logger) {
-	fmt.Printf("Received history sync event with %d conversations\n", len(historySync.Data.Conversations))
+	logf("Received history sync event with %d conversations\n", len(historySync.Data.Conversations))
 
 	ctx := context.Background()
 	syncedCount := 0
@@ -415,30 +417,30 @@ func handleHistorySync(r *chatResolver, self string, messageStore *MessageStore,
 		}
 	}
 
-	fmt.Printf("History sync complete. Stored %d messages.\n", syncedCount)
+	logf("History sync complete. Stored %d messages.\n", syncedCount)
 }
 
 // Request history sync from the server
 func requestHistorySync(client *whatsmeow.Client) {
 	if client == nil {
-		fmt.Println("Client is not initialized. Cannot request history sync.")
+		logln("Client is not initialized. Cannot request history sync.")
 		return
 	}
 
 	if !client.IsConnected() {
-		fmt.Println("Client is not connected. Please ensure you are connected to WhatsApp first.")
+		logln("Client is not connected. Please ensure you are connected to WhatsApp first.")
 		return
 	}
 
 	if client.Store.ID == nil {
-		fmt.Println("Client is not logged in. Please scan the QR code first.")
+		logln("Client is not logged in. Please scan the QR code first.")
 		return
 	}
 
 	// Build and send a history sync request
 	historyMsg := client.BuildHistorySyncRequest(nil, 100)
 	if historyMsg == nil {
-		fmt.Println("Failed to build history sync request.")
+		logln("Failed to build history sync request.")
 		return
 	}
 
@@ -448,8 +450,8 @@ func requestHistorySync(client *whatsmeow.Client) {
 	}, historyMsg)
 
 	if err != nil {
-		fmt.Printf("Failed to request history sync: %v\n", err)
+		logf("Failed to request history sync: %v\n", err)
 	} else {
-		fmt.Println("History sync requested. Waiting for server response...")
+		logln("History sync requested. Waiting for server response...")
 	}
 }
