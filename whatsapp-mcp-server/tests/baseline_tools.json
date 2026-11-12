@@ -1,0 +1,306 @@
+{
+  "download_media": {
+    "properties": {
+      "chat_jid": {
+        "title": "Chat Jid",
+        "type": "string"
+      },
+      "message_id": {
+        "title": "Message Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "message_id",
+      "chat_jid"
+    ],
+    "title": "download_mediaArguments",
+    "type": "object"
+  },
+  "get_chat": {
+    "properties": {
+      "chat_jid": {
+        "title": "Chat Jid",
+        "type": "string"
+      },
+      "include_last_message": {
+        "default": true,
+        "title": "Include Last Message",
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "chat_jid"
+    ],
+    "title": "get_chatArguments",
+    "type": "object"
+  },
+  "get_contact_chats": {
+    "properties": {
+      "jid": {
+        "title": "Jid",
+        "type": "string"
+      },
+      "limit": {
+        "default": 20,
+        "title": "Limit",
+        "type": "integer"
+      },
+      "page": {
+        "default": 0,
+        "title": "Page",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "jid"
+    ],
+    "title": "get_contact_chatsArguments",
+    "type": "object"
+  },
+  "get_direct_chat_by_contact": {
+    "properties": {
+      "sender_phone_number": {
+        "title": "Sender Phone Number",
+        "type": "string"
+      }
+    },
+    "required": [
+      "sender_phone_number"
+    ],
+    "title": "get_direct_chat_by_contactArguments",
+    "type": "object"
+  },
+  "get_last_interaction": {
+    "properties": {
+      "jid": {
+        "title": "Jid",
+        "type": "string"
+      }
+    },
+    "required": [
+      "jid"
+    ],
+    "title": "get_last_interactionArguments",
+    "type": "object"
+  },
+  "get_message_context": {
+    "properties": {
+      "after": {
+        "default": 5,
+        "title": "After",
+        "type": "integer"
+      },
+      "before": {
+        "default": 5,
+        "title": "Before",
+        "type": "integer"
+      },
+      "message_id": {
+        "title": "Message Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "message_id"
+    ],
+    "title": "get_message_contextArguments",
+    "type": "object"
+  },
+  "list_chats": {
+    "properties": {
+      "include_last_message": {
+        "default": true,
+        "title": "Include Last Message",
+        "type": "boolean"
+      },
+      "limit": {
+        "default": 20,
+        "title": "Limit",
+        "type": "integer"
+      },
+      "page": {
+        "default": 0,
+        "title": "Page",
+        "type": "integer"
+      },
+      "query": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Query"
+      },
+      "sort_by": {
+        "default": "last_active",
+        "title": "Sort By",
+        "type": "string"
+      }
+    },
+    "title": "list_chatsArguments",
+    "type": "object"
+  },
+  "list_messages": {
+    "properties": {
+      "after": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "After"
+      },
+      "before": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Before"
+      },
+      "chat_jid": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Chat Jid"
+      },
+      "context_after": {
+        "default": 1,
+        "title": "Context After",
+        "type": "integer"
+      },
+      "context_before": {
+        "default": 1,
+        "title": "Context Before",
+        "type": "integer"
+      },
+      "include_context": {
+        "default": true,
+        "title": "Include Context",
+        "type": "boolean"
+      },
+      "limit": {
+        "default": 20,
+        "title": "Limit",
+        "type": "integer"
+      },
+      "page": {
+        "default": 0,
+        "title": "Page",
+        "type": "integer"
+      },
+      "query": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Query"
+      },
+      "sender_phone_number": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Sender Phone Number"
+      }
+    },
+    "title": "list_messagesArguments",
+    "type": "object"
+  },
+  "search_contacts": {
+    "properties": {
+      "query": {
+        "title": "Query",
+        "type": "string"
+      }
+    },
+    "required": [
+      "query"
+    ],
+    "title": "search_contactsArguments",
+    "type": "object"
+  },
+  "send_audio_message": {
+    "properties": {
+      "media_path": {
+        "title": "Media Path",
+        "type": "string"
+      },
+      "recipient": {
+        "title": "Recipient",
+        "type": "string"
+      }
+    },
+    "required": [
+      "recipient",
+      "media_path"
+    ],
+    "title": "send_audio_messageArguments",
+    "type": "object"
+  },
+  "send_file": {
+    "properties": {
+      "media_path": {
+        "title": "Media Path",
+        "type": "string"
+      },
+      "recipient": {
+        "title": "Recipient",
+        "type": "string"
+      }
+    },
+    "required": [
+      "recipient",
+      "media_path"
+    ],
+    "title": "send_fileArguments",
+    "type": "object"
+  },
+  "send_message": {
+    "properties": {
+      "message": {
+        "title": "Message",
+        "type": "string"
+      },
+      "recipient": {
+        "title": "Recipient",
+        "type": "string"
+      }
+    },
+    "required": [
+      "recipient",
+      "message"
+    ],
+    "title": "send_messageArguments",
+    "type": "object"
+  }
+}
