@@ -23,7 +23,7 @@ import httpx
 
 try:
     import fcntl
-except ImportError:  # Windows: recovery runs without the advisory lock
+except ImportError:  # pragma: no cover - fcntl exists on every POSIX test OS (Windows only)
     fcntl = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
