@@ -212,6 +212,32 @@ def test_token_created_exclusively_and_shared(env):
     assert oct((env["store"] / "bridge.token").stat().st_mode & 0o777) == "0o600"
 
 
+def test_empty_token_file_from_crash_is_replaced(env):
+    """A crash between create and write (older versions) left an empty bridge.token forever."""
+    env["store"].mkdir()
+    stale = env["store"] / "bridge.token"
+    stale.touch(mode=0o600)
+    token = bridge_manager.ensure_token()
+    assert len(token) == 64 and stale.read_text() == token
+    assert oct(stale.stat().st_mode & 0o777) == "0o600"
+    assert sorted(p.name for p in env["store"].iterdir()) == ["bridge.token"]
+
+
+def test_crash_while_writing_token_leaves_no_token_file(env, monkeypatch):
+    """The token file only appears complete: a failure before it is linked leaves nothing."""
+
+    def crash(fd):
+        raise OSError(5, "simulated crash while writing")
+
+    monkeypatch.setattr(bridge_manager.os, "fsync", crash)
+    with pytest.raises(BridgeError):
+        bridge_manager.ensure_token()
+    assert list(env["store"].iterdir()) == []
+    monkeypatch.undo()
+    monkeypatch.setenv("WHATSAPP_STORE_DIR", str(env["store"]))
+    assert len(bridge_manager.ensure_token()) == 64
+
+
 def test_env_token_wins_over_file(env, monkeypatch):
     (env["store"]).mkdir()
     (env["store"] / "bridge.token").write_text("from-file")

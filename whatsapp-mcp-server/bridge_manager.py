@@ -117,26 +117,45 @@ def read_token() -> str | None:
 
 
 def ensure_token() -> str:
-    """Return the token, creating <store>/bridge.token atomically (O_EXCL, 0600) if needed."""
+    """Return the token, creating <store>/bridge.token (0600) if needed.
+
+    The token is written to a private temp file first and then hard-linked into place, which
+    is atomic and fails if the file exists: the token file is never visible empty, even after
+    a crash. An empty file (left by an older version that created first and wrote second) is
+    treated as stale and replaced.
+    """
     existing = read_token()
     if existing:
         return existing
     path = token_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     token = secrets.token_hex(32)
+    tmp = f"{path}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        # A peer won the race; its write may still be in flight, so retry briefly.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with open(fd, "w", encoding="utf-8") as f:
+            f.write(token)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.link(tmp, path)
+            return token
+        except FileExistsError:
+            pass
+        # A peer created it first; an older peer may still be writing, so retry briefly.
         for _ in range(50):
             existing = read_token()
             if existing:
                 return existing
             time.sleep(0.05)
-        raise BridgeError(f"token file {path} exists but is empty") from None
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(token)
-    return token
+        logger.warning("token file %s is empty (left by a crash); replacing it", path)
+        os.replace(tmp, path)
+        return read_token() or token
+    except OSError as e:
+        raise BridgeError(f"could not create token file {path}: {e}") from e
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 # --- build ---------------------------------------------------------------------------------
