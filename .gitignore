@@ -14,3 +14,7 @@ whatsapp-bridge/store/
 bridge.token*
 bridge.log*
 bridge.lock
+
+# Coverage artefacts
+.coverage
+coverage.out
