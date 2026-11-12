@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"io"
 	"os"
 	"strings"
@@ -165,5 +166,61 @@ func TestMessageStoreWaitsForRepair(t *testing.T) {
 	case <-done:
 	case <-time.After(3 * time.Second):
 		t.Fatal("group message blocked on the repair lock")
+	}
+}
+
+// A history sync resolving an unnamed group over the network must not hold the repair lock,
+// or live DMs (which take it) would stall behind the lookup.
+func TestHistorySyncGroupLookupDoesNotBlockLiveDM(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	gi := func(ctx context.Context, jid types.JID) (string, error) {
+		close(entered)
+		<-release
+		return "Slow Group", nil
+	}
+	r, ms := newTestResolver(t, nil, newFakeLIDs(), gi)
+	logger := newStderrLogger("Test", "ERROR")
+	group := types.NewJID("120363000000000009", types.GroupServer)
+	hs := &events.HistorySync{Data: &waHistorySync.HistorySync{Conversations: []*waHistorySync.Conversation{{
+		ID: proto.String(group.String()),
+		Messages: []*waHistorySync.HistorySyncMsg{{Message: &waWeb.WebMessageInfo{
+			Key:              &waCommon.MessageKey{RemoteJID: proto.String(group.String()), ID: proto.String("hg1")},
+			Message:          &waE2E.Message{Conversation: proto.String("hi")},
+			MessageTimestamp: proto.Uint64(uint64(time.Now().Unix())),
+		}}},
+	}}}}
+	syncDone := make(chan struct{})
+	go func() { handleHistorySync(r, testMyPN, ms, hs, logger); close(syncDone) }()
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("group name lookup never started")
+	}
+
+	evt := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{Chat: pnJID(testPN), Sender: pnJID(testPN)},
+			ID:            "live1",
+			Timestamp:     time.Now(),
+		},
+		Message: &waE2E.Message{Conversation: proto.String("hi")},
+	}
+	dmDone := make(chan struct{})
+	go func() { handleMessage(r, ms, evt, logger); close(dmDone) }()
+	select {
+	case <-dmDone:
+	case <-time.After(3 * time.Second):
+		close(release)
+		t.Fatal("live DM blocked behind a history-sync group name lookup")
+	}
+	close(release)
+	select {
+	case <-syncDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("history sync did not finish")
+	}
+	if countMsgs(t, ms, group.String()) != 1 || countMsgs(t, ms, pnJID(testPN).String()) != 1 {
+		t.Fatal("messages not stored")
 	}
 }
