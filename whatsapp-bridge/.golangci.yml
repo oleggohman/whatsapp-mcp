@@ -1,0 +1,22 @@
+# golangci-lint v2 config. Pinned version: v2.6.2
+# Run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.6.2 run
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - staticcheck
+    - govet
+    - gosec
+    - bodyclose
+  exclusions:
+    rules:
+      # Tests may ignore errors and use weak randomness / loose perms
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gosec

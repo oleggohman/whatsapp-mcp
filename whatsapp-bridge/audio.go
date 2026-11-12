@@ -96,7 +96,7 @@ func placeholderWaveform(duration uint32) []byte {
 	waveform := make([]byte, waveformLength)
 
 	// Seed the random number generator for consistent results with the same duration
-	rng := rand.New(rand.NewSource(int64(duration)))
+	rng := rand.New(rand.NewSource(int64(duration))) //nolint:gosec // G404: deterministic cosmetic waveform, not security-sensitive
 
 	// Create a more natural looking waveform with some patterns and variability
 	// rather than completely random values

@@ -88,7 +88,7 @@ func sendWhatsAppMessage(client bridgeClient, recipient string, message string, 
 		}
 
 		// Read media file (path validated above: absolute, regular file, size-capped)
-		mediaData, err := os.ReadFile(mediaPath)
+		mediaData, err := os.ReadFile(mediaPath) //nolint:gosec // G304: path validated by validateMediaPath
 		if err != nil {
 			return false, fmt.Sprintf("Error reading media file: %v", err)
 		}

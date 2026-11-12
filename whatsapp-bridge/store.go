@@ -162,6 +162,9 @@ func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, er
 		msg.Time = timestamp
 		messages = append(messages, msg)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 
 	return messages, nil
 }
@@ -183,6 +186,9 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 			return nil, err
 		}
 		chats[jid] = lastMessageTime
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 
 	return chats, nil
@@ -273,6 +279,10 @@ func (store *MessageStore) mergeChat(ctx context.Context, lid, pn string, lids s
 		if s.String != "" {
 			senders = append(senders, s.String)
 		}
+	}
+	if err := senderRows.Err(); err != nil {
+		senderRows.Close()
+		return err
 	}
 	senderRows.Close()
 	if lids != nil {

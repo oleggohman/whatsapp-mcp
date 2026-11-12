@@ -102,7 +102,7 @@ func main() {
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll(storeDir(), 0755); err != nil {
+	if err := os.MkdirAll(storeDir(), 0750); err != nil {
 		logger.Errorf("Failed to create store directory: %v", err)
 		return
 	}
