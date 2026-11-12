@@ -1,5 +1,6 @@
 import logging
 import os.path
+import pathlib
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -37,6 +38,11 @@ def _bridge_token() -> str | None:
     return bridge_manager.read_token()
 
 
+def _ro_uri(path: str) -> str:
+    """Read-only SQLite URI for an absolute path, percent-encoding "#", "?", "%" and the like."""
+    return pathlib.Path(path).as_uri() + "?mode=ro"
+
+
 @contextmanager
 def _connect() -> Iterator[sqlite3.Connection]:
     """Open messages.db read-only and attach whatsapp.db (read-only, alias "wa") when it exists.
@@ -51,12 +57,12 @@ def _connect() -> Iterator[sqlite3.Connection]:
             f"WhatsApp message database not found at {db_path}. "
             "Start the bridge and pair a device first, or set WHATSAPP_DB_PATH."
         )
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = sqlite3.connect(_ro_uri(db_path), uri=True)
     try:
         wa_path = os.path.join(os.path.dirname(db_path), "whatsapp.db")
         if os.path.isfile(wa_path):
             try:
-                conn.execute("ATTACH DATABASE ? AS wa", (f"file:{wa_path}?mode=ro",))
+                conn.execute("ATTACH DATABASE ? AS wa", (_ro_uri(wa_path),))
             except sqlite3.Error:
                 logger.debug("could not attach %s", wa_path, exc_info=True)
         yield conn

@@ -3,6 +3,7 @@
 import sqlite3
 
 import pytest
+from conftest import make_messages_db, make_whatsapp_db
 
 import whatsapp
 
@@ -162,3 +163,18 @@ def test_no_stdout_during_queries(store_dir, capsys):
     whatsapp.get_chat(ALICE)
     whatsapp.get_direct_chat_by_contact("222")
     assert capsys.readouterr().out == ""
+
+
+def test_store_path_with_uri_special_characters(tmp_path, monkeypatch):
+    """URI-special characters (#, ?, %, space) in the store path must not break the DB URIs."""
+    store = tmp_path / "uri t#1?x%20y"
+    store.mkdir()
+    make_messages_db(store / "messages.db")
+    make_whatsapp_db(store / "whatsapp.db")
+    monkeypatch.setenv("WHATSAPP_DB_PATH", str(store / "messages.db"))
+    monkeypatch.setenv("WHATSAPP_STORE_DIR", str(store))
+    assert [c.jid for c in whatsapp.list_chats(query="Alice")] == [ALICE]
+    # The LID phone search needs the attached whatsapp.db
+    assert [c.jid for c in whatsapp.list_chats(query="15551234567")] == ["999000@lid"]
+    with whatsapp._connect() as conn, pytest.raises(sqlite3.OperationalError):
+        conn.execute("DELETE FROM chats")  # still read-only
