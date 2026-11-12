@@ -1,5 +1,7 @@
 # WhatsApp MCP Server
 
+[![CI](https://github.com/oleggohman/whatsapp-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/oleggohman/whatsapp-mcp/actions/workflows/ci.yml)
+
 This is a Model Context Protocol (MCP) server for WhatsApp.
 
 With this you can search and read your personal Whatsapp messages (including images, videos, documents, and audio messages), search your contacts and send messages to either individuals or groups. You can also send media files including images, videos, documents, and audio messages.
@@ -82,6 +84,28 @@ Ask the assistant to pair your account; it uses these tools:
 - `get_connection_status` shows `state`, `connected`, `logged_in` and `pairing` (`idle`, `qr`, `code`, `replaced`). With `reconnect: true` it first takes the login back after `replaced`.
 
 Message history loads for several minutes after pairing. WhatsApp may ask you to re-authenticate after about 20 days.
+
+## Releases
+
+Tagged releases ship prebuilt bridge binaries, so Go is not needed.
+
+1. Download the archive for your OS from the [Releases page](https://github.com/oleggohman/whatsapp-mcp/releases) (`darwin-arm64`, `darwin-amd64`, `linux-amd64` or `windows-amd64`) together with `SHA256SUMS`.
+2. Verify it: `sha256sum -c SHA256SUMS --ignore-missing` (macOS: `shasum -a 256 -c SHA256SUMS --ignore-missing`).
+3. Extract it and point your MCP config at the extracted `whatsapp-mcp-server` directory, as described in [Setup](#setup). The prebuilt binary is already at `whatsapp-bridge/whatsapp-bridge`; you still need Python 3.11+ and uv.
+
+The macOS binaries are unsigned, so Gatekeeper blocks them. Remove the quarantine flag once after extracting:
+
+```bash
+xattr -dr com.apple.quarantine <extracted-dir>
+```
+
+### Cutting a release (maintainers)
+
+Releases are cut by pushing a tag; the Release workflow tests, builds on each platform, and publishes the archives and `SHA256SUMS`:
+
+```bash
+git tag vX.Y.Z && git push origin vX.Y.Z
+```
 
 ## Bridge lifecycle
 

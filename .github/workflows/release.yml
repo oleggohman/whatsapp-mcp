@@ -1,0 +1,95 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.goos }}-${{ matrix.goarch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { os: macos-14, goos: darwin, goarch: arm64 }
+          - { os: macos-13, goos: darwin, goarch: amd64 }
+          - { os: ubuntu-latest, goos: linux, goarch: amd64 }
+          - { os: windows-latest, goos: windows, goarch: amd64 }
+    env:
+      CGO_ENABLED: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-go@v5.5.0
+        with:
+          go-version-file: whatsapp-bridge/go.mod
+          cache-dependency-path: whatsapp-bridge/go.sum
+
+      - name: Test
+        working-directory: whatsapp-bridge
+        run: go test -count=1 ./...
+
+      - name: Build
+        working-directory: whatsapp-bridge
+        env:
+          EXT: ${{ matrix.goos == 'windows' && '.exe' || '' }}
+        run: >-
+          go build -trimpath
+          -ldflags "-s -w -X main.bridgeVersion=${GITHUB_REF_NAME}"
+          -o "whatsapp-bridge${EXT}"
+
+      - name: Package
+        env:
+          EXT: ${{ matrix.goos == 'windows' && '.exe' || '' }}
+          NAME: whatsapp-mcp-${{ github.ref_name }}-${{ matrix.goos }}-${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist stage
+          # Tracked sources only (no local stores, venvs or caches).
+          git archive --format=tar --prefix="${NAME}/" HEAD \
+            whatsapp-bridge whatsapp-mcp-server README.md LICENSE | tar -x -C stage
+          mv "whatsapp-bridge/whatsapp-bridge${EXT}" "stage/${NAME}/whatsapp-bridge/"
+          # bridge_manager rebuilds when sources are newer than the binary: keep the binary newest.
+          touch "stage/${NAME}/whatsapp-bridge/whatsapp-bridge${EXT}"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            (cd stage && 7z a -tzip "../dist/${NAME}.zip" "${NAME}" > /dev/null)
+          else
+            tar -C stage -czf "dist/${NAME}.tar.gz" "${NAME}"
+          fi
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4.6.2
+        with:
+          name: archive-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          path: dist
+          pattern: archive-*
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum -- *.tar.gz *.zip > SHA256SUMS
+          cat SHA256SUMS
+      - uses: softprops/action-gh-release@v2.3.2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS
