@@ -89,3 +89,20 @@ def test_ffmpeg_missing_leaves_no_temp_file(tmp_path, monkeypatch):
     with pytest.raises(FileNotFoundError, match="ffmpeg not found"):
         audio.convert_to_opus_ogg_temp(str(src))
     assert list((tmp_path / "t").iterdir()) == []
+
+
+def test_ffmpeg_never_reads_mcp_stdin(tmp_path, monkeypatch):
+    """The server speaks MCP over stdin; ffmpeg must neither inherit nor read it."""
+    src = tmp_path / "voice.mp3"
+    src.write_bytes(b"mp3")
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return audio.subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(audio.subprocess, "run", fake_run)
+    audio.convert_to_opus_ogg(str(src), str(tmp_path / "out.ogg"))
+    cmd, kwargs = calls[0]
+    assert "-nostdin" in cmd and cmd.index("-nostdin") < cmd.index("-i")
+    assert kwargs.get("stdin") is audio.subprocess.DEVNULL

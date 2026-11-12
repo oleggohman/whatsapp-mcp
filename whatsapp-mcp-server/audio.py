@@ -36,6 +36,7 @@ def convert_to_opus_ogg(input_file, output_file=None, bitrate="32k", sample_rate
     # Build the ffmpeg command
     cmd = [
         "ffmpeg",
+        "-nostdin",  # never read the MCP stdio stream for interactive commands
         "-i",
         input_file,
         "-c:a",
@@ -58,7 +59,8 @@ def convert_to_opus_ogg(input_file, output_file=None, bitrate="32k", sample_rate
 
     try:
         # Run the ffmpeg command and capture output
-        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        # stdin is the MCP JSON-RPC stream; ffmpeg must not inherit it
+        subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, check=True)
         return output_file
     except FileNotFoundError as e:
         # subprocess raises this when the ffmpeg executable itself is missing
