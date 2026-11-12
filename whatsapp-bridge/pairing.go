@@ -140,7 +140,10 @@ func (pm *pairingManager) Status() statusResponse {
 	return st
 }
 
-// endSessionLocked tears down the session state; the caller holds pm.mu.
+// endSessionLocked tears down the session state; the caller holds pm.mu. It does not cancel the
+// QR channel context: whatsmeow's QR emitter disconnects the client when that context ends before
+// the channel saw PairSuccess, which would drop a freshly paired client. consumeQR cancels it once
+// the channel has closed.
 func (pm *pairingManager) endSessionLocked(s *pairSession) {
 	if pm.sess != s || s == nil {
 		return
@@ -149,7 +152,6 @@ func (pm *pairingManager) endSessionLocked(s *pairSession) {
 	pm.phoneCodeActive = false
 	pm.qr = ""
 	pm.qrExpires = time.Time{}
-	s.cancel()
 	s.signalFirst()
 }
 
@@ -225,6 +227,7 @@ func (pm *pairingManager) consumeQR(s *pairSession, ch <-chan whatsmeow.QRChanne
 	pm.mu.Lock()
 	pm.endSessionLocked(s)
 	pm.mu.Unlock()
+	s.cancel()
 }
 
 // handleQR applies one QR channel item.

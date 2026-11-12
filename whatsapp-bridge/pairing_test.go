@@ -32,6 +32,7 @@ type fakeWA struct {
 	pairCode    string
 	pairErr     error
 	pairArgs    []string
+	qrCtx       context.Context // ctx passed to the last GetQRChannel
 }
 
 func newFakeWA(paired bool) *fakeWA {
@@ -57,9 +58,10 @@ func (f *fakeWA) Disconnect() {
 	f.disconnects++
 	f.conn = false
 }
-func (f *fakeWA) GetQRChannel(_ context.Context) (<-chan whatsmeow.QRChannelItem, error) {
+func (f *fakeWA) GetQRChannel(ctx context.Context) (<-chan whatsmeow.QRChannelItem, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.qrCtx = ctx
 	f.order = append(f.order, "qr")
 	f.qrCalls++
 	if f.qrErr != nil {
@@ -240,6 +242,29 @@ func TestPairSuccessEvent(t *testing.T) {
 	pm.handleEvent(fw, &events.PairSuccess{})
 	if st := pm.Status(); !st.LoggedIn || st.Pairing != "idle" {
 		t.Fatalf("status = %+v", st)
+	}
+}
+
+// whatsmeow's QR emitter disconnects the client when the GetQRChannel ctx is cancelled before
+// it saw PairSuccess, so the event path must not cancel it; consumeQR does after the close.
+func TestPairSuccessEventKeepsQRContextUntilChannelCloses(t *testing.T) {
+	fw := newFakeWA(false)
+	pm := newTestPairing(fw, nil)
+	if _, err := pm.StartPairing(); err != nil {
+		t.Fatal(err)
+	}
+	fw.mu.Lock()
+	ctx, ch := fw.qrCtx, fw.qrCh
+	fw.mu.Unlock()
+	pm.handleEvent(fw, &events.PairSuccess{})
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("PairSuccess cancelled the QR channel context: %v", err)
+	}
+	ch <- whatsmeow.QRChannelSuccess
+	close(ch)
+	waitFor(t, "QR context cancelled after the channel closed", func() bool { return ctx.Err() != nil })
+	if _, d, _ := fw.counts(); d != 0 {
+		t.Fatalf("must not disconnect after success, got %d", d)
 	}
 }
 
