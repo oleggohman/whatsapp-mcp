@@ -134,3 +134,74 @@ def test_find_ffmpeg_probes_beyond_minimal_path(tmp_path, monkeypatch):
     src.write_bytes(b"mp3")
     audio.convert_to_opus_ogg(str(src), str(tmp_path / "out.ogg"))
     assert calls[0][0] == "/custom/ffmpeg"
+
+
+def test_find_ffmpeg_prefers_path_lookup(monkeypatch):
+    monkeypatch.delenv("WHATSAPP_FFMPEG_BIN", raising=False)
+    monkeypatch.setattr(audio.shutil, "which", lambda name: f"/on/path/{name}")
+    assert audio.find_ffmpeg() == "/on/path/ffmpeg"
+
+
+def test_convert_missing_input_raises(tmp_path):
+    with pytest.raises(FileNotFoundError, match="Input file not found"):
+        audio.convert_to_opus_ogg(str(tmp_path / "nope.mp3"))
+
+
+def test_convert_defaults_output_to_ogg_extension_and_creates_dir(tmp_path, monkeypatch):
+    src = tmp_path / "voice.mp3"
+    src.write_bytes(b"mp3")
+    calls = []
+    monkeypatch.setattr(
+        audio.subprocess,
+        "run",
+        lambda cmd, **kw: calls.append(cmd) or audio.subprocess.CompletedProcess(cmd, 0),
+    )
+    assert audio.convert_to_opus_ogg(str(src)) == str(tmp_path / "voice.ogg")
+    assert calls[-1][-1] == str(tmp_path / "voice.ogg")
+
+    nested = tmp_path / "a" / "b" / "out.ogg"
+    assert audio.convert_to_opus_ogg(str(src), str(nested)) == str(nested)
+    assert nested.parent.is_dir()
+    # Existing output dir is reused; a bare filename has no dir to create.
+    assert audio.convert_to_opus_ogg(str(src), str(nested)) == str(nested)
+    monkeypatch.chdir(tmp_path)
+    assert audio.convert_to_opus_ogg(str(src), "bare.ogg") == "bare.ogg"
+
+
+def test_ffmpeg_failure_raises_runtime_error_with_stderr(tmp_path, monkeypatch):
+    src = tmp_path / "voice.mp3"
+    src.write_bytes(b"mp3")
+
+    def failing(cmd, **kwargs):
+        raise audio.subprocess.CalledProcessError(1, cmd, stderr="bad codec")
+
+    monkeypatch.setattr(audio.subprocess, "run", failing)
+    with pytest.raises(RuntimeError, match="Failed to convert audio.*bad codec"):
+        audio.convert_to_opus_ogg(str(src))
+
+
+def test_temp_conversion_returns_temp_path_on_success(tmp_path, monkeypatch):
+    src = tmp_path / "voice.mp3"
+    src.write_bytes(b"mp3")
+    monkeypatch.setattr(
+        audio.subprocess, "run", lambda cmd, **kw: audio.subprocess.CompletedProcess(cmd, 0)
+    )
+    out = audio.convert_to_opus_ogg_temp(str(src))
+    try:
+        assert out.endswith(".ogg") and os.path.isfile(out)
+    finally:
+        os.unlink(out)
+
+
+def test_temp_conversion_tolerates_temp_file_already_gone(tmp_path, monkeypatch):
+    """If the failing conversion already removed the temp file, cleanup must not raise."""
+    src = tmp_path / "voice.mp3"
+    src.write_bytes(b"mp3")
+
+    def convert_and_delete(input_file, output_file, bitrate, sample_rate):
+        os.unlink(output_file)
+        raise RuntimeError("converter gone wrong")
+
+    monkeypatch.setattr(audio, "convert_to_opus_ogg", convert_and_delete)
+    with pytest.raises(RuntimeError, match="converter gone wrong"):
+        audio.convert_to_opus_ogg_temp(str(src))
