@@ -2,6 +2,7 @@
 
 Lifecycle model: the bridge is a daemon, one per store dir. Any MCP client spawns it when it is
 absent and none of them ever stops it (it exits via WHATSAPP_BRIDGE_IDLE_EXIT, kill or reboot).
+When it is gone, the next bridge-dependent call starts it again (see BridgeManager.revive).
 stdout carries the MCP stdio transport, so everything here logs to stderr via logging.
 """
 
@@ -31,6 +32,7 @@ DEFAULT_API_BASE_URL = "http://localhost:8080/api"
 EX_TEMPFAIL = 75  # bridge exit code: a peer bridge holds the store lock (running or starting)
 LOG_ROTATE_BYTES = 5 * 1024 * 1024
 LOG_TAIL_BYTES = 4096
+FAILED_RETRY_SECONDS = 30.0  # a failed start is retried by the next bridge call after this
 HEALTH_TIMEOUT = httpx.Timeout(3.0, connect=1.0)
 API_TIMEOUT = httpx.Timeout(30.0, connect=3.0)
 
@@ -263,6 +265,7 @@ class BridgeManager:
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._done = threading.Event()  # set once state is running or failed
+        self._failed_at = 0.0  # time.monotonic() of the last failure
 
     # -- http helpers --
 
@@ -343,13 +346,44 @@ class BridgeManager:
     def _fail(self, message: str) -> None:
         logger.error("bridge supervisor: %s", message)
         self.state, self.error = "failed", message
+        self._failed_at = time.monotonic()
         self._done.set()
+
+    def revive(self) -> bool:
+        """Start a new supervision run when the daemon died after it was running (idle exit,
+        crash, kill) or when the last failure is older than FAILED_RETRY_SECONDS.
+
+        Returns True when a new run was started.
+        """
+        if not autostart_enabled():
+            return False
+        state = self.state
+        if state == "running":
+            if self._safe_health():
+                return False
+            logger.warning("bridge stopped answering; starting it again")
+        elif state == "failed":
+            if time.monotonic() - self._failed_at < FAILED_RETRY_SECONDS:
+                return False
+            logger.info("retrying bridge start after failure: %s", self.error)
+        else:
+            return False
+        with self._lock:
+            # Another caller may have revived it meanwhile.
+            if self.state != state or (self._thread is not None and self._thread.is_alive()):
+                return False
+            self.state = "starting"
+            self._done.clear()
+            self._thread = threading.Thread(target=self._run, name="bridge-supervisor", daemon=True)
+            self._thread.start()
+        return True
 
     def wait_ready(self, timeout: float) -> str:
         """Block up to timeout for the supervisor; returns the state (running|failed|...)."""
         if not autostart_enabled():
             return "running"  # manual mode: the user manages the bridge
-        self.start_background()
+        if not self.revive():
+            self.start_background()
         self._done.wait(timeout)
         return self.state
 
@@ -448,6 +482,7 @@ class BridgeManager:
 
     def status(self) -> dict[str, Any]:
         """Snapshot for get_connection_status: supervisor state plus the bridge's own status."""
+        self.revive()
         out: dict[str, Any] = {"state": self.state}
         if self.state == "idle" and not autostart_enabled():
             out["state"] = "running" if self._safe_health() else "failed"
@@ -481,7 +516,7 @@ class BridgeManager:
             out["restart_needed"] = True
             out["hint"] = (
                 f"The running bridge (pid {health.get('pid')}) was built from older sources. "
-                f"Stop it (kill {health.get('pid')}); the next MCP start spawns the new build."
+                f"Stop it (kill {health.get('pid')}); the next bridge call spawns the new build."
             )
             logger.warning(
                 "bridge daemon is stale: running %s, built %s", health.get("version"), expected

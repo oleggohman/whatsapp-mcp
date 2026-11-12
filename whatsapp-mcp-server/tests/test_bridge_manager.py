@@ -425,6 +425,53 @@ async def test_send_when_logged_in_passes_through(env, monkeypatch):
     assert "already paired" in qr[0].text
 
 
+def _kill_fake(env):
+    os.kill(int((env["store"] / "fake.pid").read_text()), signal.SIGKILL)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            httpx.get(f"http://127.0.0.1:{env['port']}/api/health", timeout=0.5)
+        except httpx.HTTPError:
+            return
+        time.sleep(0.05)
+    raise AssertionError("fake bridge still answering after kill")
+
+
+async def test_daemon_dies_after_running_next_call_respawns(env, monkeypatch):
+    monkeypatch.setenv("FAKE_LOGGED_IN", "1")
+    mgr = bridge_manager.get_manager()
+    mgr.start_background()
+    assert mgr._done.wait(30) and mgr.state == "running"
+    assert spawns(env["store"]) == 1
+
+    _kill_fake(env)  # idle exit, crash or kill: the daemon is gone
+    res = _data(await main.mcp.call_tool("send_message", {"recipient": "123", "message": "hi"}))
+    assert res == {"success": True, "message": "sent"}
+    assert spawns(env["store"]) == 2 and mgr.state == "running"
+
+    # get_connection_status revives it as well instead of only reporting it as stopped.
+    _kill_fake(env)
+    status = mgr.status()
+    assert status["state"] in ("starting", "running")
+    assert mgr._done.wait(30) and mgr.state == "running"
+    assert spawns(env["store"]) == 3
+
+
+def test_failed_start_is_retried_after_cooldown(env, monkeypatch):
+    monkeypatch.setattr(bridge_manager, "FAILED_RETRY_SECONDS", 0.5)
+    monkeypatch.setenv("FAKE_EXIT_EARLY", "3")
+    mgr = BridgeManager()
+    assert mgr.wait_ready(30) == "failed"
+
+    # The cause is fixed (e.g. Go installed, port freed); within the cooldown nothing retries.
+    monkeypatch.delenv("FAKE_EXIT_EARLY")
+    assert mgr.wait_ready(0.1) == "failed"
+    assert spawns(env["store"]) == 0
+    time.sleep(0.6)
+    assert mgr.wait_ready(30) == "running"
+    assert spawns(env["store"]) == 1 and mgr.error is None
+
+
 def test_stale_daemon_is_reported(env, monkeypatch):
     monkeypatch.setenv("FAKE_VERSION", "old-hash")
     Path(str(env["binary"]) + ".srchash").write_text("new-hash")
