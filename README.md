@@ -85,7 +85,7 @@ Message history loads for several minutes after pairing. WhatsApp may ask you to
 
 ## Bridge lifecycle
 
-The bridge is a shared daemon, one per store directory. Any MCP client spawns it when it is absent, and none of them stops it: it survives the client exiting and is shared by Claude Desktop and Claude Code at the same time. Its log is `<store>/bridge.log` (rotated at 5 MB).
+The bridge is a shared daemon, one per store directory. Any MCP client spawns it when it is absent, and none of them stops it: it survives the client exiting and is shared by Claude Desktop and Claude Code at the same time. Its log is `<store>/bridge.log`. When the supervisor starts a bridge and the log is over 5 MB, it moves it to `bridge.log.1` first; a running bridge keeps appending to its log until it exits, so a long-lived daemon can grow it past 5 MB (message bodies are never logged).
 
 - **Stop it** by setting `WHATSAPP_BRIDGE_IDLE_EXIT` (for example `30m`) so it exits after that long without API activity, or by killing it: `curl -s http://127.0.0.1:8080/api/health` shows its `pid`, then `kill <pid>`. The next tool call that needs the bridge (send, download, pairing, `get_connection_status`) spawns a new one; the MCP client does not need a restart. A failed start (for example Go missing or the port taken) is retried the same way 30 seconds after the failure.
 - **After updating the repository**, the supervisor rebuilds the binary but does not replace a running daemon. `get_connection_status` then shows `restart_needed: true`; kill the daemon as above.
