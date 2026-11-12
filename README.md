@@ -115,7 +115,7 @@ Ask Claude: "Check my WhatsApp connection." Claude calls `get_connection_status`
 | `connected` | The bridge has a live connection to WhatsApp. |
 | `logged_in` | The bridge is linked to a WhatsApp account. |
 | `pairing` | `idle` (nothing in progress), `qr` (a QR code is active), `code` (a phone-number code is active) or `replaced` (another process took over the login). |
-| `restart_needed` | The running bridge is older than the sources. See [Bridge lifecycle](#bridge-lifecycle). |
+| `restart_needed` | The running bridge was built from different sources than this server, and it was not replaced automatically. The `hint` field says what to do. See [Bridge lifecycle](#bridge-lifecycle). |
 
 Wait for `state: running`. If `logged_in` is already `true`, you are done.
 
