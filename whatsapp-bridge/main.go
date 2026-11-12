@@ -14,6 +14,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waCompanionReg"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/store"
@@ -125,8 +126,21 @@ var (
 	isTTY         = stderrIsTTY
 )
 
+// Name and platform shown for this bridge in WhatsApp's "Linked devices" list.
+// WhatsApp only accepts its fixed platform types, so the bridge reports itself as a desktop app.
+const linkedDeviceName = "MCP-CC"
+
+// setDeviceIdentity sets how the bridge appears in the phone's linked devices list.
+// WhatsApp stores this at pairing time, so an already linked bridge keeps its old name
+// until it is unlinked and paired again.
+func setDeviceIdentity() {
+	store.SetOSInfo(linkedDeviceName, [3]uint32{1, 0, 0})
+	store.DeviceProps.PlatformType = waCompanionReg.DeviceProps_DESKTOP.Enum()
+}
+
 // run starts the bridge and returns the process exit code.
 func run() int {
+	setDeviceIdentity()
 	// Headless daemon: all logs go to stderr
 	logger := newStderrLogger("Client", "INFO")
 	logger.Infof("Starting WhatsApp client...")

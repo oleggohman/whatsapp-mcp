@@ -103,7 +103,7 @@ Restart the client. The first start builds the bridge from source, which takes a
 
 ### What it is
 
-The bridge becomes a **linked device** on your WhatsApp account, the same mechanism as WhatsApp Web. There is no password or API key. You approve the link on your phone, which needs WhatsApp and an internet connection during pairing. You do this once. The session is stored in `whatsapp.db` in the store directory.
+The bridge becomes a **linked device** on your WhatsApp account, the same mechanism as WhatsApp Web. There is no password or API key. You approve the link on your phone, which needs WhatsApp and an internet connection during pairing. You do this once. The session is stored in `whatsapp.db` in the store directory. In the phone's **Linked devices** list the bridge appears as **MCP-CC** with a desktop icon. A bridge linked before this name was introduced keeps its old name until you log it out and pair again.
 
 ### Step 1: check the connection
 

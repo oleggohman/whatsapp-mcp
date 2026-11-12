@@ -9,9 +9,11 @@ import (
 	"time"
 
 	"go.mau.fi/whatsmeow/proto/waCommon"
+	"go.mau.fi/whatsmeow/proto/waCompanionReg"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/proto/waWeb"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
@@ -222,5 +224,15 @@ func TestHistorySyncGroupLookupDoesNotBlockLiveDM(t *testing.T) {
 	}
 	if countMsgs(t, ms, group.String()) != 1 || countMsgs(t, ms, pnJID(testPN).String()) != 1 {
 		t.Fatal("messages not stored")
+	}
+}
+
+func TestSetDeviceIdentity(t *testing.T) {
+	setDeviceIdentity()
+	if got := store.DeviceProps.GetOs(); got != "MCP-CC" {
+		t.Fatalf("linked device name = %q, want MCP-CC", got)
+	}
+	if got := store.DeviceProps.GetPlatformType(); got != waCompanionReg.DeviceProps_DESKTOP {
+		t.Fatalf("platform = %v, want DESKTOP", got)
 	}
 }
