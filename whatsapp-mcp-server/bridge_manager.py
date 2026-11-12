@@ -236,6 +236,7 @@ def build_bridge(binary: str, src: str) -> None:
     env = dict(os.environ, CGO_ENABLED="1")
     os.makedirs(os.path.dirname(binary), exist_ok=True)
     tmp = f"{binary}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+    tmp_hash = _hash_sidecar(tmp)
     cmd = [go, "build", "-ldflags", f"-X main.bridgeVersion={version}", "-o", tmp, "."]
     logger.info("building bridge: %s (cwd %s)", " ".join(cmd), src)
     try:
@@ -257,15 +258,18 @@ def build_bridge(binary: str, src: str) -> None:
                 f"go build failed (exit {proc.returncode}):\n{_tail(proc.stdout or '')}"
             )
         os.replace(tmp, binary)
-        with open(_hash_sidecar(binary), "w", encoding="utf-8") as f:
+        # Replace the sidecar atomically too: status() may read it concurrently.
+        with open(tmp_hash, "w", encoding="utf-8") as f:
             f.write(version)
+        os.replace(tmp_hash, _hash_sidecar(binary))
     except subprocess.TimeoutExpired as e:
         raise BridgeError("go build timed out after 15 minutes") from e
     except OSError as e:
         raise BridgeError(f"go build could not run: {e}") from e
     finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
+        for leftover in (tmp, tmp_hash):
+            if os.path.exists(leftover):
+                os.unlink(leftover)
 
 
 # --- manager -------------------------------------------------------------------------------

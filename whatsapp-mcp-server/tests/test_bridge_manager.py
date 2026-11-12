@@ -296,6 +296,35 @@ def test_build_is_atomic_and_captured(env, monkeypatch, capfd):
     assert "noisy build output" not in capfd.readouterr().out  # never inherited stdout
 
 
+def test_build_replaces_srchash_atomically(env, monkeypatch):
+    """A concurrent status() must never read an empty or partial .srchash sidecar."""
+    seed_sources(env)
+    target = env["tmp"] / "built-bridge"
+    sidecar = str(target) + ".srchash"
+    Path(sidecar).write_text("old-hash")
+    monkeypatch.setenv("WHATSAPP_GO_BIN", str(make_fake_go(env)))
+    replaced = []
+    real_replace = os.replace
+
+    def spy_replace(src, dst):
+        if str(dst) == sidecar:
+            replaced.append(Path(src).read_text())
+        real_replace(src, dst)
+
+    def no_direct_write(path, *a, **kw):
+        assert str(path) != sidecar, "sidecar written in place"
+        return real_open(path, *a, **kw)
+
+    real_open = open
+    monkeypatch.setattr(bridge_manager.os, "replace", spy_replace)
+    monkeypatch.setattr("builtins.open", no_direct_write)
+    bridge_manager.build_bridge(str(target), str(env["src"]))
+    monkeypatch.undo()
+    version = bridge_manager.source_hash(str(env["src"]))
+    assert replaced == [version] and Path(sidecar).read_text() == version
+    assert [p.name for p in env["tmp"].iterdir() if ".tmp." in p.name] == []
+
+
 def test_build_failure_keeps_old_binary_and_reports_output(env, monkeypatch):
     seed_sources(env)
     target = env["tmp"] / "built-bridge"
