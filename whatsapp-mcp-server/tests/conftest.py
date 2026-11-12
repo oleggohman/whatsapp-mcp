@@ -10,6 +10,27 @@ SERVER_DIR = Path(__file__).resolve().parent.parent
 if str(SERVER_DIR) not in sys.path:
     sys.path.insert(0, str(SERVER_DIR))
 
+DEFAULT_STORE = SERVER_DIR.parent / "whatsapp-bridge" / "store"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_store(tmp_path_factory, monkeypatch):
+    """Never let a test fall back to the real default store (it may hold a live login).
+
+    Every test gets a private store dir and autostart off; fixtures that need
+    something else override these with their own monkeypatch.setenv calls.
+    """
+    store = tmp_path_factory.mktemp("isolated-store")
+    monkeypatch.setenv("WHATSAPP_STORE_DIR", str(store))
+    monkeypatch.setenv("WHATSAPP_DB_PATH", str(store / "messages.db"))
+    monkeypatch.setenv("WHATSAPP_BRIDGE_AUTOSTART", "0")
+    monkeypatch.delenv("WHATSAPP_BRIDGE_TOKEN", raising=False)
+    yield
+    assert not (DEFAULT_STORE / "bridge.token").exists(), (
+        f"test wrote into the real default store {DEFAULT_STORE}"
+    )
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS chats (
     jid TEXT PRIMARY KEY,

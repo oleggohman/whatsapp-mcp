@@ -5,6 +5,7 @@ Usage: uv run scripts/dump_tools.py [output.json]   (prints to stdout without an
 
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -15,8 +16,17 @@ SERVER_DIR = Path(__file__).resolve().parent.parent
 
 
 async def dump_tools() -> dict:
+    # Forward the caller's environment: the stdio client otherwise passes only a
+    # minimal safe env, dropping WHATSAPP_* settings, and the server would fall
+    # back to the default store (possibly a live login) and autostart a bridge.
+    # Listing tools never needs the bridge, so autostart is off unless set.
+    env = {**os.environ}
+    env.setdefault("WHATSAPP_BRIDGE_AUTOSTART", "0")
     params = StdioServerParameters(
-        command=sys.executable, args=[str(SERVER_DIR / "main.py")], cwd=str(SERVER_DIR)
+        command=sys.executable,
+        args=[str(SERVER_DIR / "main.py")],
+        cwd=str(SERVER_DIR),
+        env=env,
     )
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
