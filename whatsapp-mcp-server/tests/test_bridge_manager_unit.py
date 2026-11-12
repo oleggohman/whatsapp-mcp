@@ -2,6 +2,7 @@
 
 import errno
 import os
+import subprocess
 import threading
 
 import httpx
@@ -74,6 +75,30 @@ def test_recover_empty_token_without_flock_support(tmp_path, monkeypatch):
     tmp.write_text("fresh")
     assert bridge_manager._recover_empty_token(str(tmp), str(path), "fresh") == "fresh"
     assert path.read_text() == "fresh"
+
+
+def test_recover_empty_token_reads_the_winner(tmp_path, monkeypatch):
+    """A peer replaced the empty file first: its token wins and ours is not installed."""
+    monkeypatch.setenv("WHATSAPP_STORE_DIR", str(tmp_path))
+    path = tmp_path / "bridge.token"
+    path.write_text("winner")
+    tmp = tmp_path / "bridge.token.tmp"
+    tmp.write_text("loser")
+    assert bridge_manager._recover_empty_token(str(tmp), str(path), "loser") == "winner"
+    assert path.read_text() == "winner" and tmp.read_text() == "loser"
+
+
+def test_ensure_token_reads_token_of_peer_that_created_it_first(tmp_path, monkeypatch):
+    monkeypatch.setenv("WHATSAPP_STORE_DIR", str(tmp_path))
+
+    def peer_won(tmp, path, token):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("peer-token")
+        return False
+
+    monkeypatch.setattr(bridge_manager, "_create_token_file", peer_won)
+    assert bridge_manager.ensure_token() == "peer-token"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["bridge.token"]
 
 
 # --- find_go -----------------------------------------------------------------------------------
@@ -386,6 +411,7 @@ def test_binary_appearing_while_checking_sources_is_used(run_env, monkeypatch):
 # --- stale bridge replacement ------------------------------------------------------------------
 
 STALE = {"service": "whatsapp-bridge", "version": "old-hash", "pid": 4242}
+REAL_PROCESS_NAME = bridge_manager._process_name
 
 
 def test_is_loopback():
@@ -419,6 +445,7 @@ def replace_env(run_env, monkeypatch):
     )
     monkeypatch.setattr(BridgeManager, "_wait_for_health", lambda self, proc, b: None)
     monkeypatch.setattr(bridge_manager.os, "kill", lambda pid, sig: calls["kills"].append(pid))
+    monkeypatch.setattr(bridge_manager, "_process_name", lambda pid: "bridge-bin")
     monkeypatch.setattr(bridge_manager.time, "sleep", lambda s: None)
     monkeypatch.setattr(bridge_manager, "REPLACE_TIMEOUT", 0.0)
     return calls
@@ -563,3 +590,123 @@ def test_terminate_permission_error_refuses(replace_env, monkeypatch):
     monkeypatch.setattr(bridge_manager.os, "kill", denied)
     _script_health(monkeypatch, [STALE])
     assert BridgeManager()._terminate_stale(STALE) is False
+
+
+def test_terminate_refuses_pid_that_runs_another_program(replace_env, monkeypatch):
+    """The bridge URL is loopback, but the pid it reports may belong to another namespace."""
+    seen = []
+
+    def ps(cmd, **kwargs):
+        seen.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="/usr/bin/python3\n", stderr="")
+
+    monkeypatch.setattr(bridge_manager, "_process_name", REAL_PROCESS_NAME)  # undo the stub
+    monkeypatch.setenv("WHATSAPP_BRIDGE_BIN", "/opt/bridge/whatsapp-bridge")
+    monkeypatch.setattr(bridge_manager.subprocess, "run", ps)
+    _script_health(monkeypatch, [STALE])
+    assert BridgeManager()._terminate_stale(STALE) is False
+    assert replace_env["kills"] == [] and seen == [["ps", "-p", "4242", "-o", "comm="]]
+
+
+@pytest.mark.parametrize(
+    ("stdout", "code", "expected"),
+    [
+        ("/opt/bridge/whatsapp-bridge\n", 0, True),  # macOS: full executable path
+        ("whatsapp-bridge\n", 0, True),
+        ("whatsapp-bridg\n", 0, False),  # truncation is 15 characters exactly
+        ("python3\n", 0, False),
+        ("", 1, False),  # no such process
+    ],
+)
+def test_is_bridge_process_matches_binary_basename(monkeypatch, stdout, code, expected):
+    monkeypatch.setenv("WHATSAPP_BRIDGE_BIN", "/opt/bridge/whatsapp-bridge")
+    monkeypatch.setattr(
+        bridge_manager.subprocess,
+        "run",
+        lambda cmd, **kw: subprocess.CompletedProcess(cmd, code, stdout=stdout, stderr=""),
+    )
+    assert bridge_manager._is_bridge_process(4242) is expected
+
+
+def test_is_bridge_process_accepts_linux_truncated_comm(monkeypatch):
+    monkeypatch.setenv("WHATSAPP_BRIDGE_BIN", "/opt/bridge/whatsapp-bridge-dev")
+    monkeypatch.setattr(
+        bridge_manager.subprocess,
+        "run",
+        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout="whatsapp-bridge\n"),
+    )
+    assert bridge_manager._is_bridge_process(4242) is True
+
+
+@pytest.mark.parametrize(
+    "error", [OSError(errno.ENOENT, "no ps"), subprocess.TimeoutExpired("ps", 5)]
+)
+def test_process_name_unreadable_means_not_ours(monkeypatch, error):
+    def fail(cmd, **kwargs):
+        raise error
+
+    monkeypatch.setattr(bridge_manager.subprocess, "run", fail)
+    assert bridge_manager._process_name(4242) is None
+    assert bridge_manager._is_bridge_process(4242) is False
+
+
+def _ps_works() -> bool:
+    try:
+        return subprocess.run(["ps", "-p", str(os.getpid())], capture_output=True).returncode == 0
+    except OSError:
+        return False
+
+
+@pytest.mark.skipif(not _ps_works(), reason="ps is not available (sandbox)")
+def test_is_bridge_process_with_real_ps(monkeypatch):
+    """Real ps against a real child: the binary basename decides."""
+    child = subprocess.Popen(["sleep", "30"])
+    try:
+        monkeypatch.setenv("WHATSAPP_BRIDGE_BIN", "/somewhere/sleep")
+        assert bridge_manager._is_bridge_process(child.pid) is True
+        monkeypatch.setenv("WHATSAPP_BRIDGE_BIN", "/somewhere/whatsapp-bridge")
+        assert bridge_manager._is_bridge_process(child.pid) is False
+    finally:
+        child.kill()
+        child.wait()
+
+
+@pytest.mark.parametrize(
+    ("release", "expected"),
+    [
+        ("0.3.0", (0, 3, 0)),
+        ("v1.2.0-rc1", (1, 2, 0)),
+        ("10", (10,)),
+        (None, ()),  # pre-0.3 bridges report no release
+        ("", ()),
+        ("dev", ()),
+        (3, ()),
+    ],
+)
+def test_release_tuple(release, expected):
+    assert bridge_manager._release_tuple(release) == expected
+
+
+def test_bridge_is_newer_compares_releases_numerically(monkeypatch):
+    monkeypatch.setattr(bridge_manager, "RELEASE", "0.10.0")
+    assert bridge_manager._bridge_is_newer({"release": "0.10.1"}) is True
+    assert bridge_manager._bridge_is_newer({"release": "0.9.9"}) is False
+    assert bridge_manager._bridge_is_newer({"release": "0.10.0"}) is False
+    assert bridge_manager._bridge_is_newer({}) is False
+
+
+def test_oserror_during_forced_build_reuses_the_old_bridge(replace_env, monkeypatch, tmp_path):
+    """source_hash or makedirs failing inside build_bridge must not fail the supervisor."""
+    (tmp_path / "bridge-bin.srchash").write_text("older-sidecar")
+    monkeypatch.setattr(bridge_manager, "find_go", lambda: "/fake/go")
+
+    def broken_build(binary, src):
+        raise PermissionError(errno.EACCES, "Permission denied", binary)
+
+    monkeypatch.setattr(bridge_manager, "build_bridge", broken_build)
+    _post_answers(monkeypatch, replace_env, 200)
+    _script_health(monkeypatch, [STALE])
+    mgr = BridgeManager()
+    mgr.ensure_running()
+    assert mgr.state == "running" and mgr.error is None and mgr._done.is_set()
+    assert replace_env["posts"] == [] and replace_env["spawned"] == []

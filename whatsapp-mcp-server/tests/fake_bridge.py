@@ -6,6 +6,7 @@ Behaviour is driven by environment variables:
   FAKE_EXIT_AFTER=<s>     hold the lock without listening for s seconds, then exit (a peer
                           that is shutting down: listener closed, lock not yet released)
   FAKE_VERSION            version reported by /api/health (default "fakev")
+  FAKE_RELEASE            release reported by /api/health (default: none, like a v0.2.0 bridge)
   FAKE_TOKEN              token required instead of <store>/bridge.token
   FAKE_LOGGED_IN=1        report an already paired account
   FAKE_REPLACED=1         start in pairing state "replaced" (another client took the login)
@@ -107,16 +108,16 @@ class Handler(BaseHTTPRequestHandler):
         self._record()
         url = urlsplit(self.path)
         if url.path == "/api/health":
-            return self._send(
-                200,
-                {
-                    "service": "whatsapp-bridge",
-                    "version": version,
-                    "store_dir": store,
-                    "pid": os.getpid(),
-                    "auth_required": bool(token),
-                },
-            )
+            body = {
+                "service": "whatsapp-bridge",
+                "version": version,
+                "store_dir": store,
+                "pid": os.getpid(),
+                "auth_required": bool(token),
+            }
+            if os.environ.get("FAKE_RELEASE"):
+                body["release"] = os.environ["FAKE_RELEASE"]
+            return self._send(200, body)
         if url.path == "/api/status":
             if not self._authed():
                 return

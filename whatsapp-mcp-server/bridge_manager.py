@@ -11,6 +11,7 @@ import hashlib
 import ipaddress
 import logging
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -47,6 +48,9 @@ HEALTH_TIMEOUT = httpx.Timeout(3.0, connect=1.0)
 # How long a stale bridge may take to stop answering after a shutdown request or SIGTERM.
 REPLACE_TIMEOUT = 15.0
 PAIRING_IN_PROGRESS = ("qr", "code")
+# Release of this server and of the bridge it builds (bridgeRelease in whatsapp-bridge/pairing.go).
+# A bridge reporting a newer release in /api/health is never replaced by this server.
+RELEASE = "0.3.0"
 API_TIMEOUT = httpx.Timeout(30.0, connect=3.0)
 
 GO_PROBE_PATHS = (
@@ -347,6 +351,43 @@ def _is_loopback(host: str | None) -> bool:
         return False
 
 
+def _release_tuple(release: Any) -> tuple[int, ...]:
+    """Numeric parts of a release like "0.3.0" or "v1.2.0-rc1"; () when missing (pre-0.3)."""
+    m = re.match(r"v?(\d+(?:\.\d+)*)", release) if isinstance(release, str) else None
+    return tuple(int(part) for part in m.group(1).split(".")) if m else ()
+
+
+def _bridge_is_newer(health: dict[str, Any]) -> bool:
+    """True when the bridge reports a newer release than this server (never downgrade it)."""
+    return _release_tuple(health.get("release")) > _release_tuple(RELEASE)
+
+
+def _process_name(pid: int) -> str | None:
+    """Executable basename of a local pid via ps (POSIX); None when it cannot be read."""
+    try:
+        proc = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "comm="],  # noqa: S607 - POSIX ps from PATH
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    name = proc.stdout.strip()
+    return os.path.basename(name) if proc.returncode == 0 and name else None
+
+
+def _is_bridge_process(pid: int) -> bool:
+    """Whether pid runs the bridge binary on this machine (Linux truncates comm to 15 chars)."""
+    name = _process_name(pid)
+    expected = os.path.basename(bridge_bin())
+    return name is not None and (
+        name == expected or (len(name) == 15 and expected.startswith(name))
+    )
+
+
 def _current_source_hash() -> str | None:
     """source_hash of the bridge sources; None when absent or changing mid-read (git pull)."""
     try:
@@ -544,6 +585,14 @@ class BridgeManager:
         # Only a supervisor-built binary (.srchash sidecar) is replaced, never a release binary.
         if current is None or built is None or health.get("version") == current:
             return None
+        if _bridge_is_newer(health):
+            logger.warning(
+                "bridge (pid %s) runs release %s, newer than this server (%s); reusing it",
+                health.get("pid"),
+                health.get("release"),
+                RELEASE,
+            )
+            return None
         if built != current and find_go() is None:
             logger.warning(
                 "bridge (pid %s) is stale but Go is not installed to rebuild it; reusing it",
@@ -570,12 +619,14 @@ class BridgeManager:
         if current is None:
             return False
         binary = bridge_bin()
+        # The old bridge serves until the shutdown request: bridge tools keep working meanwhile.
+        self.state = "running"
+        self._done.set()
         if built_version() != current:
             # Build while the old bridge still serves, so a failure costs no downtime.
-            self.state = "building"
             try:
                 build_bridge(binary, src_dir())
-            except BridgeError as e:
+            except (BridgeError, OSError) as e:
                 logger.warning("could not rebuild the stale bridge; reusing it: %s", e)
                 return False
         old = str(health.get("version"))
@@ -585,6 +636,8 @@ class BridgeManager:
             old,
             current,
         )
+        self._done.clear()
+        self.state = "starting"
         outcome = self._request_shutdown(old)
         if outcome == "ok":
             gone = self._wait_gone(REPLACE_TIMEOUT)
@@ -600,7 +653,6 @@ class BridgeManager:
         if not gone:
             logger.warning("a bridge still answers on %s; reusing it", api_base_url())
             return False
-        self.state = "starting"
         proc = self._spawn(binary)
         self._wait_for_health(proc, binary)
         return True
@@ -648,6 +700,9 @@ class BridgeManager:
             or now.get("version") != health.get("version")
         ):
             logger.warning("not signalling the stale bridge: it changed since it was checked")
+            return False
+        if not _is_bridge_process(pid):
+            logger.warning("not signalling pid %s: it does not run the bridge binary", pid)
             return False
         try:
             os.kill(pid, signal.SIGTERM)
@@ -769,7 +824,13 @@ class BridgeManager:
         if expected and health.get("version") != expected:
             out["restart_needed"] = True
             pid = health.get("pid")
-            if self._auto_replaceable(current, st):
+            if _bridge_is_newer(health):
+                out["hint"] = (
+                    f"The running bridge (pid {pid}) is release {health.get('release')}, newer "
+                    f"than this MCP server ({RELEASE}). This session runs an older version: "
+                    "update it, then restart it."
+                )
+            elif self._auto_replaceable(current, st):
                 out["hint"] = (
                     f"The running bridge (pid {pid}) was built from older sources. "
                     "Reconnect the MCP server to replace it automatically."
