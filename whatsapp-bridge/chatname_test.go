@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 )
 
@@ -402,5 +403,40 @@ func TestRepairWhileReaderOpen(t *testing.T) {
 	}
 	if _, _, ok := chatRow(t, ms, lid); ok {
 		t.Fatal("LID chat not merged")
+	}
+}
+
+// A device from container.NewDevice() has nil Contacts/LIDs until it is saved after
+// pairing; the resolver must pick the stores up once they are set, not keep the nil snapshot.
+func TestDeviceResolverSeesStoresSetAfterPairing(t *testing.T) {
+	ctx := context.Background()
+	ms := newTestStore(t)
+	dev := &store.Device{}
+	r := newDeviceChatResolver(ms, dev, nil)
+
+	if got := r.resolveName(ctx, lidJID(testLID), nameHints{}); got != "LID "+testLID {
+		t.Fatalf("before pairing: name = %q", got)
+	}
+
+	// What PutDevice/initializeDevice does after PairSuccess.
+	dev.LIDs = newFakeLIDs(testLID, testPN)
+	dev.Contacts = &fakeContacts{m: map[string]types.ContactInfo{testPN: {FullName: "Alice"}}}
+
+	info := &types.MessageInfo{MessageSource: types.MessageSource{Chat: lidJID(testLID), Sender: lidJID(testLID)}}
+	if chat := messageChatJID(ctx, r.lidStore(), info); chat != pnJID(testPN) {
+		t.Fatalf("chat not normalized after pairing: %v", chat)
+	}
+	if got := r.resolveName(ctx, lidJID(testLID), nameHints{}); got != "Alice" {
+		t.Fatalf("after pairing: name = %q", got)
+	}
+
+	lid := lidJID(testLID).String()
+	ms.StoreChat(lid, "LID "+testLID, time.Now().UTC())
+	putMsg(t, ms, "x", lid, testLID, "hello", time.Now().UTC())
+	if err := r.repair(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := chatRow(t, ms, lid); ok {
+		t.Fatal("repair did not merge the LID chat with the late LID store")
 	}
 }

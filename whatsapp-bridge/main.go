@@ -26,9 +26,9 @@ func handleMessage(r *chatResolver, messageStore *MessageStore, msg *events.Mess
 	ctx := context.Background()
 
 	// Normalize LID addressing to phone numbers where a mapping is known
-	chat := messageChatJID(ctx, r.lids, &msg.Info)
+	chat := messageChatJID(ctx, r.lidStore(), &msg.Info)
 	chatJID := chat.String()
-	sender := messageSenderUser(ctx, r.lids, &msg.Info)
+	sender := messageSenderUser(ctx, r.lidStore(), &msg.Info)
 	r.mergeIfMapped(ctx, msg.Info.Chat, chat)
 
 	// Name hints only make sense for the other party of an incoming DM
@@ -164,7 +164,7 @@ func run() int {
 		c := whatsmeow.NewClient(dev, logger)
 		c.InitialAutoReconnect = true
 		rc := realClient{c}
-		resolver := newChatResolver(messageStore, c.Store.Contacts, c.Store.LIDs,
+		resolver := newDeviceChatResolver(messageStore, dev,
 			func(ctx context.Context, jid types.JID) (string, error) {
 				info, err := c.GetGroupInfo(ctx, jid)
 				if err != nil {
@@ -294,7 +294,7 @@ func handleHistorySync(r *chatResolver, self string, messageStore *MessageStore,
 		if pn := conversation.GetPnJID(); pn != "" {
 			altPN, _ = types.ParseJID(pn)
 		}
-		jid := normalizeJID(ctx, r.lids, origJID, altPN)
+		jid := normalizeJID(ctx, r.lidStore(), origJID, altPN)
 		chatJID := jid.String()
 		r.mergeIfMapped(ctx, origJID, jid)
 		if lidStr := conversation.GetLidJID(); lidStr != "" && jid.Server == types.DefaultUserServer {
@@ -369,7 +369,7 @@ func handleHistorySync(r *chatResolver, self string, messageStore *MessageStore,
 						participant = *msg.Message.Key.Participant
 					}
 				}
-				sender := historySender(ctx, r.lids, participant, isFromMe, jid, self)
+				sender := historySender(ctx, r.lidStore(), participant, isFromMe, jid, self)
 
 				// Store message
 				msgID := ""

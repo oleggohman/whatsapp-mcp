@@ -53,10 +53,12 @@ func isPlaceholderName(name string, jid types.JID) bool {
 // chatResolver resolves chat names and repairs LID chats. It depends only on the
 // store interfaces and a groupInfoFn, never on *whatsmeow.Client.
 type chatResolver struct {
-	store     *MessageStore
-	contacts  store.ContactStore
-	lids      store.LIDStore
-	groupInfo groupInfoFn
+	store *MessageStore
+	// The contact and LID stores are read on every use: a freshly created device gets
+	// them only when it is saved after pairing, so a snapshot taken earlier stays nil.
+	contactsFn func() store.ContactStore
+	lidsFn     func() store.LIDStore
+	groupInfo  groupInfoFn
 
 	now      func() time.Time
 	debounce time.Duration
@@ -69,43 +71,64 @@ type chatResolver struct {
 }
 
 func newChatResolver(ms *MessageStore, contacts store.ContactStore, lids store.LIDStore, gi groupInfoFn) *chatResolver {
+	return newLazyChatResolver(ms,
+		func() store.ContactStore { return contacts },
+		func() store.LIDStore { return lids }, gi)
+}
+
+// newLazyChatResolver builds a resolver that fetches the stores through the given funcs on every use.
+func newLazyChatResolver(ms *MessageStore, contacts func() store.ContactStore, lids func() store.LIDStore, gi groupInfoFn) *chatResolver {
 	return &chatResolver{
-		store:     ms,
-		contacts:  contacts,
-		lids:      lids,
-		groupInfo: gi,
-		now:       time.Now,
-		debounce:  repairDebounce,
-		groupFail: map[types.JID]time.Time{},
+		store:      ms,
+		contactsFn: contacts,
+		lidsFn:     lids,
+		groupInfo:  gi,
+		now:        time.Now,
+		debounce:   repairDebounce,
+		groupFail:  map[types.JID]time.Time{},
 	}
 }
+
+// newDeviceChatResolver builds a resolver that always uses the current stores of dev.
+func newDeviceChatResolver(ms *MessageStore, dev *store.Device, gi groupInfoFn) *chatResolver {
+	return newLazyChatResolver(ms,
+		func() store.ContactStore { return dev.Contacts },
+		func() store.LIDStore { return dev.LIDs }, gi)
+}
+
+// lidStore returns the current LID store (nil before the device is saved).
+func (r *chatResolver) lidStore() store.LIDStore { return r.lidsFn() }
+
+// contactStore returns the current contact store (nil before the device is saved).
+func (r *chatResolver) contactStore() store.ContactStore { return r.contactsFn() }
 
 // contactFor merges the contact records of the PN and LID forms of jid; for every field
 // the PN record wins and the LID record fills the gaps.
 func (r *chatResolver) contactFor(ctx context.Context, jid types.JID) types.ContactInfo {
 	var pn, lid types.JID
+	lids, contacts := r.lidStore(), r.contactStore()
 	switch jid.Server {
 	case types.HiddenUserServer:
 		lid = jid.ToNonAD()
-		if r.lids != nil {
-			if m, err := r.lids.GetPNForLID(ctx, lid); err == nil && !m.IsEmpty() {
+		if lids != nil {
+			if m, err := lids.GetPNForLID(ctx, lid); err == nil && !m.IsEmpty() {
 				pn = m.ToNonAD()
 			}
 		}
 	default:
 		pn = jid.ToNonAD()
-		if r.lids != nil {
-			if m, err := r.lids.GetLIDForPN(ctx, pn); err == nil && !m.IsEmpty() {
+		if lids != nil {
+			if m, err := lids.GetLIDForPN(ctx, pn); err == nil && !m.IsEmpty() {
 				lid = m.ToNonAD()
 			}
 		}
 	}
 	var out types.ContactInfo
 	for _, j := range []types.JID{pn, lid} {
-		if j.IsEmpty() || r.contacts == nil {
+		if j.IsEmpty() || contacts == nil {
 			continue
 		}
-		c, err := r.contacts.GetContact(ctx, j)
+		c, err := contacts.GetContact(ctx, j)
 		if err != nil {
 			continue
 		}
@@ -189,7 +212,7 @@ func (r *chatResolver) mergeIfMapped(ctx context.Context, orig, norm types.JID) 
 	if !r.chatExists(lid) {
 		return
 	}
-	if err := r.store.mergeChat(ctx, lid, norm.ToNonAD().String(), r.lids); err != nil {
+	if err := r.store.mergeChat(ctx, lid, norm.ToNonAD().String(), r.lidStore()); err != nil {
 		logf("Failed to merge chat %s into %s: %v\n", lid, norm, err)
 	}
 }
@@ -209,16 +232,17 @@ func (r *chatResolver) repair(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	lids := r.lidStore()
 	for _, c := range lidChats {
 		jid, err := types.ParseJID(c[0])
-		if err != nil || r.lids == nil {
+		if err != nil || lids == nil {
 			continue
 		}
-		pn, err := r.lids.GetPNForLID(ctx, jid)
+		pn, err := lids.GetPNForLID(ctx, jid)
 		if err != nil || pn.IsEmpty() || pn.Server != types.DefaultUserServer {
 			continue
 		}
-		if err := r.store.mergeChat(ctx, c[0], pn.ToNonAD().String(), r.lids); err != nil {
+		if err := r.store.mergeChat(ctx, c[0], pn.ToNonAD().String(), lids); err != nil {
 			return err
 		}
 	}
