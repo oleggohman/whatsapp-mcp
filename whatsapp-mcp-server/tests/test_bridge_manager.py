@@ -568,6 +568,33 @@ def test_stale_daemon_is_reported(env, monkeypatch):
     assert status["restart_needed"] is True and "kill" in status["hint"]
 
 
+def test_daemon_older_than_updated_sources_is_reported(env):
+    """After a repo update the reused daemon is stale even though nothing rebuilt the binary."""
+    go_file = env["src"] / "main.go"
+    go_file.write_text("package main\n")
+    built = bridge_manager.source_hash(str(env["src"]))
+    Path(str(env["binary"]) + ".srchash").write_text(built)
+    start_fake(env, FAKE_VERSION=built)  # daemon built from the current sources
+    wait_health(env)
+    mgr = BridgeManager()
+    mgr.ensure_running()  # reuse path: no build
+    assert "restart_needed" not in mgr.status()
+
+    go_file.write_text("package main\n\n// updated by git pull\n")
+    status = mgr.status()
+    assert status["restart_needed"] is True and "kill" in status["hint"]
+
+
+def test_release_binary_without_sidecar_is_never_stale(env):
+    """A prebuilt release reports its tag as version and has no .srchash: never flagged."""
+    (env["src"] / "main.go").write_text("package main\n")
+    start_fake(env, FAKE_VERSION="v1.2.3")
+    wait_health(env)
+    mgr = BridgeManager()
+    mgr.ensure_running()
+    assert "restart_needed" not in mgr.status()
+
+
 def test_failed_state_carries_log_tail(env, monkeypatch):
     monkeypatch.setenv("FAKE_EXIT_EARLY", "3")
     mgr = BridgeManager()

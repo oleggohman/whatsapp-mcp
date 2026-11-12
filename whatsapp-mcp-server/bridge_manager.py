@@ -580,12 +580,15 @@ class BridgeManager:
         out.update({k: st.get(k) for k in ("connected", "logged_in", "pairing")})
         if st.get("pairing_error"):
             out["pairing_error"] = st["pairing_error"]
-        expected = built_version()
+        # Only a supervisor-built binary (it has a .srchash sidecar) is compared; release
+        # binaries report their tag. Compare with the current sources, not the sidecar: a
+        # reused daemon is never rebuilt, so after a repo update the sidecar is just as old.
+        expected = built_version() and (source_hash(src_dir()) or built_version())
         if expected and health.get("version") != expected:
             out["restart_needed"] = True
             out["hint"] = (
                 f"The running bridge (pid {health.get('pid')}) was built from older sources. "
-                f"Stop it (kill {health.get('pid')}); the next bridge call spawns the new build."
+                f"Stop it (kill {health.get('pid')}); the next bridge call rebuilds and spawns it."
             )
             logger.warning(
                 "bridge daemon is stale: running %s, built %s", health.get("version"), expected
