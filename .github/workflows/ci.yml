@@ -35,6 +35,8 @@ jobs:
           cache-dependency-path: whatsapp-bridge/go.sum
       - run: go vet ./...
       - run: go test -race -count=1 ./...
+      - name: Coverage gate (100%)
+        run: bash scripts/coverage.sh
 
   golangci-lint:
     runs-on: ubuntu-latest
@@ -67,7 +69,8 @@ jobs:
       - run: uv sync --frozen
       - run: uv run ruff check .
       - run: uv run ruff format --check .
-      - run: uv run pytest -q
+      - name: Tests + coverage gate (100%)
+        run: uv run pytest -q --cov --cov-report=term-missing
 
   trivy:
     runs-on: ubuntu-latest
