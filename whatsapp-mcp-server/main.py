@@ -1,3 +1,6 @@
+import logging
+import os
+import sys
 from typing import List, Dict, Any, Optional
 from mcp.server.fastmcp import FastMCP
 from whatsapp import (
@@ -248,5 +251,11 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
         }
 
 if __name__ == "__main__":
+    # stdout carries the MCP stdio transport, so log to stderr only
+    logging.basicConfig(
+        stream=sys.stderr,
+        level=os.environ.get("WHATSAPP_LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     # Initialize and run the server
     mcp.run(transport='stdio')

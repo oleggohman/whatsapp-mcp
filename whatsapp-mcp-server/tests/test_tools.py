@@ -167,21 +167,15 @@ def test_wal_db_readable_after_writer_closed(tmp_path, monkeypatch):
     for suffix in ("-wal", "-shm"):
         assert not (tmp_path / f"messages.db{suffix}").exists()
     monkeypatch.setenv("WHATSAPP_DB_PATH", str(db))
-    conn = whatsapp._connect()
-    try:
+    with whatsapp._connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM chats").fetchone()[0] == 4
         assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-    finally:
-        conn.close()
 
 
 def test_connect_is_read_only(store_dir):
-    conn = whatsapp._connect()
-    try:
+    with whatsapp._connect() as conn:
         with pytest.raises(sqlite3.OperationalError):
             conn.execute("DELETE FROM chats")
-    finally:
-        conn.close()
 
 
 # --- tool schema baseline ----------------------------------------------------------------------

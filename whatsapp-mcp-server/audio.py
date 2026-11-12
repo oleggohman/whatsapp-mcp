@@ -57,6 +57,9 @@ def convert_to_opus_ogg(input_file, output_file=None, bitrate="32k", sample_rate
             check=True
         )
         return output_file
+    except FileNotFoundError:
+        # subprocess raises this when the ffmpeg executable itself is missing
+        raise FileNotFoundError("ffmpeg not found on PATH. Install ffmpeg to send non-.ogg audio.")
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"Failed to convert audio. You likely need to install ffmpeg {e.stderr}")
 
