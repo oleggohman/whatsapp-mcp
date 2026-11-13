@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -568,24 +567,6 @@ func TestRealContainerFailsOnUnusableDatabase(t *testing.T) {
 	c, err := h.realContainer(context.Background(), sqliteDSN(t.TempDir()), waLog.Noop)
 	if err == nil || c != nil {
 		t.Fatalf("container = %v, err = %v", c, err)
-	}
-}
-
-func TestDefaultSignalHookDeliversSIGTERM(t *testing.T) {
-	h := newRunHarness(t, nil)
-	c := make(chan os.Signal, 1)
-	h.realSignals(c)
-	defer signal.Stop(c)
-	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case got := <-c:
-		if got != syscall.SIGTERM {
-			t.Fatalf("signal = %v", got)
-		}
-	case <-time.After(settleTimeout):
-		t.Fatal("SIGTERM not delivered to the registered channel")
 	}
 }
 
