@@ -315,6 +315,20 @@ func TestSyncConversationLogsStoreFailure(t *testing.T) {
 	}
 }
 
+func TestSyncConversationLogsChatStoreFailure(t *testing.T) {
+	ctx := context.Background()
+	r, ms := newTestResolver(t, nil, newFakeLIDs(), nil)
+	if _, err := ms.db.Exec("CREATE TRIGGER y BEFORE INSERT ON chats BEGIN SELECT RAISE(ABORT, 'chat-boom'); END"); err != nil {
+		t.Fatal(err)
+	}
+	chat := pnJID(testPN).String()
+	conv := &waHistorySync.Conversation{ID: proto.String(chat), Messages: []*waHistorySync.HistorySyncMsg{histMsg(chat, "a", uint64(time.Now().Unix()), text("hi"))}}
+	logs := captureStderr(t, func() { syncConversation(ctx, r, "me", ms, conv, newStderrLogger("T", "WARN")) })
+	if !strings.Contains(logs, "Failed to store chat:") || !strings.Contains(logs, "chat-boom") {
+		t.Fatalf("logs=%q", logs)
+	}
+}
+
 // fakeHistory is a historyClient with switchable behavior.
 type fakeHistory struct {
 	connected bool

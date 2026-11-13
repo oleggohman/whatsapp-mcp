@@ -196,7 +196,7 @@ func run() int {
 		logger.Errorf("Failed to initialize message store: %v", err)
 		return 1
 	}
-	defer messageStore.Close()
+	defer func() { _ = messageStore.Close() }()
 
 	var pm *pairingManager
 	// buildClient creates a client for a device store and attaches all event handlers.
@@ -370,12 +370,14 @@ func syncConversation(ctx context.Context, r *chatResolver, self string, message
 		// Get timestamp from message info
 		timestamp := time.Time{}
 		if ts := latestMsg.Message.GetMessageTimestamp(); ts != 0 {
-			timestamp = time.Unix(int64(ts), 0)
+			timestamp = time.Unix(int64(ts), 0) //nolint:gosec // G115: seconds since epoch, far below MaxInt64
 		} else {
 			return syncedCount
 		}
 
-		messageStore.StoreChat(chatJID, name, timestamp)
+		if err := messageStore.StoreChat(chatJID, name, timestamp); err != nil {
+			logger.Warnf("Failed to store chat: %v", err)
+		}
 
 		// Store messages
 		for _, msg := range messages {
@@ -432,7 +434,7 @@ func syncConversation(ctx context.Context, r *chatResolver, self string, message
 			// Get message timestamp
 			timestamp := time.Time{}
 			if ts := msg.Message.GetMessageTimestamp(); ts != 0 {
-				timestamp = time.Unix(int64(ts), 0)
+				timestamp = time.Unix(int64(ts), 0) //nolint:gosec // G115: seconds since epoch, far below MaxInt64
 			} else {
 				continue
 			}

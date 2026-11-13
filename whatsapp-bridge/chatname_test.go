@@ -148,7 +148,7 @@ func TestGroupNameResolutionAndFailureCache(t *testing.T) {
 	ctx := context.Background()
 	g := types.NewJID("123-456", types.GroupServer)
 	calls := 0
-	var gErr error = errors.New("not in group")
+	gErr := errors.New("not in group")
 	gi := func(_ context.Context, j types.JID) (string, error) {
 		calls++
 		if gErr != nil {

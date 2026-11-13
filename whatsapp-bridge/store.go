@@ -65,7 +65,8 @@ type MessageStore struct {
 // Initialize message store
 func NewMessageStore() (*MessageStore, error) {
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll(storeDir(), 0755); err != nil {
+	// 0700: the store holds the WhatsApp session, the API token and private messages
+	if err := os.MkdirAll(storeDir(), 0o700); err != nil {
 		return nil, fmt.Errorf("failed to create store directory: %v", err)
 	}
 
@@ -102,7 +103,7 @@ func NewMessageStore() (*MessageStore, error) {
 		);
 	`)
 	if err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
@@ -149,7 +150,7 @@ func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, er
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var messages []Message
 	for rows.Next() {
@@ -175,7 +176,7 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	chats := make(map[string]time.Time)
 	for rows.Next() {
@@ -238,7 +239,7 @@ func (store *MessageStore) chatsWithName(suffix string) ([][2]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out [][2]string
 	for rows.Next() {
 		var jid, name string
@@ -273,7 +274,7 @@ func (store *MessageStore) mergeChat(ctx context.Context, lid, pn string, lids s
 	for senderRows.Next() {
 		var s sql.NullString
 		if err := senderRows.Scan(&s); err != nil {
-			senderRows.Close()
+			_ = senderRows.Close()
 			return err
 		}
 		if s.String != "" {
@@ -281,10 +282,10 @@ func (store *MessageStore) mergeChat(ctx context.Context, lid, pn string, lids s
 		}
 	}
 	if err := senderRows.Err(); err != nil {
-		senderRows.Close()
+		_ = senderRows.Close()
 		return err
 	}
-	senderRows.Close()
+	_ = senderRows.Close()
 	if lids != nil {
 		for _, s := range senders {
 			mapped, err := lids.GetPNForLID(ctx, types.NewJID(s, types.HiddenUserServer))
@@ -298,7 +299,7 @@ func (store *MessageStore) mergeChat(ctx context.Context, lid, pn string, lids s
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }() // no-op after Commit
 
 	var lidName sql.NullString
 	var lidTime sql.NullTime

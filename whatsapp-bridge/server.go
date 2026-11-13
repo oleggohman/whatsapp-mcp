@@ -271,7 +271,7 @@ func readMediaFile(p string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("media_path is not accessible: %v", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	info, err := f.Stat()
 	if err != nil {
 		return nil, fmt.Errorf("media_path is not accessible: %v", err)
@@ -572,7 +572,7 @@ func shutdownRESTServer(srv *http.Server, timeout time.Duration) error {
 	defer cancel()
 	err := srv.Shutdown(ctx)
 	if err != nil {
-		srv.Close()
+		_ = srv.Close() // force-close what the graceful shutdown left
 	}
 	return err
 }
