@@ -17,12 +17,12 @@ import (
 
 // bridgeVersion is reported by /api/health. The MCP supervisor overrides it at build time
 // (-ldflags "-X main.bridgeVersion=<source hash>") to detect daemons running stale code.
-var bridgeVersion = "0.3.1"
+var bridgeVersion = "0.3.2"
 
 // bridgeRelease is the release this bridge belongs to, reported by /api/health. Unlike
 // bridgeVersion it is never overridden at build time, so supervisors can order bridges by it
 // and never replace a newer bridge with an older one.
-const bridgeRelease = "0.3.1"
+const bridgeRelease = "0.3.2"
 
 // Pairing states reported in /api/status ("replaced" is derived from the replaced flag).
 const (
