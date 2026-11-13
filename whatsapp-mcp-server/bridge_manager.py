@@ -357,6 +357,19 @@ def _release_tuple(release: Any) -> tuple[int, ...]:
     return tuple(int(part) for part in m.group(1).split(".")) if m else ()
 
 
+_SOURCE_HASH_RE = re.compile(r"[0-9a-f]{12}")
+
+
+def _supervisor_built(health: dict[str, Any]) -> bool:
+    """Whether the bridge reports a source hash, i.e. a supervisor built it (not a release binary).
+
+    The .srchash sidecar cannot tell: each plugin version installs into a new directory, so a
+    stale bridge from the previous version never has a sidecar next to the new binary path.
+    """
+    version = health.get("version")
+    return isinstance(version, str) and _SOURCE_HASH_RE.fullmatch(version) is not None
+
+
 def _bridge_is_newer(health: dict[str, Any]) -> bool:
     """True when the bridge reports a newer release than this server (never downgrade it)."""
     return _release_tuple(health.get("release")) > _release_tuple(RELEASE)
@@ -582,8 +595,8 @@ class BridgeManager:
             return None
         current = _current_source_hash()
         built = built_version()
-        # Only a supervisor-built binary (.srchash sidecar) is replaced, never a release binary.
-        if current is None or built is None or health.get("version") == current:
+        # Only a supervisor-built bridge (it reports a source hash) is replaced, never a release.
+        if current is None or not _supervisor_built(health) or health.get("version") == current:
             return None
         if _bridge_is_newer(health):
             logger.warning(
@@ -816,11 +829,11 @@ class BridgeManager:
         out.update({k: st.get(k) for k in ("connected", "logged_in", "pairing")})
         if st.get("pairing_error"):
             out["pairing_error"] = st["pairing_error"]
-        # Only a supervisor-built binary (it has a .srchash sidecar) is compared; release
+        # Only a supervisor-built bridge (it reports a source hash) is compared; release
         # binaries report their tag. Compare with the current sources, not the sidecar: a
-        # reused daemon is never rebuilt, so after a repo update the sidecar is just as old.
+        # reused daemon is never rebuilt, and a new plugin version has no sidecar yet.
         current = _current_source_hash()  # None when sources change mid-read: use the sidecar
-        expected = built_version() and (current or built_version())
+        expected = (current or built_version()) if _supervisor_built(health) else None
         if expected and health.get("version") != expected:
             out["restart_needed"] = True
             pid = health.get("pid")

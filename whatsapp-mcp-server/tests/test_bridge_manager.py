@@ -354,7 +354,7 @@ def test_build_replaces_srchash_atomically(env, monkeypatch):
     seed_sources(env)
     target = env["tmp"] / "built-bridge"
     sidecar = str(target) + ".srchash"
-    Path(sidecar).write_text("old-hash")
+    Path(sidecar).write_text("0123456789ab")
     monkeypatch.setenv("WHATSAPP_GO_BIN", str(make_fake_go(env)))
     replaced = []
     real_replace = os.replace
@@ -581,8 +581,8 @@ def test_failed_start_is_retried_after_cooldown(env, monkeypatch):
 
 
 def test_stale_daemon_is_reported(env, monkeypatch):
-    monkeypatch.setenv("FAKE_VERSION", "old-hash")
-    Path(str(env["binary"]) + ".srchash").write_text("new-hash")
+    monkeypatch.setenv("FAKE_VERSION", "0123456789ab")
+    Path(str(env["binary"]) + ".srchash").write_text("fedcba987654")
     mgr = BridgeManager()
     mgr.ensure_running()
     status = mgr.status()
@@ -656,7 +656,7 @@ def stale(env, monkeypatch):
 
 
 def start_stale(env, **extra) -> subprocess.Popen:
-    proc = start_fake(env, **{"FAKE_VERSION": "old-hash", **extra})
+    proc = start_fake(env, **{"FAKE_VERSION": "0123456789ab", **extra})
     env["old_pid"] = wait_health(env)["pid"]
     return proc
 
@@ -688,13 +688,32 @@ def test_matching_bridge_is_reused_without_shutdown(stale):
     assert requests(stale, "POST /api/shutdown") == 0
 
 
-def test_prebuilt_binary_is_never_replaced(stale):
+def test_prebuilt_binary_is_never_replaced(stale, monkeypatch):
+    """A release binary reports its tag, not a source hash: it is never replaced."""
     Path(str(stale["binary"]) + ".srchash").unlink()
-    start_stale(stale)
+    monkeypatch.setenv("WHATSAPP_GO_BIN", str(make_fake_go(stale)))
+    start_stale(stale, FAKE_VERSION="0.3.1")
     mgr = BridgeManager()
     mgr.ensure_running()
     assert mgr.state == "running" and requests(stale, "POST /api/shutdown") == 0
     assert wait_health(stale)["pid"] == stale["old_pid"]
+    assert "restart_needed" not in mgr.status()
+
+
+def test_new_plugin_version_without_a_binary_replaces_the_stale_bridge(stale, monkeypatch):
+    """A plugin update installs into a new directory with no .srchash next to the binary path.
+
+    The bridge from the previous version still runs; it must be rebuilt and replaced.
+    """
+    old = start_stale(stale)  # the previous version's bridge, started from its own directory
+    Path(str(stale["binary"]) + ".srchash").unlink()
+    monkeypatch.setenv("WHATSAPP_GO_BIN", str(make_fake_go(stale)))
+    mgr = BridgeManager()
+    mgr.ensure_running()
+    assert old.wait(10) == 0 and mgr.state == "running"
+    assert bridge_manager.built_version() == stale["current"]
+    assert wait_health(stale)["version"] == stale["current"]
+    assert "restart_needed" not in mgr.status()
 
 
 def test_no_replace_when_go_missing_and_binary_is_older(stale):

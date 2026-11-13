@@ -410,7 +410,7 @@ def test_binary_appearing_while_checking_sources_is_used(run_env, monkeypatch):
 
 # --- stale bridge replacement ------------------------------------------------------------------
 
-STALE = {"service": "whatsapp-bridge", "version": "old-hash", "pid": 4242}
+STALE = {"service": "whatsapp-bridge", "version": "0123456789ab", "pid": 4242}
 REAL_PROCESS_NAME = bridge_manager._process_name
 
 
@@ -467,12 +467,12 @@ def test_request_shutdown_outcomes(replace_env, monkeypatch):
     expected.update({401: "refused", 500: "refused"})
     for code, outcome in expected.items():
         _post_answers(monkeypatch, replace_env, code)
-        assert BridgeManager()._request_shutdown("old-hash") == outcome
+        assert BridgeManager()._request_shutdown("0123456789ab") == outcome
     url, kwargs = replace_env["posts"][0]
-    assert url == "http://127.0.0.1:9/api/shutdown" and kwargs["json"] == {"version": "old-hash"}
+    assert url == "http://127.0.0.1:9/api/shutdown" and kwargs["json"] == {"version": "0123456789ab"}
     assert kwargs["headers"]["Authorization"] == "Bearer tok"
     _post_answers(monkeypatch, replace_env, httpx.ConnectError(""))
-    assert BridgeManager()._request_shutdown("old-hash") == "error"
+    assert BridgeManager()._request_shutdown("0123456789ab") == "error"
 
 
 def test_source_hash_oserror_means_no_replacement(replace_env, monkeypatch):
