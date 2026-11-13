@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -225,23 +226,21 @@ func sendAndDescribe(client bridgeClient, recipient string, message string, medi
 	return true, fmt.Sprintf("Message sent to %s", recipient), &sentMessage{chat: recipientJID.ToNonAD(), resp: resp, msg: msg}
 }
 
-// recordSent stores a sent message: whatsmeow emits no event for messages this device sends,
-// so without this they would never reach messages.db.
-func recordSent(store *MessageStore, sent *sentMessage) error {
-	if store == nil || sent == nil {
-		return nil
+// sentRecorder routes a sent message to the store of the client that sent it. whatsmeow
+// emits no event for messages this device sends, so without it they never reach messages.db.
+type sentRecorder struct{ handlers sync.Map } // bridgeClient -> func(*sentMessage)
+
+// register sets how messages sent by c are stored.
+func (r *sentRecorder) register(c bridgeClient, store func(*sentMessage)) { r.handlers.Store(c, store) }
+
+// record stores sent with the handler registered for c; false when there is none.
+func (r *sentRecorder) record(c bridgeClient, sent *sentMessage) bool {
+	h, ok := r.handlers.Load(c)
+	if !ok || sent == nil {
+		return false
 	}
-	ts := sent.resp.Timestamp
-	if ts.IsZero() {
-		ts = time.Now()
-	}
-	chatJID := sent.chat.String()
-	if err := store.touchChat(chatJID, sent.chat.User, ts); err != nil {
-		return err
-	}
-	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(sent.msg)
-	return store.StoreMessage(sent.resp.ID, chatJID, sent.resp.Sender.User, extractTextContent(sent.msg), ts, true,
-		mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength)
+	h.(func(*sentMessage))(sent)
+	return true
 }
 
 // DownloadMediaRequest represents the request body for the download media API
@@ -344,6 +343,7 @@ type apiServer struct {
 	idle        *idleTracker    // optional; touched by authenticated non-health requests
 	storeDirAbs string          // absolute store dir reported by /api/health
 	shutdown    chan struct{}   // signalled by /api/shutdown; buffered(1), created only in newAPIServer
+	sent        sentRecorder    // stores messages sent through /api/send
 }
 
 // route is one API endpoint plus its guard policy.
@@ -537,10 +537,11 @@ func (a *apiServer) handleSend(w http.ResponseWriter, r *http.Request) {
 	logf("Received request to send message (text %d bytes, media %t)\n", len(req.Message), req.MediaPath != "")
 
 	// Send the message
-	success, message, sent := sendAndDescribe(a.client(), req.Recipient, req.Message, req.MediaPath)
+	client := a.client()
+	success, message, sent := sendAndDescribe(client, req.Recipient, req.Message, req.MediaPath)
 	logln("Message sent", success)
-	if err := recordSent(a.messageStore, sent); err != nil {
-		logf("Failed to store sent message: %v\n", err)
+	if sent != nil && !a.sent.record(client, sent) {
+		logln("Sent message not stored: no store handler for this client")
 	}
 
 	status := http.StatusOK

@@ -218,16 +218,6 @@ func (store *MessageStore) GetMediaInfo(id, chatJID string) (string, string, str
 	return mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, err
 }
 
-// touchChat moves a chat's last message time to ts, creating the chat with name when missing.
-// Unlike StoreChat it never overwrites a known chat name.
-func (store *MessageStore) touchChat(jid, name string, ts time.Time) error {
-	_, err := store.db.Exec(
-		`INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)
-		ON CONFLICT(jid) DO UPDATE SET last_message_time = excluded.last_message_time`,
-		jid, name, ts)
-	return err
-}
-
 // getChatName returns the stored name of a chat ("" if the chat is missing).
 func (store *MessageStore) getChatName(jid string) string {
 	var name sql.NullString

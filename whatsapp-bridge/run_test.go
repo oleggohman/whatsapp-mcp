@@ -600,3 +600,35 @@ func TestRunExitsGracefullyOnAPIShutdown(t *testing.T) {
 	}
 	l.Release()
 }
+
+func TestRunStoresMessagesSentThroughTheAPI(t *testing.T) {
+	self := types.JID{User: testSelfPN, Server: types.DefaultUserServer, Device: 3}
+	h := newRunHarness(t, &fakeContainer{dev: &store.Device{ID: &self}})
+	h.configure = func(_ int, c *fakeMeow) {
+		c.fakeWA = newFakeWA(true)
+		c.connected = true
+		c.sendResp = whatsmeow.SendResponse{ID: "RUN1", Timestamp: time.Now(), Sender: lidJID(testLID)}
+	}
+	code := h.start()
+	h.registered()
+	cl := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}, Timeout: settleTimeout}
+	resp, err := cl.Post("http://"+h.addr()+"/api/send", "application/json", strings.NewReader(`{"recipient":"15551234","message":"hi"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("send status = %d", resp.StatusCode)
+	}
+	h.stop(code)
+	db, err := openMessagesDB(messagesDBPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	var chat, sender string
+	if err := db.QueryRow("SELECT chat_jid, sender FROM messages WHERE id = 'RUN1'").Scan(&chat, &sender); err != nil ||
+		chat != "15551234@s.whatsapp.net" || sender != testSelfPN {
+		t.Fatalf("chat=%q sender=%q err=%v", chat, sender, err)
+	}
+}

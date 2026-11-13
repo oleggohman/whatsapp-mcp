@@ -199,6 +199,8 @@ func run() int {
 	defer func() { _ = messageStore.Close() }()
 
 	var pm *pairingManager
+	// The REST API exists before any client so each client can register how its sent messages are stored
+	api := newAPIServer(func() bridgeClient { return pm.Client() }, messageStore, token, bridgeAddr())
 	// buildClient creates a client for a device store and attaches all event handlers.
 	// It is also used after a logout to build the replacement client.
 	buildClient := func(dev *store.Device) waClient {
@@ -211,6 +213,9 @@ func run() int {
 				}
 				return info.Name, nil
 			})
+		api.sent.register(c, func(sent *sentMessage) {
+			handleMessage(resolver, messageStore, sentEvent(selfJID(dev, sent), sent), logger)
+		})
 		c.AddEventHandler(func(evt interface{}) {
 			// Pairing/login state machine first, then message processing
 			pm.handleEvent(c, evt)
@@ -242,7 +247,6 @@ func run() int {
 
 	// Start the REST API before connecting; handlers answer "Not connected" until the client is up
 	idle := newIdleTracker()
-	api := newAPIServer(pm.Client, messageStore, token, bridgeAddr())
 	api.pairing = pm
 	api.idle = idle
 	restServer, _, err := startRESTServer(bridgeAddr(), api.handler())
@@ -291,6 +295,37 @@ func run() int {
 }
 
 // selfUser returns the bare user digits of the logged-in account ("" before pairing).
+// selfJID is our own phone-number JID for storing a sent message; the send response's
+// Sender is often our LID and is documented as unreliable, so it is only a fallback.
+func selfJID(dev *store.Device, sent *sentMessage) types.JID {
+	if dev.ID != nil {
+		return dev.ID.ToNonAD()
+	}
+	return sent.resp.Sender
+}
+
+// sentEvent describes a message this device sent as the event whatsmeow emits for one sent
+// from another device of the account, so it is stored exactly like those.
+func sentEvent(self types.JID, sent *sentMessage) *events.Message {
+	ts := sent.resp.Timestamp
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+	return &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     sent.chat,
+				Sender:   self,
+				IsFromMe: true,
+				IsGroup:  sent.chat.Server == types.GroupServer,
+			},
+			ID:        sent.resp.ID,
+			Timestamp: ts,
+		},
+		Message: sent.msg,
+	}
+}
+
 func selfUser(dev *store.Device) string {
 	if dev.ID == nil {
 		return ""
