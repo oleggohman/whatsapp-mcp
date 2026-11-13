@@ -196,7 +196,7 @@ The bridge is a shared daemon, one per store directory. Any MCP client starts it
 - **Restarting.** The next tool call that needs the bridge starts a new one. The MCP client does not need a restart. A failed start is retried 30 seconds later.
 - **Stale reads after an idle exit.** The read tools never start the bridge, so they return history only up to the exit. Call `get_connection_status` first when you need fresh messages.
 - **After you update the plugin or the repository,** restart the MCP server (for example, reconnect it under `/mcp` in Claude Code). On startup the server notices that the running bridge was built from older sources, builds the new version while the old bridge keeps serving, asks the old bridge to shut down (`POST /api/shutdown`), and starts the new one. The WhatsApp login is kept. Bridges older than 0.3.0 have no shutdown endpoint and are stopped with `SIGTERM` instead, after the server checks that the bridge accepts its token. Another open Claude session loses at most one call and then reuses the new bridge. A bridge whose `/api/health` reports a newer `release` than the server is never replaced: the hint then asks you to update the older session.
-- **When it is not replaced automatically,** `get_connection_status` shows `restart_needed: true` with a hint. This happens while a pairing is in progress, when Go is not installed, for a prebuilt (release) binary, on Windows, and when the bridge stops in the middle of a session rather than at server startup. Kill the daemon as the hint says. The next bridge call rebuilds and starts the new version.
+- **When it is not replaced automatically,** `get_connection_status` shows `restart_needed: true` with a hint. This happens while a pairing is in progress, when Go is not installed, on Windows, and when the bridge stops in the middle of a session rather than at server startup. Kill the daemon as the hint says. The next bridge call rebuilds and starts the new version. A prebuilt (release) bridge reports its release tag instead of a source hash, so it is never compared or replaced.
 - **One bridge per WhatsApp login.** The bridge locks `<store>/bridge.lock` and exits with code 75 when another bridge holds it. The lock does not cover copies of a store. A second process that connects with the same login makes WhatsApp disconnect the first one, and the first reports `pairing: "replaced"`.
 
 ### Manual two-process mode
@@ -276,7 +276,9 @@ cd whatsapp-mcp-server && uv run pytest && uv run ruff check .
 
 ### Releases (maintainers)
 
-Push a version tag. The Release workflow runs the tests, builds the bridge for macOS (arm64, amd64), Linux and Windows, and publishes the archives with `SHA256SUMS`:
+1. Set the new version in `whatsapp-mcp-server/pyproject.toml` (and `uv.lock`), `RELEASE` in `whatsapp-mcp-server/bridge_manager.py`, and `bridgeVersion` and `bridgeRelease` in `whatsapp-bridge/pairing.go`. A test fails if they differ.
+2. Move the `Unreleased` entries in [CHANGELOG.md](CHANGELOG.md) under the new version and date.
+3. Push a version tag. The Release workflow runs the tests, builds the bridge for macOS (arm64, amd64), Linux and Windows, and publishes the archives with `SHA256SUMS`:
 
 ```bash
 git tag vX.Y.Z && git push origin vX.Y.Z
