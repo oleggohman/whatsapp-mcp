@@ -54,9 +54,22 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
+// sentMessage is what the send path knows about a message WhatsApp accepted.
+type sentMessage struct {
+	chat types.JID
+	resp whatsmeow.SendResponse
+	msg  *waE2E.Message
+}
+
 func sendWhatsAppMessage(client bridgeClient, recipient string, message string, mediaPath string) (bool, string) {
+	ok, text, _ := sendAndDescribe(client, recipient, message, mediaPath)
+	return ok, text
+}
+
+// sendAndDescribe sends a message and, on success, returns what was sent so it can be stored.
+func sendAndDescribe(client bridgeClient, recipient string, message string, mediaPath string) (bool, string, *sentMessage) {
 	if client == nil || !client.IsConnected() {
-		return false, "Not connected to WhatsApp"
+		return false, "Not connected to WhatsApp", nil
 	}
 
 	// Create JID for recipient
@@ -70,7 +83,7 @@ func sendWhatsAppMessage(client bridgeClient, recipient string, message string, 
 		// Parse the JID string
 		recipientJID, err = types.ParseJID(recipient)
 		if err != nil {
-			return false, fmt.Sprintf("Error parsing JID: %v", err)
+			return false, fmt.Sprintf("Error parsing JID: %v", err), nil
 		}
 	} else {
 		// Create JID from phone number
@@ -88,7 +101,7 @@ func sendWhatsAppMessage(client bridgeClient, recipient string, message string, 
 		// as the REST handler and a swap after validation cannot slip anything past them
 		mediaData, err := readMediaFile(mediaPath)
 		if err != nil {
-			return false, err.Error()
+			return false, err.Error(), nil
 		}
 
 		// Determine media type and mime type based on file extension
@@ -137,7 +150,7 @@ func sendWhatsAppMessage(client bridgeClient, recipient string, message string, 
 		// Upload media to WhatsApp servers
 		resp, err := client.Upload(context.Background(), mediaData, mediaType)
 		if err != nil {
-			return false, fmt.Sprintf("Error uploading media: %v", err)
+			return false, fmt.Sprintf("Error uploading media: %v", err), nil
 		}
 
 		logf("Media uploaded (%d bytes)\n", resp.FileLength)
@@ -159,7 +172,7 @@ func sendWhatsAppMessage(client bridgeClient, recipient string, message string, 
 			// Only .ogg maps to audio, so the file is always analyzed as Ogg Opus
 			seconds, waveform, err := analyzeOggOpus(mediaData)
 			if err != nil {
-				return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)
+				return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err), nil
 			}
 
 			msg.AudioMessage = &waE2E.AudioMessage{
@@ -203,13 +216,32 @@ func sendWhatsAppMessage(client bridgeClient, recipient string, message string, 
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
-		return false, fmt.Sprintf("Error sending message: %v", err)
+		return false, fmt.Sprintf("Error sending message: %v", err), nil
 	}
 
-	return true, fmt.Sprintf("Message sent to %s", recipient)
+	return true, fmt.Sprintf("Message sent to %s", recipient), &sentMessage{chat: recipientJID.ToNonAD(), resp: resp, msg: msg}
+}
+
+// recordSent stores a sent message: whatsmeow emits no event for messages this device sends,
+// so without this they would never reach messages.db.
+func recordSent(store *MessageStore, sent *sentMessage) error {
+	if store == nil || sent == nil {
+		return nil
+	}
+	ts := sent.resp.Timestamp
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+	chatJID := sent.chat.String()
+	if err := store.touchChat(chatJID, sent.chat.User, ts); err != nil {
+		return err
+	}
+	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(sent.msg)
+	return store.StoreMessage(sent.resp.ID, chatJID, sent.resp.Sender.User, extractTextContent(sent.msg), ts, true,
+		mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength)
 }
 
 // DownloadMediaRequest represents the request body for the download media API
@@ -505,8 +537,11 @@ func (a *apiServer) handleSend(w http.ResponseWriter, r *http.Request) {
 	logf("Received request to send message (text %d bytes, media %t)\n", len(req.Message), req.MediaPath != "")
 
 	// Send the message
-	success, message := sendWhatsAppMessage(a.client(), req.Recipient, req.Message, req.MediaPath)
+	success, message, sent := sendAndDescribe(a.client(), req.Recipient, req.Message, req.MediaPath)
 	logln("Message sent", success)
+	if err := recordSent(a.messageStore, sent); err != nil {
+		logf("Failed to store sent message: %v\n", err)
+	}
 
 	status := http.StatusOK
 	if !success {

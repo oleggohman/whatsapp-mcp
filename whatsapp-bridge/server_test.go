@@ -30,6 +30,7 @@ type fakeClient struct {
 	// Failure injection and recorded calls
 	uploadErr   error
 	sendErr     error
+	sendResp    whatsmeow.SendResponse
 	downloadErr error
 	uploadTypes []whatsmeow.MediaType
 	msgs        []*waE2E.Message
@@ -50,7 +51,7 @@ func (f *fakeClient) Upload(_ context.Context, b []byte, mt whatsmeow.MediaType)
 func (f *fakeClient) SendMessage(_ context.Context, to types.JID, m *waE2E.Message, _ ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
 	f.sends = append(f.sends, to)
 	f.msgs = append(f.msgs, m)
-	return whatsmeow.SendResponse{}, f.sendErr
+	return f.sendResp, f.sendErr
 }
 
 func (f *fakeClient) Download(_ context.Context, m whatsmeow.DownloadableMessage) ([]byte, error) {
