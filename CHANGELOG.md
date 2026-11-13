@@ -14,11 +14,13 @@ published in the [oleggohman/cc-things](https://github.com/oleggohman/cc-things)
 ### Fixed
 
 - Messages sent through the MCP (`send_message`, `send_file`, `send_audio_message`) are now saved
-  to the local message database. Before, they were delivered but never stored, so
-  `list_messages` and `get_last_interaction` did not show them.
+  to the local message database, in the same chat and with the same sender as messages sent from
+  the phone. Before, they were delivered but never stored, so `list_messages` and
+  `get_last_interaction` did not show them.
 - A bridge started by the previous plugin version is now replaced automatically after a plugin
   update. Before, the server only replaced bridges it had built in its own install directory,
-  and every plugin version installs into a new one.
+  and every plugin version installs into a new one. A prebuilt bridge binary is never rebuilt
+  over.
 - The v0.3.1 release build failed on Windows because a test used a Unix-only system call.
 - Lint findings reported by golangci-lint in CI. The bridge now logs a failure to store a chat
   during history sync instead of ignoring it.
