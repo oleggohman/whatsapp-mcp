@@ -18,7 +18,9 @@ def test_status_survives_sources_changing_mid_read(tmp_path, monkeypatch):
         raise FileNotFoundError("main.go")
 
     monkeypatch.setattr(bridge_manager, "source_hash", vanished)
-    _script_health(monkeypatch, {"service": "whatsapp-bridge", "version": "000000000000", "pid": 42})
+    _script_health(
+        monkeypatch, {"service": "whatsapp-bridge", "version": "000000000000", "pid": 42}
+    )
     monkeypatch.setattr(BridgeManager, "api", lambda self, m, p, **kw: {"connected": True})
     out = BridgeManager().status()
     assert out["state"] == "running" and out["connected"] is True

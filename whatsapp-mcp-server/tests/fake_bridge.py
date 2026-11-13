@@ -24,6 +24,7 @@ The lock, store dir, address and token file follow the real bridge's rules.
 import fcntl
 import json
 import os
+import socketserver
 import sys
 import threading
 import time
@@ -181,6 +182,16 @@ def stop():
 
 
 host, _, port = addr.rpartition(":")
-server = ThreadingHTTPServer((host.strip("[]") or "127.0.0.1", int(port)), Handler)
+
+
+class Server(ThreadingHTTPServer):
+    def server_bind(self):
+        # Skip HTTPServer.server_bind: its socket.getfqdn() reverse lookup of 127.0.0.1 takes
+        # ~35 s on GitHub's macOS 26 runners, longer than the tests wait for the fake to answer.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
+server = Server((host.strip("[]") or "127.0.0.1", int(port)), Handler)
 threading.Timer(120, lambda: os._exit(0)).start()  # safety net: never outlive a test run
 server.serve_forever()

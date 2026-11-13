@@ -469,7 +469,9 @@ def test_request_shutdown_outcomes(replace_env, monkeypatch):
         _post_answers(monkeypatch, replace_env, code)
         assert BridgeManager()._request_shutdown("0123456789ab") == outcome
     url, kwargs = replace_env["posts"][0]
-    assert url == "http://127.0.0.1:9/api/shutdown" and kwargs["json"] == {"version": "0123456789ab"}
+    assert url == "http://127.0.0.1:9/api/shutdown" and kwargs["json"] == {
+        "version": "0123456789ab"
+    }
     assert kwargs["headers"]["Authorization"] == "Bearer tok"
     _post_answers(monkeypatch, replace_env, httpx.ConnectError(""))
     assert BridgeManager()._request_shutdown("0123456789ab") == "error"

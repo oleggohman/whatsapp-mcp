@@ -191,7 +191,8 @@ def ensure_token() -> str:
     if existing:
         return existing
     path = token_path()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # 0700: the store holds the WhatsApp session, this token and private messages
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
     token = secrets.token_hex(32)
     tmp = f"{path}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
     try:
@@ -401,6 +402,20 @@ def _is_bridge_process(pid: int) -> bool:
     )
 
 
+def _must_build(current: str) -> bool:
+    """Whether replacing a stale bridge needs a build of the current sources first.
+
+    Without a .srchash sidecar the binary was not built here: rebuild only when it is missing or
+    older than the sources, so a prebuilt binary is spawned as is instead of being overwritten.
+    """
+    built = built_version()
+    if built == current:
+        return False
+    if built is None:
+        return needs_build(bridge_bin(), src_dir())
+    return True
+
+
 def _current_source_hash() -> str | None:
     """source_hash of the bridge sources; None when absent or changing mid-read (git pull)."""
     try:
@@ -594,7 +609,6 @@ class BridgeManager:
         if not _is_posix():
             return None
         current = _current_source_hash()
-        built = built_version()
         # Only a supervisor-built bridge (it reports a source hash) is replaced, never a release.
         if current is None or not _supervisor_built(health) or health.get("version") == current:
             return None
@@ -606,7 +620,7 @@ class BridgeManager:
                 RELEASE,
             )
             return None
-        if built != current and find_go() is None:
+        if _must_build(current) and find_go() is None:
             logger.warning(
                 "bridge (pid %s) is stale but Go is not installed to rebuild it; reusing it",
                 health.get("pid"),
@@ -635,7 +649,7 @@ class BridgeManager:
         # The old bridge serves until the shutdown request: bridge tools keep working meanwhile.
         self.state = "running"
         self._done.set()
-        if built_version() != current:
+        if _must_build(current):
             # Build while the old bridge still serves, so a failure costs no downtime.
             try:
                 build_bridge(binary, src_dir())
@@ -740,7 +754,7 @@ class BridgeManager:
         return os.path.join(store_dir(), "bridge.log")
 
     def _spawn(self, binary: str) -> "subprocess.Popen[bytes]":
-        os.makedirs(store_dir(), exist_ok=True)
+        os.makedirs(store_dir(), mode=0o700, exist_ok=True)
         log = self._log_path()
         try:
             if os.path.getsize(log) > LOG_ROTATE_BYTES:
@@ -866,7 +880,7 @@ class BridgeManager:
             _is_posix()
             and current is not None
             and st.get("pairing") not in PAIRING_IN_PROGRESS
-            and (built_version() == current or find_go() is not None)
+            and (not _must_build(current) or find_go() is not None)
         )
 
     def _safe_health(self) -> bool:

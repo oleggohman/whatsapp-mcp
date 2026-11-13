@@ -716,6 +716,38 @@ def test_new_plugin_version_without_a_binary_replaces_the_stale_bridge(stale, mo
     assert "restart_needed" not in mgr.status()
 
 
+def test_prebuilt_binary_on_disk_replaces_stale_bridge_without_building(stale, monkeypatch):
+    """No sidecar but a binary newer than the sources: spawn it as is, never build over it."""
+    old = start_stale(stale)
+    Path(str(stale["binary"]) + ".srchash").unlink()
+    future = time.time() + 100
+    os.utime(stale["binary"], (future, future))
+    before = Path(stale["binary"]).read_bytes()
+    go_log = stale["tmp"] / "go-args.log"
+    monkeypatch.setenv("WHATSAPP_GO_BIN", str(make_fake_go(stale)))
+    mgr = BridgeManager()
+    mgr.ensure_running()
+    assert old.wait(10) == 0 and mgr.state == "running"
+    assert not go_log.exists() and Path(stale["binary"]).read_bytes() == before
+    assert wait_health(stale)["pid"] != stale["old_pid"]
+
+
+def test_prebuilt_binary_on_disk_replaces_stale_bridge_without_go(stale):
+    old = start_stale(stale)  # the stale fixture has no Go
+    Path(str(stale["binary"]) + ".srchash").unlink()
+    future = time.time() + 100
+    os.utime(stale["binary"], (future, future))
+    mgr = BridgeManager()
+    mgr.ensure_running()
+    assert old.wait(10) == 0 and mgr.state == "running"
+    assert wait_health(stale)["pid"] != stale["old_pid"]
+
+
+def test_store_dir_is_created_private(env):
+    BridgeManager().ensure_running()
+    assert (env["store"].stat().st_mode & 0o777) == 0o700
+
+
 def test_no_replace_when_go_missing_and_binary_is_older(stale):
     Path(str(stale["binary"]) + ".srchash").write_text("older-sidecar")
     start_stale(stale)
