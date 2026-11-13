@@ -9,6 +9,18 @@ published in the [oleggohman/cc-things](https://github.com/oleggohman/cc-things)
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-11-13
+
+### Fixed
+
+- On Windows, a document sent through the MCP got its whole file path as its title; it now gets
+  the file name.
+- On Windows, media download paths are also checked for backslash and drive-letter escapes from
+  the store directory.
+- The bridge closes its WhatsApp device database when it exits.
+- The v0.3.2 release build failed because several bridge tests assumed Unix paths and file
+  permissions. CI now runs the bridge tests on Windows too.
+
 ## [0.3.2] - 2026-11-13
 
 ### Fixed
@@ -80,7 +92,8 @@ published in the [oleggohman/cc-things](https://github.com/oleggohman/cc-things)
 
 - Initial version from the upstream project.
 
-[Unreleased]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.2.0...v0.3.0
