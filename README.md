@@ -44,9 +44,9 @@ This project is a fork of [lharries/whatsapp-mcp](https://github.com/lharries/wh
 
 ### Option A: release archive (no Go needed)
 
-1. Download the archive for your OS from the [Releases page](https://github.com/oleggohman/whatsapp-mcp/releases) (`darwin-arm64`, `darwin-amd64`, `linux-amd64` or `windows-amd64`), together with `SHA256SUMS`.
+1. Download the `.zip` for your OS from the [Releases page](https://github.com/oleggohman/whatsapp-mcp/releases) (`darwin-arm64`, `darwin-amd64`, `linux-amd64` or `windows-amd64`), together with `SHA256SUMS`.
 2. Verify it: `sha256sum -c SHA256SUMS --ignore-missing` (macOS: `shasum -a 256 -c SHA256SUMS --ignore-missing`).
-3. Extract it. The prebuilt bridge is at `whatsapp-bridge/whatsapp-bridge`.
+3. Unzip it. The prebuilt bridge is at `whatsapp-bridge/whatsapp-bridge`.
 4. On macOS the binary is unsigned and Gatekeeper blocks it. Remove the quarantine flag once:
 
    ```bash
@@ -278,7 +278,7 @@ cd whatsapp-mcp-server && uv run pytest && uv run ruff check .
 
 1. Set the new version in `whatsapp-mcp-server/pyproject.toml` (and `uv.lock`), `RELEASE` in `whatsapp-mcp-server/bridge_manager.py`, and `bridgeVersion` and `bridgeRelease` in `whatsapp-bridge/pairing.go`. A test fails if they differ.
 2. Move the `Unreleased` entries in [CHANGELOG.md](CHANGELOG.md) under the new version and date.
-3. Push a version tag. The Release workflow runs the tests, builds the bridge for macOS (arm64, amd64), Linux and Windows, and publishes the archives with `SHA256SUMS`:
+3. Push a version tag. The Release workflow runs the tests, builds the bridge for macOS (arm64, amd64), Linux and Windows, and publishes a GitHub release with one `.zip` per platform, `SHA256SUMS`, and the version's `CHANGELOG.md` section as release notes. The release fails if that section is missing:
 
 ```bash
 git tag vX.Y.Z && git push origin vX.Y.Z

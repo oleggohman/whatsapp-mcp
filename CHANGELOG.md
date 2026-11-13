@@ -9,6 +9,11 @@ published in the [oleggohman/cc-things](https://github.com/oleggohman/cc-things)
 
 ## [Unreleased]
 
+### Changed
+
+- Release archives are `.zip` files for every platform (macOS and Linux were `.tar.gz`), and the
+  GitHub release notes are taken from this changelog.
+
 ## [0.3.3] - 2026-11-13
 
 ### Fixed

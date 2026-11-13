@@ -59,10 +59,11 @@ jobs:
           mv "whatsapp-bridge/whatsapp-bridge${EXT}" "stage/${NAME}/whatsapp-bridge/"
           # bridge_manager rebuilds when sources are newer than the binary: keep the binary newest.
           touch "stage/${NAME}/whatsapp-bridge/whatsapp-bridge${EXT}"
+          # One .zip per platform. Info-ZIP keeps the Unix executable bit; Windows runners use 7z.
           if [ "${{ matrix.goos }}" = "windows" ]; then
             (cd stage && 7z a -tzip "../dist/${NAME}.zip" "${NAME}" > /dev/null)
           else
-            tar -C stage -czf "dist/${NAME}.tar.gz" "${NAME}"
+            (cd stage && zip -qry "../dist/${NAME}.zip" "${NAME}")
           fi
           ls -l dist
 
@@ -78,6 +79,24 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Release notes from CHANGELOG.md
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          # The section between "## [<version>]" and the next "## [" heading.
+          awk -v v="$version" '
+            index($0, "## [" v "]") == 1 { on = 1; next }
+            on && /^## \[/ { exit }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "::error::CHANGELOG.md has no section for ${version}"
+            exit 1
+          fi
+          printf '\n**Full changelog:** [CHANGELOG.md](https://github.com/%s/blob/%s/CHANGELOG.md)\n' \
+            "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" >> notes.md
+          cat notes.md
       - uses: actions/download-artifact@v8.0.2
         with:
           path: dist
@@ -86,12 +105,11 @@ jobs:
       - name: Checksums
         working-directory: dist
         run: |
-          sha256sum -- *.tar.gz *.zip > SHA256SUMS
+          sha256sum -- *.zip > SHA256SUMS
           cat SHA256SUMS
       - uses: softprops/action-gh-release@v3.0.4
         with:
-          generate_release_notes: true
+          body_path: notes.md
           files: |
-            dist/*.tar.gz
             dist/*.zip
             dist/SHA256SUMS
