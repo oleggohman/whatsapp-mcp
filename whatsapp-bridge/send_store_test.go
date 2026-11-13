@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -86,7 +87,7 @@ func TestHandleSendStoresMediaInfo(t *testing.T) {
 	r := newChatResolver(a.messageStore, &fakeContacts{}, newFakeLIDs(), nil)
 	a.sent.register(fc, storeSentLike(r, a.messageStore, pnJID(testSelfPN)))
 	img := writeTemp(t, "pic.png", []byte("\x89PNG fake"))
-	if rec := do(h, http.MethodPost, "/api/send", `{"recipient":"1555","message":"look","media_path":"`+img+`"}`); rec.Code != http.StatusOK {
+	if rec := do(h, http.MethodPost, "/api/send", `{"recipient":"1555","message":"look","media_path":`+strconv.Quote(img)+`}`); rec.Code != http.StatusOK {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
 	}
 	var mediaType, url string

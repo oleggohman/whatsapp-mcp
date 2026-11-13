@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -179,8 +180,8 @@ func TestDownloadMediaErrors(t *testing.T) {
 		}
 	})
 	t.Run("file cannot be saved", func(t *testing.T) {
-		if os.Geteuid() == 0 {
-			t.Skip("root ignores directory permissions")
+		if os.Geteuid() == 0 || runtime.GOOS == "windows" {
+			t.Skip("root and Windows ignore Unix directory permissions")
 		}
 		root := t.TempDir()
 		s := newTestStoreIn(t, root)
@@ -215,12 +216,17 @@ func TestSafeMediaPathDefensiveErrors(t *testing.T) {
 	}
 	filepathAbs = oldAbs
 
-	for name, rel := range map[string]func(string, string) (string, error){
+	cases := map[string]func(string, string) (string, error){
 		"error":    func(string, string) (string, error) { return "", errors.New("rel boom") },
 		"parent":   func(string, string) (string, error) { return "..", nil },
 		"up":       func(string, string) (string, error) { return "../x", nil },
 		"absolute": func(string, string) (string, error) { return "/etc/passwd", nil },
-	} {
+	}
+	if runtime.GOOS == "windows" { // backslash and drive letters only mean something there
+		cases["backslash"] = func(string, string) (string, error) { return `..\x`, nil }
+		cases["drive"] = func(string, string) (string, error) { return `C:\x`, nil }
+	}
+	for name, rel := range cases {
 		filepathRel = rel
 		if _, _, _, err := safeMediaPath(root, "chat", "a.jpg"); err == nil || !strings.Contains(err.Error(), "escapes store directory") {
 			t.Errorf("%s: err = %v", name, err)

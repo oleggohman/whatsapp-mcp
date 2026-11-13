@@ -201,7 +201,7 @@ func sendAndDescribe(client bridgeClient, recipient string, message string, medi
 			}
 		case whatsmeow.MediaDocument:
 			msg.DocumentMessage = &waE2E.DocumentMessage{
-				Title:         proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
+				Title:         proto.String(filepath.Base(mediaPath)),
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
 				URL:           &resp.URL,

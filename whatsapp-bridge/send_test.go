@@ -204,14 +204,14 @@ func TestReadMediaFileFailureModes(t *testing.T) {
 	})
 	t.Run("stat fails", func(t *testing.T) {
 		withOpenMediaFile(t, &failingFile{statErr: errors.New("stat boom")})
-		_, err := readMediaFile("/x/y.bin")
+		_, err := readMediaFile(filepath.Join(t.TempDir(), "y.bin"))
 		if err == nil || !strings.Contains(err.Error(), "stat boom") {
 			t.Fatalf("err = %v", err)
 		}
 	})
 	t.Run("read fails", func(t *testing.T) {
 		withOpenMediaFile(t, &failingFile{size: 3, r: errReader{errors.New("io boom")}})
-		_, err := readMediaFile("/x/y.bin")
+		_, err := readMediaFile(filepath.Join(t.TempDir(), "y.bin"))
 		if err == nil || !strings.Contains(err.Error(), "io boom") {
 			t.Fatalf("err = %v", err)
 		}
@@ -221,7 +221,7 @@ func TestReadMediaFileFailureModes(t *testing.T) {
 		maxMediaBytes = 4
 		t.Cleanup(func() { maxMediaBytes = old })
 		withOpenMediaFile(t, &failingFile{size: 2, r: strings.NewReader("0123456789")})
-		_, err := readMediaFile("/x/y.bin")
+		_, err := readMediaFile(filepath.Join(t.TempDir(), "y.bin"))
 		if err == nil || !strings.Contains(err.Error(), "more than 4 bytes") {
 			t.Fatalf("err = %v", err)
 		}

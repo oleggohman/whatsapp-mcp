@@ -266,7 +266,9 @@ func safeMediaPath(root, chatJID, filename string) (chatDir, localPath, safeName
 	chatDir = filepath.Join(absRoot, dirName)
 	localPath = filepath.Join(chatDir, safeName)
 	rel, err := filepathRel(absRoot, localPath)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+	// ToSlash: Windows accepts both separators; a rooted or drive path is never inside the store.
+	r := filepath.ToSlash(rel)
+	if err != nil || r == ".." || strings.HasPrefix(r, "../") || strings.HasPrefix(r, "/") || filepath.IsAbs(rel) || filepath.VolumeName(rel) != "" {
 		return "", "", "", fmt.Errorf("media path escapes store directory")
 	}
 	return chatDir, localPath, safeName, nil

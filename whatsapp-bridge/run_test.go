@@ -60,6 +60,8 @@ type fakeContainer struct {
 	firstErr error
 }
 
+func (c *fakeContainer) Close() error { return nil }
+
 func (c *fakeContainer) GetFirstDevice(context.Context) (*store.Device, error) {
 	return c.dev, c.firstErr
 }

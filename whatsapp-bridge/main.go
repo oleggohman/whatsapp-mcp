@@ -98,6 +98,7 @@ func handleMessage(r *chatResolver, messageStore *MessageStore, msg *events.Mess
 type deviceContainer interface {
 	GetFirstDevice(ctx context.Context) (*store.Device, error)
 	NewDevice() *store.Device
+	Close() error
 }
 
 // wmClient is what buildClient needs from a whatsmeow client beyond waClient.
@@ -178,6 +179,9 @@ func run() int {
 	}
 
 	// Get device store - This contains session information
+	// Closed last (defers run in reverse), after the client disconnected; Windows cannot
+	// delete an open database file.
+	defer func() { _ = container.Close() }()
 	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
