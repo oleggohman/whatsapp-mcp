@@ -9,6 +9,67 @@ published in the [oleggohman/cc-things](https://github.com/oleggohman/cc-things)
 
 ## [Unreleased]
 
+### Changed
+
+- Reads on a large `messages.db` are much faster. The bridge adds indexes on `messages` and an FTS5
+  trigram index (`messages_fts`) kept up to date by triggers. The MCP server reuses one database
+  connection per call instead of opening several per message.
+- Every bridge build needs `-tags sqlite_fts5`; an untagged build does not compile. The MCP
+  server's automatic build and the README commands already pass it.
+- The first start after an upgrade builds the indexes and the FTS table after `/api/health` is
+  listening and before WhatsApp connects. Search uses `LIKE` until that finishes. During that
+  window `POST /api/reconnect`, `POST /api/start-pairing` and `POST /api/pair-phone` return 503
+  `bridge is starting` and do not connect. `POST /api/send` keeps its "Not connected" answer.
+- Text search: queries of 3 or more characters use FTS5 trigram and still match substrings
+  (including Hebrew), with Unicode case folding. Shorter queries use `LIKE`. `%` and `_` in a
+  query are now literal characters on every path; before they acted as `LIKE` wildcards. If
+  `messages_fts` is missing or `MATCH` fails, search falls back to `LIKE` and does not return an
+  empty list.
+- `list_messages` `after` / `before` are strict (`>` and `<`) and use the stored timestamp layout.
+  The MCP server converts the bound to its own local time zone (a naive value is read as local
+  time), so the MCP server and the bridge must run in the same time zone. Offset-aware values and
+  fractional seconds now match. A naive
+  bound equal to a stored second no longer includes that row. Ordering is by timestamp text: it
+  matches chronology for rows with the same offset, and rows written across a DST fall-back hour
+  can be out of order. A UTC migration is not part of this change.
+- Sender display names no longer use `LIKE '%digits%'`: `15551212` does not take the name of
+  `551212`. A `...@lid` sender still resolves when that exact chat row exists.
+- The last message of a chat is the newest row by `timestamp DESC, rowid DESC`, not a join on
+  `last_message_time = timestamp`. Chats with equal timestamps are no longer duplicated, and a chat
+  whose `last_message_time` matches no message now shows its last text instead of nothing.
+- `get_direct_chat_by_contact` matches `user@s.whatsapp.net` and `user@lid` exactly after removing
+  `+`, spaces and dashes, instead of `LIKE '%phone%'`: `551212` no longer finds `15551212`. The
+  `@s.whatsapp.net` chat wins when both exist. A phone number does not find an unmerged LID chat;
+  the LID repair still merges those.
+- `get_contact_chats` accepts `111` or `111@s.whatsapp.net` and returns one row per chat. It now
+  includes direct chats that have no messages and no longer repeats a chat.
+- `get_last_interaction` returns the newer of the sender lookup and the chat lookup, so a message
+  the contact sent in a group can be returned over an older direct-chat message.
+- History sync is stored in one transaction per conversation. One failed insert rolls the whole
+  conversation back, and the warning is now `Failed to store history conversation` instead of the
+  per-message and per-chat warnings. Per-message history lines moved from Info to Debug; one Info
+  line per conversation remains.
+- `chats.last_message_time` after a history conversation is `max(stored time, newest message in
+  the batch)`, so an older chunk does not move a chat backward. Times are compared as text, so
+  values written under different UTC offsets compare by text, not by instant. Across a DST change
+  an older batch can compare as newer and move the time back by up to the offset difference.
+- `messages.db` uses `synchronous=NORMAL`. A committed transaction survives a process crash; a
+  power loss can drop the commits made since the last WAL checkpoint. The store is a local mirror.
+- `messages` rows are updated in place (`ON CONFLICT DO UPDATE`) so the SQLite `rowid` stays
+  stable for the FTS index.
+
+### Downgrading
+
+To run an older bridge on a store that was opened by this version, drop the FTS objects first. The
+indexes can stay.
+
+```sql
+DROP TRIGGER IF EXISTS messages_fts_insert;
+DROP TRIGGER IF EXISTS messages_fts_delete;
+DROP TRIGGER IF EXISTS messages_fts_update;
+DROP TABLE IF EXISTS messages_fts;
+```
+
 ## [0.3.4] - 2026-11-13
 
 ### Changed

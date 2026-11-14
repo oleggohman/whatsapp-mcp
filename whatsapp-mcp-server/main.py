@@ -105,8 +105,8 @@ def list_messages(
     """Get WhatsApp messages matching specified criteria with optional context.
 
     Args:
-        after: Optional ISO-8601 formatted string to only return messages after this date
-        before: Optional ISO-8601 formatted string to only return messages before this date
+        after: Optional ISO-8601 string; only messages strictly after it (no offset = local time)
+        before: Optional ISO-8601 string; only messages strictly before it (no offset = local time)
         sender_phone_number: Optional phone number to filter messages by sender
         chat_jid: Optional chat JID to filter messages by chat
         query: Optional search term to filter messages by content
@@ -186,7 +186,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> list[dict[str
     """Get all WhatsApp chats involving the contact.
 
     Args:
-        jid: The contact's JID to search for
+        jid: The contact's JID or bare phone number to search for
         limit: Maximum number of chats to return (default 20)
         page: Page number for pagination (default 0)
     """
@@ -199,7 +199,7 @@ def get_last_interaction(jid: str) -> str | None:
     """Get most recent WhatsApp message involving the contact.
 
     Args:
-        jid: The JID of the contact to search for
+        jid: The contact's JID or bare phone number to search for
     """
     message = whatsapp_get_last_interaction(jid)
     return message

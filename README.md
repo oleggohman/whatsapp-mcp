@@ -156,12 +156,12 @@ The bridge API has its own access token. It is unrelated to your WhatsApp login.
 | Tool | Key parameters | Returns |
 | --- | --- | --- |
 | `search_contacts` | `query` | Contacts whose name or phone number matches. |
-| `list_messages` | `after`, `before` (ISO-8601), `sender_phone_number`, `chat_jid`, `query`, `limit` (20), `page` (0), `include_context` (true), `context_before` (1), `context_after` (1) | Matching messages as formatted text, with surrounding context. |
+| `list_messages` | `after`, `before` (ISO-8601, exclusive; a value without an offset is local time), `sender_phone_number`, `chat_jid`, `query`, `limit` (20), `page` (0), `include_context` (true), `context_before` (1), `context_after` (1) | Matching messages as formatted text, with surrounding context. |
 | `list_chats` | `query`, `limit` (20), `page` (0), `include_last_message` (true), `sort_by` (`last_active` or `name`) | Chats with metadata. |
 | `get_chat` | `chat_jid`, `include_last_message` (true) | Metadata of one chat, or nothing. |
 | `get_direct_chat_by_contact` | `sender_phone_number` | The direct chat with that number, or nothing. |
-| `get_contact_chats` | `jid`, `limit` (20), `page` (0) | All chats that involve the contact. |
-| `get_last_interaction` | `jid` | The most recent message with the contact. |
+| `get_contact_chats` | `jid` (JID or bare phone number), `limit` (20), `page` (0) | All chats that involve the contact. |
+| `get_last_interaction` | `jid` (JID or bare phone number) | The most recent message with the contact. |
 | `get_message_context` | `message_id`, `before` (5), `after` (5) | The message and its neighbors. |
 | `send_message` | `recipient`, `message` | `success` and `message`. |
 | `send_file` | `recipient`, `media_path` (absolute path) | `success` and `message`. |
@@ -185,6 +185,8 @@ MCP client (Claude)  <-- stdio -->  Python MCP server  <-- REST, localhost -->  
 
 1. **Go bridge** (`whatsapp-bridge/`) connects to WhatsApp, handles pairing, and writes message history to `messages.db`. It serves a small REST API: `/api/health`, `/api/status`, `/api/start-pairing`, `/api/pair-phone`, `/api/reconnect`, `/api/send`, `/api/download`, `/api/shutdown`. `GET /api/status` is read-only. Every state change is a `POST`.
 2. **Python MCP server** (`whatsapp-mcp-server/`) implements the tools. It reads `messages.db` read-only and calls the bridge for sending, downloading and pairing.
+
+Reads stay fast on a large archive. The bridge indexes `messages` by chat, timestamp and sender, and keeps an FTS5 trigram index (`messages_fts`) in step with it through triggers. Text searches of 3 or more characters use that index and still match substrings; shorter queries, or a missing or failing index, fall back to `LIKE`. On the first start after an upgrade the bridge builds the indexes after `/api/health` is listening and before it connects to WhatsApp, so search uses `LIKE` until that finishes. During that build `POST /api/reconnect`, `POST /api/start-pairing` and `POST /api/pair-phone` return 503 `bridge is starting`. `messages.db` runs with `synchronous=NORMAL`: a committed write survives a process crash, and a power loss can drop the commits made since the last WAL checkpoint. The bridge must be built with `-tags sqlite_fts5`, as the MCP server's automatic build does. An untagged build does not compile.
 
 The store directory defaults to `whatsapp-bridge/store`. It holds `messages.db`, `whatsapp.db` (the whatsmeow session), `bridge.token`, `bridge.lock`, `bridge.log` and downloaded media.
 
