@@ -257,6 +257,28 @@ def _format_bound(value: datetime) -> str:
     return f"{text}{offset[:3]}:{offset[3:5]}"
 
 
+# Trigram FTS cannot index a string shorter than 3 characters.
+FTS_MIN_QUERY_LEN = 3
+_FTS_CLAUSE = "messages.rowid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)"
+_LIKE_CLAUSE = "LOWER(messages.content) LIKE LOWER(?) ESCAPE '\\'"
+
+
+def _fts_available(conn: sqlite3.Connection) -> bool:
+    """True when the bridge has built the messages_fts index."""
+    row = conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'messages_fts'").fetchone()
+    return row is not None
+
+
+def _fts_phrase(text: str) -> str:
+    """Quote user text as a single FTS5 phrase (internal quotes doubled)."""
+    return '"' + text.replace('"', '""') + '"'
+
+
+def _like_escape(text: str) -> str:
+    """Escape LIKE wildcards so % and _ match only themselves (pair with ESCAPE backslash)."""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def list_messages(
     after: str | None = None,
     before: str | None = None,
@@ -314,21 +336,35 @@ def list_messages(
                 where_clauses.append("messages.chat_jid = ?")
                 params.append(chat_jid)
 
-            if query:
-                where_clauses.append("LOWER(messages.content) LIKE LOWER(?)")
-                params.append(f"%{query}%")
-
-            if where_clauses:
-                query_parts.append("WHERE " + " AND ".join(where_clauses))
-
-            # Add pagination
             offset = page * limit
-            query_parts.append("ORDER BY messages.timestamp DESC")
-            query_parts.append("LIMIT ? OFFSET ?")
-            params.extend([limit, offset])
 
-            cursor.execute(" ".join(query_parts), tuple(params))
-            messages = cursor.fetchall()
+            def fetch(text_clause: str | None = None, text_param: str | None = None) -> list:
+                clauses = list(where_clauses)
+                bound = list(params)
+                if text_clause:
+                    clauses.append(text_clause)
+                    bound.append(text_param)
+                parts = list(query_parts)
+                if clauses:
+                    parts.append("WHERE " + " AND ".join(clauses))
+                # Add pagination
+                parts.append("ORDER BY messages.timestamp DESC")
+                parts.append("LIMIT ? OFFSET ?")
+                bound.extend([limit, offset])
+                cursor.execute(" ".join(parts), tuple(bound))
+                return cursor.fetchall()
+
+            messages = None
+            if query and len(query) >= FTS_MIN_QUERY_LEN and _fts_available(conn):
+                try:
+                    messages = fetch(_FTS_CLAUSE, _fts_phrase(query))
+                except sqlite3.Error as e:
+                    logger.warning("FTS search failed, falling back to LIKE: %s", e)
+            if messages is None:
+                if query:
+                    messages = fetch(_LIKE_CLAUSE, f"%{_like_escape(query)}%")
+                else:
+                    messages = fetch()
 
             resolve_name = _name_resolver(conn)
             result = []

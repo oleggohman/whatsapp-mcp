@@ -392,3 +392,112 @@ def test_last_interaction_uses_sender_and_chat_indexes(store_dir):
 def test_contact_chats_sender_lookup_uses_sender_index(store_dir):
     plan = _plan(store_dir, "SELECT chat_jid FROM messages WHERE sender = ?", ("111",))
     assert "INDEX idx_messages_sender_time" in plan
+
+
+# --- FTS search (Task 5c) ---
+
+
+def _add_search_message(store_dir, msg_id, content, chat=ALICE, ts="2025-01-04 10:00:00+00:00"):
+    conn = sqlite3.connect(store_dir / "messages.db")
+    conn.execute(
+        "INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me) "
+        "VALUES (?, ?, '111', ?, ?, 0)",
+        (msg_id, chat, content, ts),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _search_ids(query):
+    return _ids(whatsapp.list_messages(query=query, include_context=False))
+
+
+def test_search_substring_hebrew_and_case_folding(store_dir):
+    _add_search_message(store_dir, "h1", "הלכתי בבית")
+    out = whatsapp.list_messages(query="בית", include_context=False)
+    assert "הלכתי בבית" in out
+    assert "GROUP hello".lower() in whatsapp.list_messages(query="GROUP", include_context=False)
+    assert "hello" in whatsapp.list_messages(query="HELLO", include_context=False)
+
+
+def test_search_non_match(store_dir):
+    assert whatsapp.list_messages(query="zzzzz", include_context=False) == "No messages to display."
+
+
+def test_search_quote_in_query_does_not_error(store_dir):
+    _add_search_message(store_dir, "q1", 'he said "hi" loudly')
+    assert 'he said "hi" loudly' in whatsapp.list_messages(query='"hi"', include_context=False)
+    assert whatsapp.list_messages(query='a"b"c', include_context=False) == (
+        "No messages to display."
+    )
+
+
+def test_search_short_query_uses_like(store_dir, monkeypatch):
+    def boom(_text):
+        raise AssertionError("FTS must not be used for short queries")
+
+    monkeypatch.setattr(whatsapp, "_fts_phrase", boom)
+    assert "bob says hi" in whatsapp.list_messages(query="bo", include_context=False)
+    assert "second" in whatsapp.list_messages(query="d", include_context=False)
+
+
+def test_search_percent_is_literal_on_fts_path(store_dir):
+    _add_search_message(store_dir, "p1", "got 50% off today")
+    out = whatsapp.list_messages(query="50% off", include_context=False)
+    assert "got 50% off today" in out and "hello" not in out
+    # As a LIKE wildcard "hel%" would match "hello"; literally it matches nothing.
+    assert whatsapp.list_messages(query="hel%", include_context=False) == (
+        "No messages to display."
+    )
+
+
+def _drop_fts(store_dir):
+    conn = sqlite3.connect(store_dir / "messages.db")
+    for trig in ("insert", "delete", "update"):
+        conn.execute(f"DROP TRIGGER messages_fts_{trig}")
+    conn.execute("DROP TABLE messages_fts")
+    conn.commit()
+    conn.close()
+
+
+def test_like_path_treats_percent_and_underscore_literally(store_dir):
+    _add_search_message(store_dir, "l1", "abc")
+    _add_search_message(store_dir, "l2", "a_c 5% done")
+    _add_search_message(store_dir, "l3", "back\\slash")
+    # 2-character queries use LIKE even with the FTS table present.
+    assert "a_c 5% done" in whatsapp.list_messages(query="5%", include_context=False)
+    assert "abc" not in whatsapp.list_messages(query="5%", include_context=False)
+    assert whatsapp.list_messages(query="_c", include_context=True).count("a_c 5% done") == 1
+    _drop_fts(store_dir)
+    out = whatsapp.list_messages(query="a_c", include_context=False)
+    assert "a_c 5% done" in out and "abc" not in out.replace("a_c 5% done", "")
+    assert whatsapp.list_messages(query="%%%", include_context=False) == "No messages to display."
+    assert "back\\slash" in whatsapp.list_messages(query="k\\s", include_context=False)
+
+
+def test_search_without_fts_table_falls_back_to_like(store_dir):
+    _drop_fts(store_dir)
+    assert "bob says hi" in whatsapp.list_messages(query="BOB says", include_context=False)
+
+
+def test_search_match_error_falls_back_to_like(store_dir, caplog):
+    conn = sqlite3.connect(store_dir / "messages.db")
+    conn.execute("DROP TABLE messages_fts_data")  # break the index but keep messages_fts
+    conn.commit()
+    conn.close()
+    with caplog.at_level("WARNING", logger="whatsapp"):
+        out = whatsapp.list_messages(query="bob says", include_context=False)
+    assert "bob says hi" in out
+    assert "falling back to LIKE" in caplog.text
+
+
+def test_search_plan_reads_messages_fts(store_dir):
+    with whatsapp._connect() as conn:
+        plan = " ".join(
+            row[3]
+            for row in conn.execute(
+                "EXPLAIN QUERY PLAN SELECT messages.id FROM messages WHERE " + whatsapp._FTS_CLAUSE,
+                (whatsapp._fts_phrase("hello"),),
+            )
+        )
+    assert "messages_fts" in plan
