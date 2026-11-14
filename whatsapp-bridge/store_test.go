@@ -351,6 +351,7 @@ func TestMessagesFTSStaysInSyncWithMessages(t *testing.T) {
 
 	store("m1", "alpha bravo")
 	check("insert", 1, "bravo", []string{"m1"})
+	check("insert mid-word upper-case", 1, "RAV", []string{"m1"})
 	if _, err := s.db.Exec("UPDATE messages SET content = 'charlie delta' WHERE id = 'm1'"); err != nil {
 		t.Fatal(err)
 	}
@@ -372,8 +373,10 @@ func TestMigrateSearchIndexesExistingRows(t *testing.T) {
 	if err := s.StoreChat("a@s.whatsapp.net", "A", time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.StoreMessage("m1", "a@s.whatsapp.net", "111", "old row about pelican", time.Now(), false, "", "", "", nil, nil, nil, 0); err != nil {
-		t.Fatal(err)
+	for id, content := range map[string]string{"m1": "old row about pelican", "m2": "שלום עולם"} {
+		if err := s.StoreMessage(id, "a@s.whatsapp.net", "111", content, time.Now(), false, "", "", "", nil, nil, nil, 0); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := s.migrateSearch(context.Background()); err != nil {
 		t.Fatal(err)
@@ -382,26 +385,43 @@ func TestMigrateSearchIndexesExistingRows(t *testing.T) {
 	if err := s.db.QueryRow("SELECT count(*) FROM sqlite_master WHERE name = 'messages_fts'").Scan(&n); err != nil || n != 1 {
 		t.Fatalf("messages_fts in sqlite_master = %d, %v", n, err)
 	}
-	if got := ftsHits(t, s, "pelican"); len(got) != 1 || got[0] != "m1" {
-		t.Fatalf("MATCH = %v", got)
+	// The trigram tokenizer finds substrings, folds case and handles non-Latin text
+	for q, want := range map[string]string{"pelican": "m1", "lica": "m1", "PELICAN": "m1", "לום": "m2"} {
+		if got := ftsHits(t, s, q); len(got) != 1 || got[0] != want {
+			t.Fatalf("MATCH %q = %v, want [%s]", q, got, want)
+		}
 	}
 	// An index that diverged from messages (a crashed process) is rebuilt on the next start
 	if _, err := s.db.Exec("INSERT INTO messages_fts(messages_fts) VALUES('delete-all')"); err != nil {
 		t.Fatal(err)
 	}
-	if indexed, total := ftsCounts(t, s); indexed != 0 || total != 1 {
+	if indexed, total := ftsCounts(t, s); indexed != 0 || total != 2 {
 		t.Fatalf("after delete-all: docsize = %d, messages = %d", indexed, total)
 	}
 	if err := s.migrateSearch(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if indexed, total := ftsCounts(t, s); indexed != 1 || total != 1 {
+	if indexed, total := ftsCounts(t, s); indexed != 2 || total != 2 {
 		t.Fatalf("after rebuild: docsize = %d, messages = %d", indexed, total)
+	}
+	if got := ftsHits(t, s, "lica"); len(got) != 1 || got[0] != "m1" {
+		t.Fatalf("MATCH after rebuild = %v", got)
 	}
 }
 
+// A downgrade drops the triggers but keeps messages_fts; the old bridge's INSERT OR REPLACE then
+// renumbers rowids at an unchanged row count. The next migration must rebuild anyway.
 func TestMigrateSearchRestoresDroppedTriggers(t *testing.T) {
 	s := newTestStore(t)
+	chat := "a@s.whatsapp.net"
+	if err := s.StoreChat(chat, "A", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	for id, content := range map[string]string{"m1": "pelican", "m2": "albatross"} {
+		if err := s.StoreMessage(id, chat, "111", content, time.Now(), false, "", "", "", nil, nil, nil, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := s.migrateSearch(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -411,6 +431,17 @@ func TestMigrateSearchRestoresDroppedTriggers(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if _, err := s.db.Exec(`INSERT OR REPLACE INTO messages (id, chat_jid, sender, content, timestamp, is_from_me)
+		VALUES ('m1', ?, '111', 'heron', ?, 0)`, chat, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if indexed, total := ftsCounts(t, s); indexed != total {
+		t.Fatalf("setup: docsize = %d, messages = %d, want equal", indexed, total)
+	}
+	if got := ftsHits(t, s, "heron"); len(got) != 0 {
+		t.Fatalf("setup: the replaced row must be unindexed, MATCH = %v", got)
+	}
+
 	if err := s.migrateSearch(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -419,5 +450,46 @@ func TestMigrateSearchRestoresDroppedTriggers(t *testing.T) {
 		if err := s.db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name = ?", n).Scan(&c); err != nil || c != 1 {
 			t.Fatalf("trigger %s present = %d, %v", n, c, err)
 		}
+	}
+	if got := ftsHits(t, s, "heron"); len(got) != 1 || got[0] != "m1" {
+		t.Fatalf("MATCH heron after migration = %v", got)
+	}
+	if got := ftsHits(t, s, "pelican"); len(got) != 0 {
+		t.Fatalf("stale MATCH pelican after migration = %v", got)
+	}
+	// The restored triggers index new writes
+	if err := s.StoreMessage("m3", chat, "111", "osprey", time.Now(), false, "", "", "", nil, nil, nil, 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := ftsHits(t, s, "osprey"); len(got) != 1 || got[0] != "m3" {
+		t.Fatalf("MATCH osprey = %v", got)
+	}
+}
+
+// A cancelled migration returns the context error, leaves no FTS table or trigger behind,
+// and the next start completes it.
+func TestMigrateSearchCancelledLeavesNothingAndRetries(t *testing.T) {
+	s := newTestStore(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := s.migrateSearch(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	ftsObjects := func() int {
+		t.Helper()
+		var n int
+		if err := s.db.QueryRow("SELECT count(*) FROM sqlite_master WHERE name LIKE 'messages_fts%'").Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if n := ftsObjects(); n != 0 {
+		t.Fatalf("%d messages_fts objects after a cancelled migration", n)
+	}
+	if err := s.migrateSearch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := ftsObjects(); n == 0 {
+		t.Fatal("retry did not create messages_fts")
 	}
 }

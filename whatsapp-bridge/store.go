@@ -34,7 +34,7 @@ func sqliteDSN(path string) string {
 // messagesDSN is sqliteDSN plus immediate write transactions and WAL, so the repair
 // pass and the Python reader (mode=ro) do not block each other. With WAL,
 // synchronous=NORMAL syncs on checkpoint instead of every commit: a process crash
-// keeps committed transactions, a power loss can drop the last one. This store is
+// keeps committed transactions, a power loss can drop every commit since the last checkpoint. This store is
 // a local mirror that history sync can fill again.
 func messagesDSN(path string) string {
 	return sqliteDSN(path) + "&_txlock=immediate&_journal_mode=WAL&_synchronous=NORMAL"
@@ -120,7 +120,7 @@ const migrateIndexesSQL = `
 	CREATE INDEX IF NOT EXISTS idx_messages_sender_time ON messages (sender, timestamp);`
 
 // migrateFTSTableSQL creates the external-content trigram index over messages.content.
-// case_sensitive 0 keeps case folding; the default trigram tokenizer is case-sensitive.
+// case_sensitive 0 (case folding) is the trigram default; it is spelled out so the intent is explicit.
 // The index is keyed on messages.rowid, so a VACUUM (which can renumber rowids) requires
 // INSERT INTO messages_fts(messages_fts) VALUES('rebuild') before search is correct.
 // Nothing in this repo vacuums.
@@ -133,7 +133,8 @@ const migrateFTSTableSQL = `
 	);`
 
 // migrateFTSTriggersSQL keeps messages_fts in step with messages. It runs on every migration
-// so a downgrade that dropped the triggers but left the table cannot leave later writes unindexed.
+// so a downgrade that dropped the triggers but left the table cannot leave later writes unindexed;
+// migrateSearch also rebuilds the index whenever a trigger was missing.
 const migrateFTSTriggersSQL = `
 	CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
 		INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
@@ -147,7 +148,9 @@ const migrateFTSTriggersSQL = `
 	END;`
 
 // migrateSearch creates the message indexes and the FTS table with its triggers, and rebuilds
-// the FTS index when it does not cover every message. The virtual table, the triggers and the
+// the FTS index when a trigger was missing or the index does not cover every message. A missing
+// trigger means writes went unindexed: an older bridge's INSERT OR REPLACE renumbers rowids, so
+// the index can be stale even at an equal row count. The virtual table, the triggers and the
 // rebuild share one transaction: a crash rolls all of it back and the next start retries.
 // External-content count(*) on messages_fts reads messages, so the docsize shadow table is
 // what says how many rows are really indexed.
@@ -163,15 +166,18 @@ func (store *MessageStore) migrateSearch(ctx context.Context) error {
 	if _, err := tx.ExecContext(ctx, migrateFTSTableSQL); err != nil {
 		return fmt.Errorf("create messages_fts: %w", err)
 	}
+	// Counted before the triggers are created, so a trigger that was missing is still seen
+	var triggers, indexed, total int
+	if err := tx.QueryRowContext(ctx, `SELECT
+		(SELECT count(*) FROM sqlite_master WHERE type = 'trigger'
+			AND name IN ('messages_fts_insert', 'messages_fts_delete', 'messages_fts_update')),
+		(SELECT count(*) FROM messages_fts_docsize), (SELECT count(*) FROM messages)`).Scan(&triggers, &indexed, &total); err != nil {
+		return fmt.Errorf("count indexed messages: %w", err)
+	}
 	if _, err := tx.ExecContext(ctx, migrateFTSTriggersSQL); err != nil {
 		return fmt.Errorf("create messages_fts triggers: %w", err)
 	}
-	var indexed, total int
-	if err := tx.QueryRowContext(ctx, `SELECT
-		(SELECT count(*) FROM messages_fts_docsize), (SELECT count(*) FROM messages)`).Scan(&indexed, &total); err != nil {
-		return fmt.Errorf("count indexed messages: %w", err)
-	}
-	if indexed != total {
+	if triggers != 3 || indexed != total {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO messages_fts(messages_fts) VALUES('rebuild')`); err != nil {
 			return fmt.Errorf("rebuild messages_fts: %w", err)
 		}

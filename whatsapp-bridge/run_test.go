@@ -724,6 +724,9 @@ func TestRunStopDuringMigration(t *testing.T) {
 			if st := post(h, "/api/reconnect"); st != http.StatusServiceUnavailable {
 				t.Fatalf("reconnect during migration = %d, want 503", st)
 			}
+			if st, _ := h.get(h.addr(), "/api/health"); st != http.StatusOK {
+				t.Fatalf("health during migration = %d, want 200", st)
+			}
 			if how == "signal" {
 				select {
 				case c := <-h.sig:
@@ -743,9 +746,67 @@ func TestRunStopDuringMigration(t *testing.T) {
 			if err := ms.db.Ping(); err == nil {
 				t.Fatal("message store must be closed after run returns")
 			}
+			h.restore() // flush the stderr copy before the negative check
 			if strings.Contains(h.logs.String(), "Search index") {
 				t.Fatalf("a cancelled migration must not log a result:\n%s", h.logs.String())
 			}
 		})
 	}
+}
+
+// The connecting routes answer 503 from the moment the REST server is up: notifySignals runs
+// after the server started and before the migration, and a reconnect sent there is refused.
+func TestRunGatesConnectingRoutesBeforeMigrationStarts(t *testing.T) {
+	h := newRunHarness(t, &fakeContainer{dev: &store.Device{}})
+	h.configure = pairedConfigure
+	old := runMigrateSearch
+	t.Cleanup(func() { runMigrateSearch = old })
+	runMigrateSearch = func(*MessageStore, context.Context) error { return nil }
+	status := make(chan int, 1)
+	notifySignals = func(c chan<- os.Signal) {
+		cl := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}, Timeout: settleTimeout}
+		resp, err := cl.Post("http://"+h.addr()+"/api/reconnect", "application/json", strings.NewReader(`{}`))
+		if err != nil {
+			status <- -1
+		} else {
+			_ = resp.Body.Close()
+			status <- resp.StatusCode
+		}
+		h.sig <- c
+	}
+	code := h.start()
+	h.registered()
+	if st := <-status; st != http.StatusServiceUnavailable {
+		t.Fatalf("reconnect before the migration = %d, want 503", st)
+	}
+	if connects, _, _ := h.client(0).counts(); connects != 1 {
+		t.Fatalf("connects = %d, want only run's own Connect", connects)
+	}
+	if c := h.stop(code); c != 0 {
+		t.Fatalf("code = %d", c)
+	}
+}
+
+// Health polls do not count as API activity, so a migration longer than the idle window must
+// not make the bridge exit right after it connects: the idle window starts after the migration.
+func TestRunIdleWindowStartsAfterMigration(t *testing.T) {
+	h := newRunHarness(t, &fakeContainer{dev: &store.Device{}})
+	h.configure = pairedConfigure
+	const idleExit = 200 * time.Millisecond
+	t.Setenv("WHATSAPP_BRIDGE_IDLE_EXIT", idleExit.String())
+	old := runMigrateSearch
+	t.Cleanup(func() { runMigrateSearch = old })
+	var migrated time.Time
+	runMigrateSearch = func(*MessageStore, context.Context) error {
+		time.Sleep(2 * idleExit)
+		migrated = time.Now()
+		return nil
+	}
+	if code := h.wait(h.start()); code != 0 {
+		t.Fatalf("code = %d", code)
+	}
+	if ran := time.Since(migrated); ran < idleExit*3/4 {
+		t.Fatalf("exited %s after the migration, want about the idle window %s", ran, idleExit)
+	}
+	waitForText(t, h.logs, "No API activity for")
 }

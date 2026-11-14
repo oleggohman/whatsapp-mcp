@@ -249,7 +249,9 @@ func run() int {
 		}
 	}
 
-	// Start the REST API before connecting; handlers answer "Not connected" until the client is up
+	// Start the REST API before connecting; handlers answer "Not connected" until the client is up.
+	// The connecting routes answer 503 from the first request until the search migration is done.
+	pm.migrating.Store(true)
 	idle := newIdleTracker()
 	api.pairing = pm
 	api.idle = idle
@@ -271,7 +273,6 @@ func run() int {
 	// connect return 503 until it is done, so no client writes during the migration.
 	migCtx, cancelMigration := context.WithCancel(context.Background())
 	defer cancelMigration()
-	pm.migrating.Store(true)
 	migrationDone, watcherDone := make(chan struct{}), make(chan struct{})
 	// The watcher cancels the migration on a stop request and hands the request on, so the
 	// final select below still sees it. It does not touch the database.
@@ -298,6 +299,8 @@ func run() int {
 	close(migrationDone)
 	<-watcherDone
 	pm.migrating.Store(false)
+	// Health polls do not count as activity, so a long migration must not use up the idle window
+	idle.Touch()
 	if migCtx.Err() == nil {
 		if migErr != nil {
 			// Search stays on LIKE; the bridge still serves
@@ -404,7 +407,7 @@ func handleHistorySync(r *chatResolver, self string, messageStore *MessageStore,
 }
 
 // syncConversation stores one history-sync conversation and returns the stored message count.
-// A non-group conversation holds the repair lock for its normalize + StoreChat + StoreMessage
+// A non-group conversation holds the repair lock for its normalize + storeHistoryBatch
 // writes only, so a repair cannot merge its LID chat in between (see lockChat) while live
 // handlers are not stalled for the whole sync. Group names may need the network; groups are
 // never merged, so they are resolved without the lock.

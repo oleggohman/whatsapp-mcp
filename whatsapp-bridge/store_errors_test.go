@@ -260,8 +260,9 @@ func TestStoreHistoryBatchFailsClosed(t *testing.T) {
 }
 
 func TestMigrateSearchFailsClosed(t *testing.T) {
+	// counts answers the migration's count query: all three triggers present, then docsize and messages
 	counts := func(indexed, total int64) func(string) [][]driver.Value {
-		return func(string) [][]driver.Value { return [][]driver.Value{{indexed, total}} }
+		return func(string) [][]driver.Value { return [][]driver.Value{{int64(3), indexed, total}} }
 	}
 	cases := []struct {
 		name string
@@ -300,6 +301,17 @@ func TestMigrateSearchFailsClosed(t *testing.T) {
 	})
 	t.Run("mismatched counts rebuild", func(t *testing.T) {
 		c := &fakeConnector{txMode: true, queryRows: counts(0, 2)}
+		if err := fakeStore(c).migrateSearch(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if c.execCalls != 4 {
+			t.Fatalf("exec calls = %d, want 4", c.execCalls)
+		}
+	})
+	t.Run("missing trigger rebuilds at matching counts", func(t *testing.T) {
+		c := &fakeConnector{txMode: true, queryRows: func(string) [][]driver.Value {
+			return [][]driver.Value{{int64(2), int64(2), int64(2)}}
+		}}
 		if err := fakeStore(c).migrateSearch(context.Background()); err != nil {
 			t.Fatal(err)
 		}
