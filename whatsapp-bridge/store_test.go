@@ -234,9 +234,17 @@ func TestGetMediaInfoMissingRow(t *testing.T) {
 
 func TestMessagesDSNOptions(t *testing.T) {
 	got := messagesDSN("/x/messages.db")
-	want := "file:/x/messages.db?_foreign_keys=on&_busy_timeout=5000&_txlock=immediate&_journal_mode=WAL"
+	want := "file:/x/messages.db?_foreign_keys=on&_busy_timeout=5000&_txlock=immediate&_journal_mode=WAL&_synchronous=NORMAL"
 	if got != want {
 		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
+func TestNewMessageStoreUsesSynchronousNormal(t *testing.T) {
+	s := newTestStore(t)
+	var mode int
+	if err := s.db.QueryRow("PRAGMA synchronous").Scan(&mode); err != nil || mode != 1 {
+		t.Fatalf("synchronous = %d, %v", mode, err)
 	}
 }
 

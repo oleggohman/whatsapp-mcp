@@ -32,9 +32,12 @@ func sqliteDSN(path string) string {
 }
 
 // messagesDSN is sqliteDSN plus immediate write transactions and WAL, so the repair
-// pass and the Python reader (mode=ro) do not block each other.
+// pass and the Python reader (mode=ro) do not block each other. With WAL,
+// synchronous=NORMAL syncs on checkpoint instead of every commit: a process crash
+// keeps committed transactions, a power loss can drop the last one. This store is
+// a local mirror that history sync can fill again.
 func messagesDSN(path string) string {
-	return sqliteDSN(path) + "&_txlock=immediate&_journal_mode=WAL"
+	return sqliteDSN(path) + "&_txlock=immediate&_journal_mode=WAL&_synchronous=NORMAL"
 }
 
 // messagesDBPath returns the location of messages.db.
