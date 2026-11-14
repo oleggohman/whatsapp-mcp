@@ -7,7 +7,8 @@
 #   - lock_windows.go: built only for Windows (build-tagged), so it is not compiled on the
 #     darwin/linux hosts that run this script and never appears in the profile.
 #
-# Usage: bash scripts/coverage.sh -tags sqlite_fts5   (from anywhere; extra args go to `go test`)
+# Usage: bash scripts/coverage.sh   (from anywhere; extra args go to `go test`)
+# The bridge needs -tags sqlite_fts5, so it is always passed. Passing it again is harmless.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -15,7 +16,7 @@ cd "$(dirname "$0")/.."
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/bridge-cover.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 
-go test -count=1 -coverprofile="$tmp/raw.out" "$@" ./...
+go test -count=1 -tags sqlite_fts5 -coverprofile="$tmp/raw.out" "$@" ./...
 
 # Keep the mode line and every block that is not in an excluded file.
 grep -v '/main_entry\.go:' "$tmp/raw.out" > "$tmp/cover.out"

@@ -176,6 +176,14 @@ def test_get_last_interaction(store_dir):
     assert whatsapp.get_last_interaction("none") is None
 
 
+def test_get_last_interaction_group_jid(store_dir):
+    # Any other JID matches its own chat exactly, as on main: a group returns its newest message.
+    assert "group hello" in whatsapp.get_last_interaction("g1@g.us")
+    _add_message(store_dir, "m7", "g1@g.us", "222", "bob in group", "2025-01-02 09:00:00+00:00")
+    assert "bob in group" in whatsapp.get_last_interaction("g1@g.us")
+    assert whatsapp.get_last_interaction("g2@g.us") is None
+
+
 def test_get_sender_name(store_dir):
     assert whatsapp.get_sender_name(ALICE) == "Alice"
     assert whatsapp.get_sender_name("111") == "Alice"
@@ -347,6 +355,14 @@ def test_get_contact_chats_one_row_per_chat(store_dir):
     assert sorted(jids) == sorted(set(jids))
 
 
+def test_get_contact_chats_group_jid(store_dir):
+    # Any other JID matches its own chat exactly, as on main.
+    chats = whatsapp.get_contact_chats("g1@g.us")
+    assert [c.jid for c in chats] == ["g1@g.us"]
+    assert chats[0].last_message == "group hello"
+    assert whatsapp.get_contact_chats("g2@g.us") == []
+
+
 def test_get_direct_chat_by_contact_is_exact(store_dir):
     conn = sqlite3.connect(store_dir / "messages.db")
     conn.execute("INSERT INTO chats VALUES ('15551212@s.whatsapp.net', 'Long', NULL)")
@@ -393,9 +409,10 @@ def test_last_message_lookup_uses_chat_time_index(store_dir):
 
 
 def test_last_interaction_uses_sender_and_chat_indexes(store_dir):
-    plan = _plan(store_dir, whatsapp._LAST_INTERACTION_SQL, ("111", "111", "111"))
+    plan = _plan(store_dir, whatsapp._LAST_INTERACTION_SQL, ("111", "111", "111", ALICE))
     assert "idx_messages_sender_time" in plan
     assert "idx_messages_chat_time" in plan
+    assert "SCAN m " not in plan + " "  # every branch, the exact-JID one too, is an index search
 
 
 def test_contact_chats_sender_lookup_uses_sender_index(store_dir):

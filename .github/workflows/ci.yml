@@ -42,7 +42,7 @@ jobs:
         if: runner.os == 'Windows'
       - name: Coverage gate (100%)
         if: runner.os != 'Windows' # Unix-only files (lock, signals) are not built there
-        run: bash scripts/coverage.sh -tags sqlite_fts5
+        run: bash scripts/coverage.sh
 
   golangci-lint:
     runs-on: ubuntu-latest

@@ -31,6 +31,8 @@ def _isolate_store(tmp_path_factory, monkeypatch):
     )
 
 
+# The index, FTS and trigger DDL below copies migrateIndexesSQL, migrateFTSTableSQL and
+# migrateFTSTriggersSQL in whatsapp-bridge/store.go; test_schema_sync.py fails if they drift.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS chats (
     jid TEXT PRIMARY KEY,

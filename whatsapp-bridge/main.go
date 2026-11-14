@@ -301,7 +301,9 @@ func run() int {
 	pm.migrating.Store(false)
 	// Health polls do not count as activity, so a long migration must not use up the idle window
 	idle.Touch()
-	if migCtx.Err() == nil {
+	// The watcher has returned, so nothing cancels migCtx from here on
+	stopped := migCtx.Err() != nil
+	if !stopped {
 		if migErr != nil {
 			// Search stays on LIKE; the bridge still serves
 			logger.Errorf("Search index migration failed after %s: %v", time.Since(migStart).Round(time.Millisecond), migErr)
@@ -313,7 +315,7 @@ func run() int {
 	idleCtx, stopIdle := context.WithCancel(context.Background())
 	defer stopIdle()
 	idleExit := make(chan struct{})
-	if migCtx.Err() == nil {
+	if !stopped {
 		if c := pm.current(); c.Paired() {
 			// Already logged in, just connect; failures stay visible in /api/status
 			if err := c.Connect(); err != nil {
@@ -445,7 +447,6 @@ func syncConversation(ctx context.Context, r *chatResolver, self string, message
 	// Get appropriate chat name from the stored name, contacts and the conversation itself
 	name := r.chatName(ctx, jid, nameHints{convName: conversationName(conversation)})
 
-	// Process messages
 	messages := conversation.Messages
 	if len(messages) == 0 {
 		return syncedCount
@@ -492,9 +493,6 @@ func syncConversation(ctx context.Context, r *chatResolver, self string, message
 		if msg.Message.Message != nil {
 			mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message)
 		}
-
-		// Log the message content for debugging
-		logger.Debugf("Message: %d text bytes, Media Type: %v", len(content), mediaType)
 
 		// Skip messages with no content and no media
 		if content == "" && mediaType == "" {

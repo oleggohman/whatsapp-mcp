@@ -86,7 +86,9 @@ def test_sender_name_resolver_memoizes_and_survives_db_error(store_dir, caplog):
         assert resolve("222") == "Bob"
         assert resolve("nobody") == "nobody"
         assert resolve("111") == "111"  # uncached lookup on a closed connection
-    assert any("Database error while getting sender name" in m for m in _logged(caplog))
+        assert resolve("111") == "111"  # the failure is memoized: no second error
+    errors = [m for m in _logged(caplog) if "Database error while getting sender name" in m]
+    assert len(errors) == 1
 
 
 def _msg(**kw):

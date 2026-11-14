@@ -218,6 +218,18 @@ func (h *runHarness) get(addr, path string) (int, string) {
 	return resp.StatusCode, string(b)
 }
 
+// post sends a JSON body to path on the harness REST server and returns the status code, or -1
+// when the request fails. It never calls t.Fatal, so it is safe from goroutines run starts.
+func (h *runHarness) post(path, body string) int {
+	cl := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}, Timeout: settleTimeout}
+	resp, err := cl.Post("http://"+h.addr()+path, "application/json", strings.NewReader(body))
+	if err != nil {
+		return -1
+	}
+	_ = resp.Body.Close()
+	return resp.StatusCode
+}
+
 // seedStore creates messages.db in the harness store with a placeholder-named chat.
 func (h *runHarness) seedStore(jid types.JID, name string) {
 	h.t.Helper()
@@ -637,18 +649,24 @@ func TestRunStoresMessagesSentThroughTheAPI(t *testing.T) {
 	}
 }
 
+// stubMigration replaces runMigrateSearch with fn for the rest of the test.
+func stubMigration(t *testing.T, fn func(*MessageStore, context.Context) error) {
+	t.Helper()
+	old := runMigrateSearch
+	t.Cleanup(func() { runMigrateSearch = old })
+	runMigrateSearch = fn
+}
+
 // blockingMigration replaces runMigrateSearch with a migration that blocks until its context is
 // cancelled. The returned channel reports the store it was called with.
 func blockingMigration(t *testing.T) <-chan *MessageStore {
 	t.Helper()
-	old := runMigrateSearch
-	t.Cleanup(func() { runMigrateSearch = old })
 	entered := make(chan *MessageStore, 1)
-	runMigrateSearch = func(ms *MessageStore, ctx context.Context) error {
+	stubMigration(t, func(ms *MessageStore, ctx context.Context) error {
 		entered <- ms
 		<-ctx.Done()
 		return ctx.Err()
-	}
+	})
 	return entered
 }
 
@@ -657,9 +675,7 @@ func pairedConfigure(i int, c *fakeMeow) { c.paired, c.conn = true, false }
 func TestRunLogsMigrationFailureAndStillConnects(t *testing.T) {
 	h := newRunHarness(t, &fakeContainer{dev: &store.Device{}})
 	h.configure = pairedConfigure
-	old := runMigrateSearch
-	t.Cleanup(func() { runMigrateSearch = old })
-	runMigrateSearch = func(*MessageStore, context.Context) error { return io.ErrClosedPipe }
+	stubMigration(t, func(*MessageStore, context.Context) error { return io.ErrClosedPipe })
 	code := h.start()
 	h.registered()
 	if connects, _, _ := h.client(0).counts(); connects != 1 {
@@ -675,10 +691,8 @@ func TestRunLogsMigrationFailureAndStillConnects(t *testing.T) {
 func TestRunSignalAfterMigrationExits(t *testing.T) {
 	h := newRunHarness(t, &fakeContainer{dev: &store.Device{}})
 	h.configure = pairedConfigure
-	old := runMigrateSearch
-	t.Cleanup(func() { runMigrateSearch = old })
 	calls := 0
-	runMigrateSearch = func(*MessageStore, context.Context) error { calls++; return nil }
+	stubMigration(t, func(*MessageStore, context.Context) error { calls++; return nil })
 	code := h.start()
 	h.registered()
 	if c := h.stop(code); c != 0 {
@@ -699,16 +713,7 @@ func TestRunSignalAfterMigrationExits(t *testing.T) {
 // While the migration runs the connecting routes answer 503 and a stop request cancels it:
 // run skips Connect, returns 0 and closes the message store.
 func TestRunStopDuringMigration(t *testing.T) {
-	post := func(h *runHarness, path string) int {
-		h.t.Helper()
-		cl := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}, Timeout: settleTimeout}
-		resp, err := cl.Post("http://"+h.addr()+path, "application/json", strings.NewReader(`{"version":"`+bridgeVersion+`"}`))
-		if err != nil {
-			h.t.Fatal(err)
-		}
-		_ = resp.Body.Close()
-		return resp.StatusCode
-	}
+	body := `{"version":"` + bridgeVersion + `"}`
 	for _, how := range []string{"signal", "api shutdown"} {
 		t.Run(how, func(t *testing.T) {
 			h := newRunHarness(t, &fakeContainer{dev: &store.Device{}})
@@ -721,7 +726,7 @@ func TestRunStopDuringMigration(t *testing.T) {
 			case <-time.After(settleTimeout):
 				t.Fatal("migration never started")
 			}
-			if st := post(h, "/api/reconnect"); st != http.StatusServiceUnavailable {
+			if st := h.post("/api/reconnect", body); st != http.StatusServiceUnavailable {
 				t.Fatalf("reconnect during migration = %d, want 503", st)
 			}
 			if st, _ := h.get(h.addr(), "/api/health"); st != http.StatusOK {
@@ -734,7 +739,7 @@ func TestRunStopDuringMigration(t *testing.T) {
 				case <-time.After(settleTimeout):
 					t.Fatal("run never registered for signals")
 				}
-			} else if st := post(h, "/api/shutdown"); st != http.StatusOK {
+			} else if st := h.post("/api/shutdown", body); st != http.StatusOK {
 				t.Fatalf("shutdown status = %d", st)
 			}
 			if c := h.wait(code); c != 0 {
@@ -759,19 +764,10 @@ func TestRunStopDuringMigration(t *testing.T) {
 func TestRunGatesConnectingRoutesBeforeMigrationStarts(t *testing.T) {
 	h := newRunHarness(t, &fakeContainer{dev: &store.Device{}})
 	h.configure = pairedConfigure
-	old := runMigrateSearch
-	t.Cleanup(func() { runMigrateSearch = old })
-	runMigrateSearch = func(*MessageStore, context.Context) error { return nil }
+	stubMigration(t, func(*MessageStore, context.Context) error { return nil })
 	status := make(chan int, 1)
 	notifySignals = func(c chan<- os.Signal) {
-		cl := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}, Timeout: settleTimeout}
-		resp, err := cl.Post("http://"+h.addr()+"/api/reconnect", "application/json", strings.NewReader(`{}`))
-		if err != nil {
-			status <- -1
-		} else {
-			_ = resp.Body.Close()
-			status <- resp.StatusCode
-		}
+		status <- h.post("/api/reconnect", `{}`)
 		h.sig <- c
 	}
 	code := h.start()
@@ -794,14 +790,12 @@ func TestRunIdleWindowStartsAfterMigration(t *testing.T) {
 	h.configure = pairedConfigure
 	const idleExit = 200 * time.Millisecond
 	t.Setenv("WHATSAPP_BRIDGE_IDLE_EXIT", idleExit.String())
-	old := runMigrateSearch
-	t.Cleanup(func() { runMigrateSearch = old })
 	var migrated time.Time
-	runMigrateSearch = func(*MessageStore, context.Context) error {
+	stubMigration(t, func(*MessageStore, context.Context) error {
 		time.Sleep(2 * idleExit)
 		migrated = time.Now()
 		return nil
-	}
+	})
 	if code := h.wait(h.start()); code != 0 {
 		t.Fatalf("code = %d", code)
 	}

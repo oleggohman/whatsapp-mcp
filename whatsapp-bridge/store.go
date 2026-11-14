@@ -34,8 +34,8 @@ func sqliteDSN(path string) string {
 // messagesDSN is sqliteDSN plus immediate write transactions and WAL, so the repair
 // pass and the Python reader (mode=ro) do not block each other. With WAL,
 // synchronous=NORMAL syncs on checkpoint instead of every commit: a process crash
-// keeps committed transactions, a power loss can drop every commit since the last checkpoint. This store is
-// a local mirror that history sync can fill again.
+// keeps committed transactions, a power loss can drop every commit since the last
+// checkpoint. This store is a local mirror that history sync can fill again.
 func messagesDSN(path string) string {
 	return sqliteDSN(path) + "&_txlock=immediate&_journal_mode=WAL&_synchronous=NORMAL"
 }
@@ -114,6 +114,8 @@ func NewMessageStore() (*MessageStore, error) {
 }
 
 // migrateIndexesSQL creates the btree indexes the read paths rely on.
+// whatsapp-mcp-server/tests/conftest.py copies this, migrateFTSTableSQL and
+// migrateFTSTriggersSQL; its test_schema_sync.py fails if they drift.
 const migrateIndexesSQL = `
 	CREATE INDEX IF NOT EXISTS idx_messages_chat_time ON messages (chat_jid, timestamp);
 	CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages (timestamp);

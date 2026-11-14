@@ -159,7 +159,8 @@ def _name_resolver(conn: sqlite3.Connection) -> Callable[[str], str]:
     The stored sender is the user part of a JID. Its `@server` suffix is dropped and
     `user@s.whatsapp.net`, then `user@lid`, are looked up by primary key. There is no
     substring match, so `15551212` never takes the name of `551212`. Results are memoized
-    for the life of the resolver; a sender with no named chat resolves to itself.
+    for the life of the resolver; a sender with no named chat, or whose lookup fails, resolves
+    to itself.
     """
     cache: dict[str, str] = {}
 
@@ -175,7 +176,6 @@ def _name_resolver(conn: sqlite3.Connection) -> Callable[[str], str]:
                     return row[0]
         except sqlite3.Error as e:
             logger.error("Database error while getting sender name: %s", e)
-            return sender
         cache[sender] = sender
         return sender
 
@@ -656,7 +656,8 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> list[Chat]:
     """Get all chats involving the contact.
 
     Args:
-        jid: The contact's JID or bare sender (user part) to search for
+        jid: The contact's JID or bare sender (user part) to search for. Any other JID (a
+            group, for example) matches its own chat exactly.
         limit: Maximum number of chats to return (default 20)
         page: Page number for pagination (default 0)
     """
@@ -665,8 +666,8 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> list[Chat]:
         with _connect() as conn:
             cursor = conn.cursor()
 
-            # Chat ids first (direct chat by JID, other chats by sender index), then one
-            # row per chat with its newest message attached.
+            # Chat ids first (direct chat by JID or the exact JID given, other chats by sender
+            # index), then one row per chat with its newest message attached.
             cursor.execute(
                 f"""
                 SELECT
@@ -679,14 +680,14 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> list[Chat]:
                 FROM chats c
                 LEFT JOIN messages m ON m.rowid = {_LAST_ROWID.format(a="m2", jid="c.jid")}
                 WHERE c.jid IN (
-                    SELECT jid FROM chats WHERE jid IN (? || '@s.whatsapp.net', ? || '@lid')
+                    SELECT jid FROM chats WHERE jid IN (? || '@s.whatsapp.net', ? || '@lid', ?)
                     UNION
                     SELECT chat_jid FROM messages WHERE sender = ?
                 )
                 ORDER BY c.last_message_time DESC
                 LIMIT ? OFFSET ?
             """,
-                (user, user, user, limit, page * limit),
+                (user, user, jid, user, limit, page * limit),
             )
 
             chats = cursor.fetchall()
@@ -713,12 +714,13 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> list[Chat]:
 
 
 _INTERACTION_COLS = (
-    "m.timestamp, m.sender, c.name, m.content, m.is_from_me, c.jid, m.id, m.media_type, "
+    "m.timestamp AS ts, m.sender, c.name, m.content, m.is_from_me, c.jid, m.id, m.media_type, "
     "m.rowid AS rid"
 )
 
 # Newest message by this sender (idx_messages_sender_time) and newest message of each direct
-# chat JID form (idx_messages_chat_time), then the newer of the three.
+# chat JID form and of the exact JID given, e.g. a group (idx_messages_chat_time), then the
+# newest of the four.
 _LAST_INTERACTION_SQL = f"""
     SELECT * FROM (
         SELECT {_INTERACTION_COLS} FROM messages m JOIN chats c ON m.chat_jid = c.jid
@@ -734,7 +736,12 @@ _LAST_INTERACTION_SQL = f"""
         SELECT {_INTERACTION_COLS} FROM messages m JOIN chats c ON m.chat_jid = c.jid
         WHERE m.chat_jid = ? || '@lid' ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1
     )
-    ORDER BY 1 DESC, 9 DESC
+    UNION ALL
+    SELECT * FROM (
+        SELECT {_INTERACTION_COLS} FROM messages m JOIN chats c ON m.chat_jid = c.jid
+        WHERE m.chat_jid = ? ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1
+    )
+    ORDER BY ts DESC, rid DESC
     LIMIT 1
 """
 
@@ -746,7 +753,7 @@ def get_last_interaction(jid: str) -> str:
         with _connect() as conn:
             cursor = conn.cursor()
 
-            cursor.execute(_LAST_INTERACTION_SQL, (user, user, user))
+            cursor.execute(_LAST_INTERACTION_SQL, (user, user, user, jid))
 
             msg_data = cursor.fetchone()
 
