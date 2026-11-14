@@ -86,6 +86,19 @@ def _lid_map_available(conn: sqlite3.Connection) -> bool:
 _LID_PN_CLAUSE = "{jid} IN (SELECT m.lid || '@lid' FROM wa.whatsmeow_lid_map m WHERE m.pn LIKE ?)"
 
 
+# Newest message of a chat: ties on timestamp go to the higher rowid. idx_messages_chat_time
+# serves both the chat filter and the order. Used instead of joining on last_message_time.
+_LAST_ROWID = (
+    "(SELECT {a}.rowid FROM messages AS {a} WHERE {a}.chat_jid = {jid} "
+    "ORDER BY {a}.timestamp DESC, {a}.rowid DESC LIMIT 1)"
+)
+
+
+def _user_part(jid: str) -> str:
+    """Return the user part of a JID or phone number (drops `@server`)."""
+    return jid.split("@")[0]
+
+
 def to_jsonable(obj: Any) -> Any:
     """Convert dataclasses (recursively) to plain dicts with datetimes as ISO-8601 strings."""
     if hasattr(obj, "__dataclass_fields__"):
@@ -503,10 +516,10 @@ def list_chats(
             ]
 
             if include_last_message:
-                query_parts.append("""
-                    LEFT JOIN messages ON chats.jid = messages.chat_jid 
-                    AND chats.last_message_time = messages.timestamp
-                """)
+                query_parts.append(
+                    "LEFT JOIN messages ON messages.rowid = "
+                    + _LAST_ROWID.format(a="m2", jid="chats.jid")
+                )
 
             where_clauses = []
             params = []
@@ -607,17 +620,20 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> list[Chat]:
     """Get all chats involving the contact.
 
     Args:
-        jid: The contact's JID to search for
+        jid: The contact's JID or bare sender (user part) to search for
         limit: Maximum number of chats to return (default 20)
         page: Page number for pagination (default 0)
     """
+    user = _user_part(jid)
     try:
         with _connect() as conn:
             cursor = conn.cursor()
 
+            # Chat ids first (direct chat by JID, other chats by sender index), then one
+            # row per chat with its newest message attached.
             cursor.execute(
-                """
-                SELECT DISTINCT
+                f"""
+                SELECT
                     c.jid,
                     c.name,
                     c.last_message_time,
@@ -625,12 +641,16 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> list[Chat]:
                     m.sender as last_sender,
                     m.is_from_me as last_is_from_me
                 FROM chats c
-                JOIN messages m ON c.jid = m.chat_jid
-                WHERE m.sender = ? OR c.jid = ?
+                LEFT JOIN messages m ON m.rowid = {_LAST_ROWID.format(a="m2", jid="c.jid")}
+                WHERE c.jid IN (
+                    SELECT jid FROM chats WHERE jid IN (? || '@s.whatsapp.net', ? || '@lid')
+                    UNION
+                    SELECT chat_jid FROM messages WHERE sender = ?
+                )
                 ORDER BY c.last_message_time DESC
                 LIMIT ? OFFSET ?
             """,
-                (jid, jid, limit, page * limit),
+                (user, user, user, limit, page * limit),
             )
 
             chats = cursor.fetchall()
@@ -656,31 +676,41 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> list[Chat]:
         return []
 
 
+_INTERACTION_COLS = (
+    "m.timestamp, m.sender, c.name, m.content, m.is_from_me, c.jid, m.id, m.media_type, "
+    "m.rowid AS rid"
+)
+
+# Newest message by this sender (idx_messages_sender_time) and newest message of each direct
+# chat JID form (idx_messages_chat_time), then the newer of the three.
+_LAST_INTERACTION_SQL = f"""
+    SELECT * FROM (
+        SELECT {_INTERACTION_COLS} FROM messages m JOIN chats c ON m.chat_jid = c.jid
+        WHERE m.sender = ? ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1
+    )
+    UNION ALL
+    SELECT * FROM (
+        SELECT {_INTERACTION_COLS} FROM messages m JOIN chats c ON m.chat_jid = c.jid
+        WHERE m.chat_jid = ? || '@s.whatsapp.net' ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1
+    )
+    UNION ALL
+    SELECT * FROM (
+        SELECT {_INTERACTION_COLS} FROM messages m JOIN chats c ON m.chat_jid = c.jid
+        WHERE m.chat_jid = ? || '@lid' ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1
+    )
+    ORDER BY 1 DESC, 9 DESC
+    LIMIT 1
+"""
+
+
 def get_last_interaction(jid: str) -> str:
     """Get most recent message involving the contact."""
+    user = _user_part(jid)
     try:
         with _connect() as conn:
             cursor = conn.cursor()
 
-            cursor.execute(
-                """
-                SELECT 
-                    m.timestamp,
-                    m.sender,
-                    c.name,
-                    m.content,
-                    m.is_from_me,
-                    c.jid,
-                    m.id,
-                    m.media_type
-                FROM messages m
-                JOIN chats c ON m.chat_jid = c.jid
-                WHERE m.sender = ? OR c.jid = ?
-                ORDER BY m.timestamp DESC
-                LIMIT 1
-            """,
-                (jid, jid),
-            )
+            cursor.execute(_LAST_INTERACTION_SQL, (user, user, user))
 
             msg_data = cursor.fetchone()
 
@@ -727,10 +757,9 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Chat | None:
             """
 
             if include_last_message:
-                query += """
-                    LEFT JOIN messages m ON c.jid = m.chat_jid 
-                    AND c.last_message_time = m.timestamp
-                """
+                query += " LEFT JOIN messages m ON m.rowid = " + _LAST_ROWID.format(
+                    a="m2", jid="c.jid"
+                )
 
             query += " WHERE c.jid = ?"
 
@@ -755,14 +784,19 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Chat | None:
 
 
 def get_direct_chat_by_contact(sender_phone_number: str) -> Chat | None:
-    """Get chat metadata by sender phone number."""
+    """Get chat metadata by sender phone number.
+
+    Matches `user@s.whatsapp.net` and `user@lid` exactly (after dropping `+`, spaces and
+    dashes). The `@s.whatsapp.net` row wins when both exist.
+    """
+    user = _user_part(sender_phone_number.replace("+", "").replace(" ", "").replace("-", ""))
     try:
         with _connect() as conn:
             cursor = conn.cursor()
 
             cursor.execute(
-                """
-                SELECT 
+                f"""
+                SELECT
                     c.jid,
                     c.name,
                     c.last_message_time,
@@ -770,14 +804,14 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Chat | None:
                     m.sender as last_sender,
                     m.is_from_me as last_is_from_me
                 FROM chats c
-                LEFT JOIN messages m ON c.jid = m.chat_jid 
-                    AND c.last_message_time = m.timestamp
-                WHERE c.jid LIKE ? AND c.jid NOT LIKE '%@g.us'
+                LEFT JOIN messages m ON m.rowid = {_LAST_ROWID.format(a="m2", jid="c.jid")}
+                WHERE c.jid IN (? || '@s.whatsapp.net', ? || '@lid')
+                    AND c.jid NOT LIKE '%@g.us'
+                ORDER BY CASE WHEN c.jid LIKE '%@s.whatsapp.net' THEN 0 ELSE 1 END
                 LIMIT 1
             """,
-                (f"%{sender_phone_number}%",),
+                (user, user),
             )
-
             chat_data = cursor.fetchone()
 
             if not chat_data:

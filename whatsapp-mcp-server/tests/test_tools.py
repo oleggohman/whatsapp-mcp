@@ -99,7 +99,7 @@ async def test_get_contact_chats(store_dir):
 
 async def test_get_last_interaction(store_dir):
     out = await call("get_last_interaction", jid="111@s.whatsapp.net")
-    assert "third" in out
+    assert "group hello" in out  # newest of sender 111 anywhere and the direct chat
     assert await call("get_last_interaction", jid="nobody@s.whatsapp.net") is None
 
 

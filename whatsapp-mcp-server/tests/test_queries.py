@@ -168,7 +168,11 @@ def test_get_direct_chat_by_contact(store_dir):
 
 
 def test_get_last_interaction(store_dir):
-    assert "third" in whatsapp.get_last_interaction(ALICE)
+    # The newest of: sender 111 anywhere (group hello, day 2) and the direct chat (third).
+    assert "group hello" in whatsapp.get_last_interaction(ALICE)
+    assert "group hello" in whatsapp.get_last_interaction("111")
+    assert "bob says hi" in whatsapp.get_last_interaction("222@s.whatsapp.net")
+    assert "from lid" in whatsapp.get_last_interaction("999000@lid")
     assert whatsapp.get_last_interaction("none") is None
 
 
@@ -283,3 +287,108 @@ def test_list_messages_bounds_use_driver_layout_in_local_zone(store_dir, monkeyp
     finally:
         monkeypatch.undo()
         time.tzset()
+
+
+# --- last-message shape, contact chats, plans --------------------------------------------------
+
+
+def _add_message(store_dir, mid, chat, sender, content, ts, from_me=0):
+    conn = sqlite3.connect(store_dir / "messages.db")
+    conn.execute(
+        "INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (mid, chat, sender, content, ts, from_me),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_list_chats_tied_timestamps_one_row_highest_rowid(store_dir):
+    # Same timestamp as m3 (the chat's last_message_time): higher rowid wins, no duplicate row.
+    _add_message(store_dir, "m3b", ALICE, "111", "tied", "2025-01-01 10:02:00+00:00")
+    rows = [c for c in whatsapp.list_chats() if c.jid == ALICE]
+    assert len(rows) == 1 and rows[0].last_message == "tied"
+    assert whatsapp.get_chat(ALICE).last_message == "tied"
+    assert whatsapp.get_direct_chat_by_contact("111").last_message == "tied"
+
+
+def test_last_message_does_not_need_matching_last_message_time(store_dir):
+    conn = sqlite3.connect(store_dir / "messages.db")
+    conn.execute(
+        "UPDATE chats SET last_message_time = '2030-01-01 00:00:00+00:00' WHERE jid = ?", (ALICE,)
+    )
+    conn.commit()
+    conn.close()
+    assert whatsapp.get_chat(ALICE).last_message == "third"
+
+
+@pytest.mark.parametrize("arg", ["111", ALICE])
+def test_get_contact_chats_bare_sender_and_full_jid(store_dir, arg):
+    chats = whatsapp.get_contact_chats(arg)
+    assert [c.jid for c in chats] == ["g1@g.us", ALICE]  # last_message_time DESC, one row each
+    assert all(c.last_message and c.last_sender for c in chats)
+    assert chats[1].last_message == "third" and chats[1].last_is_from_me
+    assert "222@s.whatsapp.net" not in {c.jid for c in chats}
+    assert len(whatsapp.get_contact_chats(arg, limit=1, page=1)) == 1
+
+
+def test_get_contact_chats_one_row_per_chat(store_dir):
+    _add_message(store_dir, "m7", "g1@g.us", "111", "again", "2025-01-02 08:05:00+00:00")
+    jids = [c.jid for c in whatsapp.get_contact_chats("111")]
+    assert sorted(jids) == sorted(set(jids))
+
+
+def test_get_direct_chat_by_contact_is_exact(store_dir):
+    conn = sqlite3.connect(store_dir / "messages.db")
+    conn.execute("INSERT INTO chats VALUES ('15551212@s.whatsapp.net', 'Long', NULL)")
+    conn.commit()
+    conn.close()
+    assert whatsapp.get_direct_chat_by_contact("551212") is None
+    assert whatsapp.get_direct_chat_by_contact("+1 555-1212").jid == "15551212@s.whatsapp.net"
+    assert whatsapp.get_direct_chat_by_contact("15551212@s.whatsapp.net").last_message is None
+    assert whatsapp.get_direct_chat_by_contact("999000").jid == "999000@lid"
+
+
+def test_get_direct_chat_prefers_phone_jid_over_lid(store_dir):
+    conn = sqlite3.connect(store_dir / "messages.db")
+    conn.execute("INSERT INTO chats VALUES ('999000@s.whatsapp.net', 'Phone', NULL)")
+    conn.commit()
+    conn.close()
+    assert whatsapp.get_direct_chat_by_contact("999000").jid == "999000@s.whatsapp.net"
+
+
+def test_list_chats_query_without_last_message_and_lid_map(store_dir):
+    chats = whatsapp.list_chats(query="15551234567", include_last_message=False)
+    assert [c.jid for c in chats] == ["999000@lid"]  # found through whatsmeow_lid_map
+    assert chats[0].last_message is None and chats[0].last_sender is None
+    assert chats[0].last_is_from_me is None
+    with_last = whatsapp.list_chats(query="15551234567")
+    assert with_last[0].last_message == "from lid"
+    assert [c.name for c in whatsapp.list_chats(query="a", sort_by="name")] == sorted(
+        c.name for c in whatsapp.list_chats(query="a")
+    )
+
+
+def _plan(store_dir, sql, params):
+    conn = sqlite3.connect(store_dir / "messages.db")
+    try:
+        rows = conn.execute("EXPLAIN QUERY PLAN " + sql, params).fetchall()
+    finally:
+        conn.close()
+    return " ".join(r[-1] for r in rows)
+
+
+def test_last_message_lookup_uses_chat_time_index(store_dir):
+    sql = "SELECT 1 FROM messages WHERE rowid = " + whatsapp._LAST_ROWID.format(a="m2", jid="?")
+    assert "INDEX idx_messages_chat_time" in _plan(store_dir, sql, (ALICE,))
+
+
+def test_last_interaction_uses_sender_and_chat_indexes(store_dir):
+    plan = _plan(store_dir, whatsapp._LAST_INTERACTION_SQL, ("111", "111", "111"))
+    assert "idx_messages_sender_time" in plan
+    assert "idx_messages_chat_time" in plan
+
+
+def test_contact_chats_sender_lookup_uses_sender_index(store_dir):
+    plan = _plan(store_dir, "SELECT chat_jid FROM messages WHERE sender = ?", ("111",))
+    assert "INDEX idx_messages_sender_time" in plan
