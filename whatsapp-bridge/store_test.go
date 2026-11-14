@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"os"
@@ -247,14 +248,19 @@ func TestNewMessageStoreUsesWAL(t *testing.T) {
 	}
 }
 
-func TestNewMessageStoreCreatesIndexes(t *testing.T) {
+func TestMigrateSearchCreatesIndexes(t *testing.T) {
 	s := newTestStore(t)
-	// Reopening an existing database keeps the IF NOT EXISTS statements idempotent.
-	s2, err := NewMessageStore()
-	if err != nil {
-		t.Fatalf("reopen: %v", err)
+	// NewMessageStore leaves the indexes to migrateSearch so opening stays fast.
+	var n int
+	if err := s.db.QueryRow("SELECT count(*) FROM sqlite_master WHERE name LIKE 'idx_messages_%'").Scan(&n); err != nil || n != 0 {
+		t.Fatalf("indexes before migrateSearch = %d, %v", n, err)
 	}
-	defer s2.Close()
+	// Running it twice keeps the IF NOT EXISTS statements idempotent.
+	for i := 0; i < 2; i++ {
+		if err := s.migrateSearch(context.Background()); err != nil {
+			t.Fatalf("migrateSearch: %v", err)
+		}
+	}
 
 	rows, err := s.db.Query(`EXPLAIN QUERY PLAN SELECT content FROM messages
 		WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?`, "a@s.whatsapp.net", 20)
@@ -274,5 +280,136 @@ func TestNewMessageStoreCreatesIndexes(t *testing.T) {
 	if !strings.Contains(plan, "USING INDEX idx_messages_chat_time") &&
 		!strings.Contains(plan, "USING COVERING INDEX idx_messages_chat_time") {
 		t.Fatalf("plan does not use idx_messages_chat_time:\n%s", plan)
+	}
+}
+
+// ftsCounts returns the rows really indexed (docsize) and the rows in messages.
+func ftsCounts(t *testing.T, s *MessageStore) (indexed, total int) {
+	t.Helper()
+	if err := s.db.QueryRow("SELECT count(*) FROM messages_fts_docsize").Scan(&indexed); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow("SELECT count(*) FROM messages").Scan(&total); err != nil {
+		t.Fatal(err)
+	}
+	return indexed, total
+}
+
+// ftsHits returns the messages ids whose content matches the trigram query.
+func ftsHits(t *testing.T, s *MessageStore, q string) []string {
+	t.Helper()
+	rows, err := s.db.Query(`SELECT id FROM messages WHERE rowid IN
+		(SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?) ORDER BY id`, `"`+q+`"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func TestMessagesFTSStaysInSyncWithMessages(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.migrateSearch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	chat := "a@s.whatsapp.net"
+	if err := s.StoreChat(chat, "A", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	store := func(id, content string) {
+		t.Helper()
+		if err := s.StoreMessage(id, chat, "111", content, time.Now(), false, "", "", "", nil, nil, nil, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check := func(step string, wantRows int, token string, want []string) {
+		t.Helper()
+		indexed, total := ftsCounts(t, s)
+		if indexed != total || total != wantRows {
+			t.Fatalf("%s: docsize = %d, messages = %d, want both %d", step, indexed, total, wantRows)
+		}
+		if got := ftsHits(t, s, token); strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Fatalf("%s: MATCH %q = %v, want %v", step, token, got, want)
+		}
+	}
+
+	store("m1", "alpha bravo")
+	check("insert", 1, "bravo", []string{"m1"})
+	if _, err := s.db.Exec("UPDATE messages SET content = 'charlie delta' WHERE id = 'm1'"); err != nil {
+		t.Fatal(err)
+	}
+	check("update", 1, "bravo", nil)
+	check("update new token", 1, "delta", []string{"m1"})
+	store("m1", "echo foxtrot") // upsert of the same key with new content
+	check("upsert old token", 1, "delta", nil)
+	check("upsert new token", 1, "foxtrot", []string{"m1"})
+	store("m2", "golf hotel")
+	check("second row", 2, "golf", []string{"m2"})
+	if _, err := s.db.Exec("DELETE FROM messages WHERE id = 'm1'"); err != nil {
+		t.Fatal(err)
+	}
+	check("delete", 1, "foxtrot", nil)
+}
+
+func TestMigrateSearchIndexesExistingRows(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.StoreChat("a@s.whatsapp.net", "A", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.StoreMessage("m1", "a@s.whatsapp.net", "111", "old row about pelican", time.Now(), false, "", "", "", nil, nil, nil, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.migrateSearch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := s.db.QueryRow("SELECT count(*) FROM sqlite_master WHERE name = 'messages_fts'").Scan(&n); err != nil || n != 1 {
+		t.Fatalf("messages_fts in sqlite_master = %d, %v", n, err)
+	}
+	if got := ftsHits(t, s, "pelican"); len(got) != 1 || got[0] != "m1" {
+		t.Fatalf("MATCH = %v", got)
+	}
+	// An index that diverged from messages (a crashed process) is rebuilt on the next start
+	if _, err := s.db.Exec("INSERT INTO messages_fts(messages_fts) VALUES('delete-all')"); err != nil {
+		t.Fatal(err)
+	}
+	if indexed, total := ftsCounts(t, s); indexed != 0 || total != 1 {
+		t.Fatalf("after delete-all: docsize = %d, messages = %d", indexed, total)
+	}
+	if err := s.migrateSearch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if indexed, total := ftsCounts(t, s); indexed != 1 || total != 1 {
+		t.Fatalf("after rebuild: docsize = %d, messages = %d", indexed, total)
+	}
+}
+
+func TestMigrateSearchRestoresDroppedTriggers(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.migrateSearch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	names := []string{"messages_fts_insert", "messages_fts_delete", "messages_fts_update"}
+	for _, n := range names {
+		if _, err := s.db.Exec("DROP TRIGGER " + n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.migrateSearch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range names {
+		var c int
+		if err := s.db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name = ?", n).Scan(&c); err != nil || c != 1 {
+			t.Fatalf("trigger %s present = %d, %v", n, c, err)
+		}
 	}
 }

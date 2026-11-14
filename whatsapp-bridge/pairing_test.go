@@ -836,3 +836,56 @@ func TestConsumeQREndsWhenSessionEndsElsewhere(t *testing.T) {
 	pm.handleEvent(fw, &events.LoggedOut{})
 	waitFor(t, "QR context cancelled after the session ended", func() bool { return ctx.Err() != nil })
 }
+
+// While run builds the search index the routes that would connect refuse with 503 and never
+// reach the client.
+func TestPairingRoutesRefusedWhileMigrating(t *testing.T) {
+	assert503 := func(t *testing.T, err error) {
+		t.Helper()
+		var pe *pairError
+		if !errors.As(err, &pe) || pe.status != http.StatusServiceUnavailable || pe.msg != "bridge is starting" {
+			t.Fatalf("err = %v, want 503 bridge is starting", err)
+		}
+	}
+	setup := func(paired bool) (*pairingManager, *fakeWA) {
+		c := newFakeWA(paired)
+		pm := newTestPairing(c, nil)
+		pm.migrating.Store(true)
+		return pm, c
+	}
+	t.Run("Reconnect", func(t *testing.T) {
+		pm, c := setup(true)
+		c.conn = false
+		assert503(t, pm.Reconnect())
+		if connects, _, _ := c.counts(); connects != 0 {
+			t.Fatalf("connects = %d", connects)
+		}
+	})
+	t.Run("StartPairing", func(t *testing.T) {
+		pm, c := setup(false)
+		_, err := pm.StartPairing()
+		assert503(t, err)
+		if connects, _, qr := c.counts(); connects != 0 || qr != 0 {
+			t.Fatalf("connects=%d qr=%d", connects, qr)
+		}
+	})
+	t.Run("PairPhone", func(t *testing.T) {
+		pm, c := setup(false)
+		_, err := pm.PairPhone(context.Background(), "14155552671")
+		assert503(t, err)
+		if connects, _, qr := c.counts(); connects != 0 || qr != 0 {
+			t.Fatalf("connects=%d qr=%d", connects, qr)
+		}
+	})
+	t.Run("allowed again once cleared", func(t *testing.T) {
+		pm, c := setup(true)
+		c.conn = false
+		pm.migrating.Store(false)
+		if err := pm.Reconnect(); err != nil {
+			t.Fatal(err)
+		}
+		if connects, _, _ := c.counts(); connects != 1 {
+			t.Fatalf("connects = %d", connects)
+		}
+	})
+}

@@ -101,10 +101,6 @@ func NewMessageStore() (*MessageStore, error) {
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
-
-		CREATE INDEX IF NOT EXISTS idx_messages_chat_time ON messages (chat_jid, timestamp);
-		CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages (timestamp);
-		CREATE INDEX IF NOT EXISTS idx_messages_sender_time ON messages (sender, timestamp);
 	`)
 	if err != nil {
 		_ = db.Close()
@@ -112,6 +108,75 @@ func NewMessageStore() (*MessageStore, error) {
 	}
 
 	return &MessageStore{db: db}, nil
+}
+
+// migrateIndexesSQL creates the btree indexes the read paths rely on.
+const migrateIndexesSQL = `
+	CREATE INDEX IF NOT EXISTS idx_messages_chat_time ON messages (chat_jid, timestamp);
+	CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages (timestamp);
+	CREATE INDEX IF NOT EXISTS idx_messages_sender_time ON messages (sender, timestamp);`
+
+// migrateFTSTableSQL creates the external-content trigram index over messages.content.
+// case_sensitive 0 keeps case folding; the default trigram tokenizer is case-sensitive.
+// The index is keyed on messages.rowid, so a VACUUM (which can renumber rowids) requires
+// INSERT INTO messages_fts(messages_fts) VALUES('rebuild') before search is correct.
+// Nothing in this repo vacuums.
+const migrateFTSTableSQL = `
+	CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+		content,
+		content='messages',
+		content_rowid='rowid',
+		tokenize='trigram case_sensitive 0'
+	);`
+
+// migrateFTSTriggersSQL keeps messages_fts in step with messages. It runs on every migration
+// so a downgrade that dropped the triggers but left the table cannot leave later writes unindexed.
+const migrateFTSTriggersSQL = `
+	CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
+		INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
+	END;
+	CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
+		INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+	END;
+	CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE OF content ON messages BEGIN
+		INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+		INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
+	END;`
+
+// migrateSearch creates the message indexes and the FTS table with its triggers, and rebuilds
+// the FTS index when it does not cover every message. The virtual table, the triggers and the
+// rebuild share one transaction: a crash rolls all of it back and the next start retries.
+// External-content count(*) on messages_fts reads messages, so the docsize shadow table is
+// what says how many rows are really indexed.
+func (store *MessageStore) migrateSearch(ctx context.Context) error {
+	if _, err := store.db.ExecContext(ctx, migrateIndexesSQL); err != nil {
+		return fmt.Errorf("create indexes: %w", err)
+	}
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, migrateFTSTableSQL); err != nil {
+		return fmt.Errorf("create messages_fts: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, migrateFTSTriggersSQL); err != nil {
+		return fmt.Errorf("create messages_fts triggers: %w", err)
+	}
+	var indexed, total int
+	if err := tx.QueryRowContext(ctx, `SELECT
+		(SELECT count(*) FROM messages_fts_docsize), (SELECT count(*) FROM messages)`).Scan(&indexed, &total); err != nil {
+		return fmt.Errorf("count indexed messages: %w", err)
+	}
+	if indexed != total {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO messages_fts(messages_fts) VALUES('rebuild')`); err != nil {
+			return fmt.Errorf("rebuild messages_fts: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+	return nil
 }
 
 // Close the database connection

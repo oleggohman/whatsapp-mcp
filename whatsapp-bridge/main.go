@@ -264,25 +264,67 @@ func run() int {
 		}
 	}()
 
-	if c := pm.current(); c.Paired() {
-		// Already logged in, just connect; failures stay visible in /api/status
-		if err := c.Connect(); err != nil {
-			logger.Errorf("Failed to connect: %v", err)
+	exitChan := make(chan os.Signal, 1)
+	notifySignals(exitChan)
+
+	// Build the search index while /api/health already answers. The routes that would
+	// connect return 503 until it is done, so no client writes during the migration.
+	migCtx, cancelMigration := context.WithCancel(context.Background())
+	defer cancelMigration()
+	pm.migrating.Store(true)
+	migrationDone, watcherDone := make(chan struct{}), make(chan struct{})
+	// The watcher cancels the migration on a stop request and hands the request on, so the
+	// final select below still sees it. It does not touch the database.
+	go func() {
+		defer close(watcherDone)
+		select {
+		case sig := <-exitChan:
+			cancelMigration()
+			select {
+			case exitChan <- sig:
+			default:
+			}
+		case <-api.shutdown:
+			cancelMigration()
+			select {
+			case api.shutdown <- struct{}{}:
+			default:
+			}
+		case <-migrationDone:
 		}
-	} else if isTTY() {
-		// Interactive run: show a QR code right away. Headless runs wait for an explicit request.
-		if _, err := pm.StartPairing(); err != nil {
-			logger.Errorf("Failed to start pairing: %v", err)
+	}()
+	migStart := time.Now()
+	migErr := runMigrateSearch(messageStore, migCtx)
+	close(migrationDone)
+	<-watcherDone
+	pm.migrating.Store(false)
+	if migCtx.Err() == nil {
+		if migErr != nil {
+			// Search stays on LIKE; the bridge still serves
+			logger.Errorf("Search index migration failed after %s: %v", time.Since(migStart).Round(time.Millisecond), migErr)
+		} else {
+			logger.Infof("Search index ready in %s", time.Since(migStart).Round(time.Millisecond))
 		}
 	}
 
-	exitChan := make(chan os.Signal, 1)
-	notifySignals(exitChan)
 	idleCtx, stopIdle := context.WithCancel(context.Background())
 	defer stopIdle()
 	idleExit := make(chan struct{})
-	// watchIdle calls this at most once
-	watchIdle(idleCtx, idle, idleExitDuration(), func() { close(idleExit) })
+	if migCtx.Err() == nil {
+		if c := pm.current(); c.Paired() {
+			// Already logged in, just connect; failures stay visible in /api/status
+			if err := c.Connect(); err != nil {
+				logger.Errorf("Failed to connect: %v", err)
+			}
+		} else if isTTY() {
+			// Interactive run: show a QR code right away. Headless runs wait for an explicit request.
+			if _, err := pm.StartPairing(); err != nil {
+				logger.Errorf("Failed to start pairing: %v", err)
+			}
+		}
+		// watchIdle calls this at most once
+		watchIdle(idleCtx, idle, idleExitDuration(), func() { close(idleExit) })
+	}
 
 	logln("REST server is running. Press Ctrl+C to disconnect and exit.")
 	select {
@@ -297,6 +339,9 @@ func run() int {
 	pm.current().Disconnect()
 	return 0
 }
+
+// runMigrateSearch is a seam so tests can replace the search migration.
+var runMigrateSearch = (*MessageStore).migrateSearch
 
 // selfUser returns the bare user digits of the logged-in account ("" before pairing).
 // selfJID is our own phone-number JID for storing a sent message; the send response's

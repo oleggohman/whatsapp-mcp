@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.mau.fi/whatsmeow"
@@ -47,6 +48,11 @@ type pairError struct {
 }
 
 func (e *pairError) Error() string { return e.msg }
+
+// errStarting is returned by the routes that would connect while the bridge still migrates.
+func errStarting() error {
+	return &pairError{status: http.StatusServiceUnavailable, msg: "bridge is starting"}
+}
 
 // waClient is what the pairing manager needs from the WhatsApp client, so tests can fake it.
 type waClient interface {
@@ -93,6 +99,10 @@ type pairingManager struct {
 	sess      *pairSession
 
 	phoneCodeActive bool // a phone pairing code was issued for the current session
+
+	// migrating is set while run builds the search index, before any client connects. Routes
+	// that would call Connect answer 503 meanwhile.
+	migrating atomic.Bool
 
 	startMu sync.Mutex // serialises session starts and reconnects
 	phoneMu sync.Mutex // serialises pair-phone requests
@@ -172,6 +182,9 @@ func (pm *pairingManager) endSessionLocked(s *pairSession) {
 
 // StartPairing arms a QR session if none is active. GetQRChannel must come before Connect.
 func (pm *pairingManager) StartPairing() (*pairSession, error) {
+	if pm.migrating.Load() {
+		return nil, errStarting()
+	}
 	pm.startMu.Lock()
 	defer pm.startMu.Unlock()
 
@@ -369,6 +382,9 @@ func (pm *pairingManager) onLoggedOut(src waClient) {
 
 // Reconnect explicitly reconnects a paired client (the only way out of "replaced").
 func (pm *pairingManager) Reconnect() error {
+	if pm.migrating.Load() {
+		return errStarting()
+	}
 	pm.startMu.Lock()
 	defer pm.startMu.Unlock()
 	pm.mu.Lock()
@@ -438,6 +454,9 @@ func mapPairPhoneError(err error) *pairError {
 
 // PairPhone starts a session if needed, waits for the first QR event and requests a phone pairing code.
 func (pm *pairingManager) PairPhone(ctx context.Context, raw string) (string, error) {
+	if pm.migrating.Load() {
+		return "", errStarting()
+	}
 	phone, err := normalizePhone(raw)
 	if err != nil {
 		return "", err

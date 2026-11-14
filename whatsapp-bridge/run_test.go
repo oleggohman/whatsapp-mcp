@@ -176,9 +176,11 @@ func (h *runHarness) wait(code <-chan int) int {
 	}
 }
 
-// registered waits until run reached its main loop (signals registered).
+// registered waits until run reached its main loop: signals are registered before the search
+// migration and Connect, so it also waits for the marker run logs after Connect / StartPairing.
 func (h *runHarness) registered() chan<- os.Signal {
 	h.t.Helper()
+	waitForText(h.t, h.logs, "REST server is running")
 	select {
 	case c := <-h.sig:
 		h.sig <- c // keep it for stop
@@ -632,5 +634,118 @@ func TestRunStoresMessagesSentThroughTheAPI(t *testing.T) {
 	if err := db.QueryRow("SELECT chat_jid, sender FROM messages WHERE id = 'RUN1'").Scan(&chat, &sender); err != nil ||
 		chat != "15551234@s.whatsapp.net" || sender != testSelfPN {
 		t.Fatalf("chat=%q sender=%q err=%v", chat, sender, err)
+	}
+}
+
+// blockingMigration replaces runMigrateSearch with a migration that blocks until its context is
+// cancelled. The returned channel reports the store it was called with.
+func blockingMigration(t *testing.T) <-chan *MessageStore {
+	t.Helper()
+	old := runMigrateSearch
+	t.Cleanup(func() { runMigrateSearch = old })
+	entered := make(chan *MessageStore, 1)
+	runMigrateSearch = func(ms *MessageStore, ctx context.Context) error {
+		entered <- ms
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return entered
+}
+
+func pairedConfigure(i int, c *fakeMeow) { c.paired, c.conn = true, false }
+
+func TestRunLogsMigrationFailureAndStillConnects(t *testing.T) {
+	h := newRunHarness(t, &fakeContainer{dev: &store.Device{}})
+	h.configure = pairedConfigure
+	old := runMigrateSearch
+	t.Cleanup(func() { runMigrateSearch = old })
+	runMigrateSearch = func(*MessageStore, context.Context) error { return io.ErrClosedPipe }
+	code := h.start()
+	h.registered()
+	if connects, _, _ := h.client(0).counts(); connects != 1 {
+		t.Fatalf("connects = %d, want 1 after a failed migration", connects)
+	}
+	waitForText(t, h.logs, "Search index migration failed after")
+	if c := h.stop(code); c != 0 {
+		t.Fatalf("code = %d", c)
+	}
+}
+
+// A signal after the migration finished still ends run through the final select.
+func TestRunSignalAfterMigrationExits(t *testing.T) {
+	h := newRunHarness(t, &fakeContainer{dev: &store.Device{}})
+	h.configure = pairedConfigure
+	old := runMigrateSearch
+	t.Cleanup(func() { runMigrateSearch = old })
+	calls := 0
+	runMigrateSearch = func(*MessageStore, context.Context) error { calls++; return nil }
+	code := h.start()
+	h.registered()
+	if c := h.stop(code); c != 0 {
+		t.Fatalf("code = %d", c)
+	}
+	if calls != 1 {
+		t.Fatalf("migration calls = %d", calls)
+	}
+	if connects, disconnects, _ := h.client(0).counts(); connects != 1 || disconnects != 1 {
+		t.Fatalf("connects=%d disconnects=%d", connects, disconnects)
+	}
+	h.restore()
+	if !strings.Contains(h.logs.String(), "Search index ready in") {
+		t.Fatalf("missing migration log:\n%s", h.logs.String())
+	}
+}
+
+// While the migration runs the connecting routes answer 503 and a stop request cancels it:
+// run skips Connect, returns 0 and closes the message store.
+func TestRunStopDuringMigration(t *testing.T) {
+	post := func(h *runHarness, path string) int {
+		h.t.Helper()
+		cl := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}, Timeout: settleTimeout}
+		resp, err := cl.Post("http://"+h.addr()+path, "application/json", strings.NewReader(`{"version":"`+bridgeVersion+`"}`))
+		if err != nil {
+			h.t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+	for _, how := range []string{"signal", "api shutdown"} {
+		t.Run(how, func(t *testing.T) {
+			h := newRunHarness(t, &fakeContainer{dev: &store.Device{}})
+			h.configure = pairedConfigure
+			entered := blockingMigration(t)
+			code := h.start()
+			var ms *MessageStore
+			select {
+			case ms = <-entered:
+			case <-time.After(settleTimeout):
+				t.Fatal("migration never started")
+			}
+			if st := post(h, "/api/reconnect"); st != http.StatusServiceUnavailable {
+				t.Fatalf("reconnect during migration = %d, want 503", st)
+			}
+			if how == "signal" {
+				select {
+				case c := <-h.sig:
+					c <- os.Interrupt
+				case <-time.After(settleTimeout):
+					t.Fatal("run never registered for signals")
+				}
+			} else if st := post(h, "/api/shutdown"); st != http.StatusOK {
+				t.Fatalf("shutdown status = %d", st)
+			}
+			if c := h.wait(code); c != 0 {
+				t.Fatalf("code = %d", c)
+			}
+			if connects, _, _ := h.client(0).counts(); connects != 0 {
+				t.Fatalf("connects = %d, want 0", connects)
+			}
+			if err := ms.db.Ping(); err == nil {
+				t.Fatal("message store must be closed after run returns")
+			}
+			if strings.Contains(h.logs.String(), "Search index") {
+				t.Fatalf("a cancelled migration must not log a result:\n%s", h.logs.String())
+			}
+		})
 	}
 }

@@ -27,6 +27,13 @@ type fakeConnector struct {
 	failCommit    bool
 	failExecAt    int // 1-based index of the Exec call that fails (0: none)
 	execCalls     int
+	failBegin     bool // txMode only: Begin fails
+
+	// failSQL fails the Prepare of any statement containing this text, so one chosen statement
+	// of a multi-statement flow can fail (Exec and Query both prepare first).
+	failSQL string
+	// queryRows, when set, answers a Query per statement text; the column count follows the row width.
+	queryRows func(query string) [][]driver.Value
 }
 
 func (c *fakeConnector) Connect(context.Context) (driver.Conn, error) { return &fakeConn{c}, nil }
@@ -38,16 +45,19 @@ func (fakeDriver) Open(string) (driver.Conn, error) { return nil, errors.New("us
 
 type fakeConn struct{ c *fakeConnector }
 
-func (f *fakeConn) Prepare(string) (driver.Stmt, error) {
+func (f *fakeConn) Prepare(query string) (driver.Stmt, error) {
 	f.c.prepareCalls++
 	if f.c.prepareCalls == f.c.failPrepareAt {
 		return nil, errors.New("prepare boom")
 	}
-	return &fakeStmt{f.c}, nil
+	if f.c.failSQL != "" && strings.Contains(query, f.c.failSQL) {
+		return nil, errors.New("statement boom")
+	}
+	return &fakeStmt{f.c, query}, nil
 }
 func (f *fakeConn) Close() error { return nil }
 func (f *fakeConn) Begin() (driver.Tx, error) {
-	if f.c.txMode {
+	if f.c.txMode && !f.c.failBegin {
 		return fakeTx{f.c}, nil
 	}
 	return nil, errors.New("begin boom")
@@ -63,7 +73,10 @@ func (t fakeTx) Commit() error {
 }
 func (fakeTx) Rollback() error { return nil }
 
-type fakeStmt struct{ c *fakeConnector }
+type fakeStmt struct {
+	c     *fakeConnector
+	query string
+}
 
 func (s *fakeStmt) Close() error  { return nil }
 func (s *fakeStmt) NumInput() int { return -1 }
@@ -77,18 +90,27 @@ func (s *fakeStmt) Exec([]driver.Value) (driver.Result, error) {
 	}
 	return nil, errors.New("exec not supported")
 }
-func (s *fakeStmt) Query([]driver.Value) (driver.Rows, error) { return &fakeRows{c: s.c}, nil }
-
-type fakeRows struct {
-	c *fakeConnector
-	i int
+func (s *fakeStmt) Query([]driver.Value) (driver.Rows, error) {
+	r := &fakeRows{c: s.c, cols: s.c.cols, rows: s.c.rows}
+	if s.c.queryRows != nil {
+		r.rows = s.c.queryRows(s.query)
+		r.cols = make([]string, len(r.rows[0]))
+	}
+	return r, nil
 }
 
-func (r *fakeRows) Columns() []string { return r.c.cols }
+type fakeRows struct {
+	c    *fakeConnector
+	cols []string
+	rows [][]driver.Value
+	i    int
+}
+
+func (r *fakeRows) Columns() []string { return r.cols }
 func (r *fakeRows) Close() error      { return nil }
 func (r *fakeRows) Next(dest []driver.Value) error {
-	if r.i < len(r.c.rows) {
-		copy(dest, r.c.rows[r.i])
+	if r.i < len(r.rows) {
+		copy(dest, r.rows[r.i])
 		r.i++
 		return nil
 	}
@@ -233,6 +255,56 @@ func TestStoreHistoryBatchFailsClosed(t *testing.T) {
 		}
 		if c.execCalls != 3 {
 			t.Fatalf("exec calls = %d, want chat upsert + 2 messages", c.execCalls)
+		}
+	})
+}
+
+func TestMigrateSearchFailsClosed(t *testing.T) {
+	counts := func(indexed, total int64) func(string) [][]driver.Value {
+		return func(string) [][]driver.Value { return [][]driver.Value{{indexed, total}} }
+	}
+	cases := []struct {
+		name string
+		c    *fakeConnector
+		want string
+	}{
+		{"index creation", &fakeConnector{txMode: true, failSQL: "idx_messages_chat_time"}, "create indexes: "},
+		{"begin", &fakeConnector{txMode: true, failBegin: true}, "begin: "},
+		{"fts table", &fakeConnector{txMode: true, failSQL: "CREATE VIRTUAL TABLE"}, "create messages_fts: "},
+		{"triggers", &fakeConnector{txMode: true, failSQL: "CREATE TRIGGER"}, "create messages_fts triggers: "},
+		{"count", &fakeConnector{txMode: true, failSQL: "messages_fts_docsize"}, "count indexed messages: "},
+		// The docsize count differs from the messages count, so the rebuild runs
+		{"rebuild", &fakeConnector{txMode: true, failSQL: "'rebuild'", queryRows: counts(1, 2)}, "rebuild messages_fts: "},
+		{"commit", &fakeConnector{txMode: true, failCommit: true, queryRows: counts(2, 2)}, "commit: "},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.c.queryRows == nil {
+				tc.c.queryRows = counts(0, 0)
+			}
+			err := fakeStore(tc.c).migrateSearch(context.Background())
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want %q", err, tc.want)
+			}
+		})
+	}
+	t.Run("matching counts skip the rebuild", func(t *testing.T) {
+		c := &fakeConnector{txMode: true, queryRows: counts(2, 2)}
+		if err := fakeStore(c).migrateSearch(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		// indexes, virtual table, triggers; no rebuild
+		if c.execCalls != 3 {
+			t.Fatalf("exec calls = %d, want 3", c.execCalls)
+		}
+	})
+	t.Run("mismatched counts rebuild", func(t *testing.T) {
+		c := &fakeConnector{txMode: true, queryRows: counts(0, 2)}
+		if err := fakeStore(c).migrateSearch(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if c.execCalls != 4 {
+			t.Fatalf("exec calls = %d, want 4", c.execCalls)
 		}
 	})
 }
