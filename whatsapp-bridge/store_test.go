@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -216,5 +217,35 @@ func TestNewMessageStoreUsesWAL(t *testing.T) {
 	var mode string
 	if err := s.db.QueryRow("PRAGMA journal_mode").Scan(&mode); err != nil || mode != "wal" {
 		t.Fatalf("journal_mode = %q, %v", mode, err)
+	}
+}
+
+func TestNewMessageStoreCreatesIndexes(t *testing.T) {
+	s := newTestStore(t)
+	// Reopening an existing database keeps the IF NOT EXISTS statements idempotent.
+	s2, err := NewMessageStore()
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.Close()
+
+	rows, err := s.db.Query(`EXPLAIN QUERY PLAN SELECT content FROM messages
+		WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?`, "a@s.whatsapp.net", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var plan string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan += detail + "\n"
+	}
+	if !strings.Contains(plan, "USING INDEX idx_messages_chat_time") &&
+		!strings.Contains(plan, "USING COVERING INDEX idx_messages_chat_time") {
+		t.Fatalf("plan does not use idx_messages_chat_time:\n%s", plan)
 	}
 }

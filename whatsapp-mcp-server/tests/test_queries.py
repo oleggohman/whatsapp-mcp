@@ -1,6 +1,8 @@
 """Query functions in whatsapp.py against a temp DB: filters, pagination, errors, stdout silence."""
 
 import sqlite3
+import time
+from datetime import datetime
 
 import pytest
 from conftest import make_messages_db, make_whatsapp_db
@@ -178,3 +180,46 @@ def test_store_path_with_uri_special_characters(tmp_path, monkeypatch):
     assert [c.jid for c in whatsapp.list_chats(query="15551234567")] == ["999000@lid"]
     with whatsapp._connect() as conn, pytest.raises(sqlite3.OperationalError):
         conn.execute("DELETE FROM chats")  # still read-only
+
+
+def test_list_messages_bounds_use_driver_layout_in_local_zone(store_dir, monkeypatch):
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+    try:
+        conn = sqlite3.connect(store_dir / "messages.db")
+        rows = [
+            ("z1", "2024-06-01 11:59:59-04:00", "before bound"),
+            ("z2", "2024-06-01 12:00:00-04:00", "on bound"),  # zero fraction, non-UTC offset
+            ("z3", "2024-06-01 12:00:00.5-04:00", "after bound"),  # trimmed fraction
+        ]
+        for mid, ts, content in rows:
+            conn.execute(
+                "INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me) "
+                "VALUES (?, ?, '111', ?, ?, 0)",
+                (mid, ALICE, content, ts),
+            )
+        conn.commit()
+        conn.close()
+
+        assert whatsapp._format_bound(datetime.fromisoformat("2024-06-01T12:00:00")) == (
+            "2024-06-01 12:00:00-04:00"
+        )
+        assert whatsapp._format_bound(datetime.fromisoformat("2024-06-01T12:00:00.250000")) == (
+            "2024-06-01 12:00:00.25-04:00"
+        )
+
+        out = whatsapp.list_messages(
+            chat_jid=ALICE, after="2024-06-01T12:00:00", include_context=False
+        )
+        assert "after bound" in out and "on bound" not in out and "before bound" not in out
+
+        out = whatsapp.list_messages(
+            chat_jid=ALICE,
+            after="2024-06-01T00:00:00",
+            before="2024-06-01T12:00:00",
+            include_context=False,
+        )
+        assert "before bound" in out and "on bound" not in out and "after bound" not in out
+    finally:
+        monkeypatch.undo()
+        time.tzset()

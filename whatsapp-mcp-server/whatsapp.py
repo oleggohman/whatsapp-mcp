@@ -222,6 +222,26 @@ def format_messages_list(messages: list[Message], show_chat_info: bool = True) -
     return output
 
 
+def _format_bound(value: datetime) -> str:
+    """Format a time bound like the bridge driver stores timestamps.
+
+    go-sqlite3 writes `2006-01-02 15:04:05.999999999-07:00` in the bridge's local
+    zone: trailing fractional zeros dropped, numeric offset, no `Z`. Comparison is
+    lexicographic on that text. A naive whole-second bound such as
+    `2024-06-01 12:00:00` is a prefix of a stored value, which is why it matched
+    before; bounds carrying an offset or a fraction missed rows. Order matches
+    chronology only for rows that share an offset: a DST fall-back hour can
+    disorder rows written across the transition. Rewriting stored values to UTC
+    is out of scope.
+    """
+    local = value.astimezone()  # naive values are read as local time
+    text = local.strftime("%Y-%m-%d %H:%M:%S")
+    if local.microsecond:
+        text += f".{local.microsecond:06d}".rstrip("0")
+    offset = local.strftime("%z")
+    return f"{text}{offset[:3]}:{offset[3:5]}"
+
+
 def list_messages(
     after: str | None = None,
     before: str | None = None,
@@ -258,7 +278,7 @@ def list_messages(
                     ) from e
 
                 where_clauses.append("messages.timestamp > ?")
-                params.append(after.isoformat(" "))
+                params.append(_format_bound(after))
 
             if before:
                 try:
@@ -269,7 +289,7 @@ def list_messages(
                     ) from e
 
                 where_clauses.append("messages.timestamp < ?")
-                params.append(before.isoformat(" "))
+                params.append(_format_bound(before))
 
             if sender_phone_number:
                 where_clauses.append("messages.sender = ?")

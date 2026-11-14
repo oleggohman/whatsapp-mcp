@@ -54,6 +54,9 @@ CREATE TABLE IF NOT EXISTS messages (
     PRIMARY KEY (id, chat_jid),
     FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 );
+CREATE INDEX IF NOT EXISTS idx_messages_chat_time ON messages (chat_jid, timestamp);
+CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages (timestamp);
+CREATE INDEX IF NOT EXISTS idx_messages_sender_time ON messages (sender, timestamp);
 """
 
 CHATS = [
