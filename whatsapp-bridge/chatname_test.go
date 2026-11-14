@@ -210,6 +210,9 @@ func TestMergeChatDuplicatesAndNames(t *testing.T) {
 	ctx := context.Background()
 	lids := newFakeLIDs(testLID, testPN)
 	ms := newTestStore(t)
+	if err := ms.migrateSearch(ctx); err != nil {
+		t.Fatal(err)
+	}
 	lid, pn := lidJID(testLID).String(), pnJID(testPN).String()
 	t1 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
 	t2 := t1.Add(time.Hour)
@@ -249,6 +252,16 @@ func TestMergeChatDuplicatesAndNames(t *testing.T) {
 	name, last, _ := chatRow(t, ms, pn)
 	if name != "Alice" || !last.Equal(t2) {
 		t.Fatalf("name=%q last=%v", name, last)
+	}
+	// The FTS index follows the moved and dropped rows
+	if indexed, total := ftsCounts(t, ms); indexed != 3 || total != 3 {
+		t.Fatalf("docsize = %d, messages = %d, want 3", indexed, total)
+	}
+	if got := ftsHits(t, ms, "dup-from-lid"); len(got) != 0 {
+		t.Fatalf("dropped duplicate still indexed: %v", got)
+	}
+	if got := ftsHits(t, ms, "only-lid"); len(got) != 1 || got[0] != "m2" {
+		t.Fatalf("MATCH only-lid = %v", got)
 	}
 
 	// Second run is a no-op.

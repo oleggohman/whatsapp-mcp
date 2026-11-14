@@ -166,7 +166,7 @@ def _name_resolver(conn: sqlite3.Connection) -> Callable[[str], str]:
     def resolve(sender: str) -> str:
         if sender in cache:
             return cache[sender]
-        user = sender.split("@")[0]
+        user = _user_part(sender)
         try:
             for jid in (f"{user}@s.whatsapp.net", f"{user}@lid"):
                 row = conn.execute("SELECT name FROM chats WHERE jid = ?", (jid,)).fetchone()

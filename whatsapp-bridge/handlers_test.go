@@ -421,6 +421,28 @@ func TestSyncConversationChatTimeOnlyMovesForward(t *testing.T) {
 	if _, last, _ := chatRow(t, ms, chat); !last.Equal(newest) {
 		t.Fatalf("last_message_time = %v, want %v", last, newest)
 	}
+
+	// A chunk at the stored time keeps it
+	if n := syncConversation(ctx, r, "me", ms, syncAt(chat, newest.Unix()), logger); n != 1 {
+		t.Fatalf("n = %d", n)
+	}
+	if _, last, _ := chatRow(t, ms, chat); !last.Equal(newest) {
+		t.Fatalf("last_message_time = %v, want %v", last, newest)
+	}
+
+	// A NULL stored time takes the batch time, and the resolved name overwrites a placeholder
+	other := pnJID(testPN2).String()
+	if _, err := ms.db.Exec("INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, NULL)", other, testPN2); err != nil {
+		t.Fatal(err)
+	}
+	conv := syncAt(other, newer.Unix())
+	conv.Name = proto.String("Fresh")
+	if n := syncConversation(ctx, r, "me", ms, conv, logger); n != 1 {
+		t.Fatalf("n = %d", n)
+	}
+	if name, last, _ := chatRow(t, ms, other); name != "Fresh" || !last.Equal(newer) {
+		t.Fatalf("name=%q last_message_time=%v, want Fresh %v", name, last, newer)
+	}
 }
 
 func TestSyncConversationEmptyMessagesStillUpsertChat(t *testing.T) {
@@ -457,11 +479,14 @@ func TestSyncConversationWithoutMessagesWritesNothing(t *testing.T) {
 func TestSyncConversationRollsBackWholeBatch(t *testing.T) {
 	ctx := context.Background()
 	r, ms := newTestResolver(t, nil, newFakeLIDs(), nil)
+	if err := ms.migrateSearch(ctx); err != nil {
+		t.Fatal(err)
+	}
 	chat := pnJID(testPN).String()
 	ts := time.Now().Unix()
 	conv := &waHistorySync.Conversation{ID: proto.String(chat)}
 	for i := 1; i <= 100; i++ {
-		conv.Messages = append(conv.Messages, histMsg(chat, fmt.Sprintf("id%03d", i), uint64(ts), text("hi")))
+		conv.Messages = append(conv.Messages, histMsg(chat, fmt.Sprintf("id%03d", i), uint64(ts), text(fmt.Sprintf("history row %03d", i))))
 	}
 	// The fake driver keeps no row state, so a conditional trigger fails the 50th insert
 	if _, err := ms.db.Exec("CREATE TRIGGER x BEFORE INSERT ON messages WHEN new.id = 'id050' BEGIN SELECT RAISE(ABORT, 'insert-boom'); END"); err != nil {
@@ -478,12 +503,21 @@ func TestSyncConversationRollsBackWholeBatch(t *testing.T) {
 	if _, _, ok := chatRow(t, ms, chat); ok {
 		t.Fatal("the chat upsert must be rolled back too")
 	}
+	if indexed, total := ftsCounts(t, ms); indexed != 0 || total != 0 {
+		t.Fatalf("after rollback: docsize = %d, messages = %d", indexed, total)
+	}
 
-	// Without the failure all 100 are stored in one batch
+	// Without the failure all 100 are stored in one batch, and the FTS index follows
 	if _, err := ms.db.Exec("DROP TRIGGER x"); err != nil {
 		t.Fatal(err)
 	}
 	if n := syncConversation(ctx, r, "me", ms, conv, newStderrLogger("T", "WARN")); n != 100 {
 		t.Fatalf("n = %d", n)
+	}
+	if indexed, total := ftsCounts(t, ms); indexed != 100 || total != 100 {
+		t.Fatalf("docsize = %d, messages = %d, want 100", indexed, total)
+	}
+	if got := ftsHits(t, ms, "row 050"); len(got) != 1 || got[0] != "id050" {
+		t.Fatalf("MATCH = %v", got)
 	}
 }

@@ -83,8 +83,8 @@ def test_list_messages_with_context_opens_one_connection(store_dir, monkeypatch)
 
     # Five hits with context still use a single connection.
     opened.clear()
-    out = whatsapp.list_messages(sender_phone_number="111", limit=5)
-    assert len(opened) == 1 and "second" in out
+    out = whatsapp.list_messages(limit=5)
+    assert len(opened) == 1 and "second" in out and "from lid" in out
 
 
 def test_sender_names_do_not_match_by_substring(tmp_path, monkeypatch):
@@ -284,6 +284,15 @@ def test_list_messages_bounds_use_driver_layout_in_local_zone(store_dir, monkeyp
             include_context=False,
         )
         assert "before bound" in out and "on bound" not in out and "after bound" not in out
+
+        # An aware bound is converted to the local zone before the text comparison
+        assert whatsapp._format_bound(datetime.fromisoformat("2024-06-01T16:00:00+00:00")) == (
+            "2024-06-01 12:00:00-04:00"
+        )
+        out = whatsapp.list_messages(
+            chat_jid=ALICE, after="2024-06-01T16:00:00+00:00", include_context=False
+        )
+        assert "after bound" in out and "on bound" not in out and "before bound" not in out
     finally:
         monkeypatch.undo()
         time.tzset()
@@ -412,12 +421,28 @@ def _search_ids(query):
     return _ids(whatsapp.list_messages(query=query, include_context=False))
 
 
-def test_search_substring_hebrew_and_case_folding(store_dir):
+def test_search_substring_hebrew_and_case_folding(store_dir, caplog):
     _add_search_message(store_dir, "h1", "הלכתי בבית")
-    out = whatsapp.list_messages(query="בית", include_context=False)
-    assert "הלכתי בבית" in out
-    assert "GROUP hello".lower() in whatsapp.list_messages(query="GROUP", include_context=False)
-    assert "hello" in whatsapp.list_messages(query="HELLO", include_context=False)
+    with caplog.at_level("WARNING", logger="whatsapp"):
+        out = whatsapp.list_messages(query="בית", include_context=False)
+        assert "הלכתי בבית" in out
+        assert "GROUP hello".lower() in whatsapp.list_messages(query="GROUP", include_context=False)
+        assert "hello" in whatsapp.list_messages(query="HELLO", include_context=False)
+    assert "falling back to LIKE" not in caplog.text
+
+
+def test_search_of_three_or_more_chars_is_answered_by_fts(store_dir, caplog):
+    # Empty the FTS index but keep messages: only the LIKE path could still find rows.
+    conn = sqlite3.connect(store_dir / "messages.db")
+    conn.execute("INSERT INTO messages_fts(messages_fts) VALUES ('delete-all')")
+    conn.commit()
+    conn.close()
+    with caplog.at_level("WARNING", logger="whatsapp"):
+        assert _search_ids("bob says") == ["No messages to display."]
+        assert _search_ids("hello") == ["No messages to display."]
+        # A 2-character query uses LIKE and still finds the row
+        assert "bob says hi" in whatsapp.list_messages(query="hi", include_context=False)
+    assert "falling back to LIKE" not in caplog.text
 
 
 def test_search_non_match(store_dir):
@@ -441,14 +466,16 @@ def test_search_short_query_uses_like(store_dir, monkeypatch):
     assert "second" in whatsapp.list_messages(query="d", include_context=False)
 
 
-def test_search_percent_is_literal_on_fts_path(store_dir):
+def test_search_percent_is_literal_on_fts_path(store_dir, caplog):
     _add_search_message(store_dir, "p1", "got 50% off today")
-    out = whatsapp.list_messages(query="50% off", include_context=False)
-    assert "got 50% off today" in out and "hello" not in out
-    # As a LIKE wildcard "hel%" would match "hello"; literally it matches nothing.
-    assert whatsapp.list_messages(query="hel%", include_context=False) == (
-        "No messages to display."
-    )
+    with caplog.at_level("WARNING", logger="whatsapp"):
+        out = whatsapp.list_messages(query="50% off", include_context=False)
+        assert "got 50% off today" in out and "hello" not in out
+        # As a LIKE wildcard "hel%" would match "hello"; literally it matches nothing.
+        assert whatsapp.list_messages(query="hel%", include_context=False) == (
+            "No messages to display."
+        )
+    assert "falling back to LIKE" not in caplog.text
 
 
 def _drop_fts(store_dir):
