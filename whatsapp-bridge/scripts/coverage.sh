@@ -7,7 +7,7 @@
 #   - lock_windows.go: built only for Windows (build-tagged), so it is not compiled on the
 #     darwin/linux hosts that run this script and never appears in the profile.
 #
-# Usage: bash scripts/coverage.sh   (from anywhere; extra args go to `go test`)
+# Usage: bash scripts/coverage.sh -tags sqlite_fts5   (from anywhere; extra args go to `go test`)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

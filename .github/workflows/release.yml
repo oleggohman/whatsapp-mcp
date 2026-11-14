@@ -35,14 +35,14 @@ jobs:
 
       - name: Test
         working-directory: whatsapp-bridge
-        run: go test -count=1 ./...
+        run: go test -count=1 -tags sqlite_fts5 ./...
 
       - name: Build
         working-directory: whatsapp-bridge
         env:
           EXT: ${{ matrix.goos == 'windows' && '.exe' || '' }}
         run: >-
-          go build -trimpath
+          go build -trimpath -tags sqlite_fts5
           -ldflags "-s -w -X main.bridgeVersion=${GITHUB_REF_NAME}"
           -o "whatsapp-bridge${EXT}"
 

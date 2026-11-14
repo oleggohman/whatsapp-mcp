@@ -345,6 +345,7 @@ def test_build_is_atomic_and_captured(env, monkeypatch, capfd):
     assert [p.name for p in env["tmp"].iterdir() if ".tmp." in p.name] == []
     args = (env["tmp"] / "go-args.log").read_text()
     assert "-X main.bridgeVersion=" in args and "build" in args
+    assert "-tags sqlite_fts5" in args
     assert bridge_manager.built_version(str(target)) == bridge_manager.source_hash(str(env["src"]))
     assert "noisy build output" not in capfd.readouterr().out  # never inherited stdout
 

@@ -296,7 +296,17 @@ def build_bridge(binary: str, src: str) -> None:
     os.makedirs(os.path.dirname(binary), exist_ok=True)
     tmp = f"{binary}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
     tmp_hash = _hash_sidecar(tmp)
-    cmd = [go, "build", "-ldflags", f"-X main.bridgeVersion={version}", "-o", tmp, "."]
+    cmd = [
+        go,
+        "build",
+        "-tags",
+        "sqlite_fts5",
+        "-ldflags",
+        f"-X main.bridgeVersion={version}",
+        "-o",
+        tmp,
+        ".",
+    ]
     logger.info("building bridge: %s (cwd %s)", " ".join(cmd), src)
     try:
         with _build_lock:

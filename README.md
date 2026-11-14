@@ -205,7 +205,7 @@ Set `WHATSAPP_BRIDGE_AUTOSTART=0` in the server's environment to stop it from bu
 
 ```bash
 cd whatsapp-bridge
-CGO_ENABLED=1 go run .      # or build it and run the binary
+CGO_ENABLED=1 go run -tags sqlite_fts5 .      # or build it and run the binary
 ```
 
 When stderr is a terminal, the bridge prints a pairing QR code right away. Otherwise pair with the tools. Use the same `WHATSAPP_STORE_DIR`, `WHATSAPP_BRIDGE_ADDR` and token on both sides. In this mode the server never builds or restarts the bridge and never reports `restart_needed`.
@@ -270,7 +270,7 @@ See also the [MCP documentation](https://modelcontextprotocol.io/quickstart/serv
 ## Development
 
 ```bash
-cd whatsapp-bridge && go test ./... && golangci-lint run
+cd whatsapp-bridge && go test -tags sqlite_fts5 ./... && golangci-lint run
 cd whatsapp-mcp-server && uv run pytest && uv run ruff check .
 ```
 

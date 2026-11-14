@@ -34,15 +34,15 @@ jobs:
         with:
           go-version-file: whatsapp-bridge/go.mod
           cache-dependency-path: whatsapp-bridge/go.sum
-      - run: go vet ./...
-      - run: go test -race -count=1 ./...
+      - run: go vet -tags sqlite_fts5 ./...
+      - run: go test -race -count=1 -tags sqlite_fts5 ./...
         if: runner.os != 'Windows'
       # The release workflow tests on Windows too; catch breaks here before a tag is pushed.
-      - run: go test -count=1 ./...
+      - run: go test -count=1 -tags sqlite_fts5 ./...
         if: runner.os == 'Windows'
       - name: Coverage gate (100%)
         if: runner.os != 'Windows' # Unix-only files (lock, signals) are not built there
-        run: bash scripts/coverage.sh
+        run: bash scripts/coverage.sh -tags sqlite_fts5
 
   golangci-lint:
     runs-on: ubuntu-latest
