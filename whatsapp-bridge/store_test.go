@@ -155,6 +155,33 @@ func TestStoreMessageUpsert(t *testing.T) {
 	}
 }
 
+// The upsert must keep the rowid: an external-content FTS index is keyed on it.
+func TestStoreMessageUpsertKeepsRowid(t *testing.T) {
+	s := newTestStore(t)
+	chat := "a@s.whatsapp.net"
+	ts := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	if err := s.StoreChat(chat, "Alice", ts); err != nil {
+		t.Fatal(err)
+	}
+	rowid := func() int64 {
+		var id int64
+		if err := s.db.QueryRow("SELECT rowid FROM messages WHERE id = 'm1'").Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	if err := s.StoreMessage("m1", chat, "alice", "first", ts, false, "", "", "", nil, nil, nil, 0); err != nil {
+		t.Fatal(err)
+	}
+	before := rowid()
+	if err := s.StoreMessage("m1", chat, "alice", "edited", ts, false, "", "", "", nil, nil, nil, 0); err != nil {
+		t.Fatal(err)
+	}
+	if after := rowid(); after != before {
+		t.Fatalf("rowid changed from %d to %d", before, after)
+	}
+}
+
 func TestStoreMessageRequiresChat(t *testing.T) {
 	s := newTestStore(t)
 	// Foreign keys are on, so a message for an unknown chat is rejected.

@@ -19,6 +19,14 @@ type fakeConnector struct {
 	cols    []string
 	rows    [][]driver.Value
 	nextErr error // returned by Next once the canned rows are consumed (io.EOF when nil)
+
+	// Transaction mode: Begin, Prepare, Exec and Commit succeed unless the matching fault is set.
+	txMode        bool
+	failPrepareAt int // 1-based index of the Prepare call that fails (0: none); tx.Exec prepares too
+	prepareCalls  int
+	failCommit    bool
+	failExecAt    int // 1-based index of the Exec call that fails (0: none)
+	execCalls     int
 }
 
 func (c *fakeConnector) Connect(context.Context) (driver.Conn, error) { return &fakeConn{c}, nil }
@@ -30,15 +38,43 @@ func (fakeDriver) Open(string) (driver.Conn, error) { return nil, errors.New("us
 
 type fakeConn struct{ c *fakeConnector }
 
-func (f *fakeConn) Prepare(string) (driver.Stmt, error) { return &fakeStmt{f.c}, nil }
-func (f *fakeConn) Close() error                        { return nil }
-func (f *fakeConn) Begin() (driver.Tx, error)           { return nil, errors.New("begin boom") }
+func (f *fakeConn) Prepare(string) (driver.Stmt, error) {
+	f.c.prepareCalls++
+	if f.c.prepareCalls == f.c.failPrepareAt {
+		return nil, errors.New("prepare boom")
+	}
+	return &fakeStmt{f.c}, nil
+}
+func (f *fakeConn) Close() error { return nil }
+func (f *fakeConn) Begin() (driver.Tx, error) {
+	if f.c.txMode {
+		return fakeTx{f.c}, nil
+	}
+	return nil, errors.New("begin boom")
+}
+
+type fakeTx struct{ c *fakeConnector }
+
+func (t fakeTx) Commit() error {
+	if t.c.failCommit {
+		return errors.New("commit boom")
+	}
+	return nil
+}
+func (fakeTx) Rollback() error { return nil }
 
 type fakeStmt struct{ c *fakeConnector }
 
 func (s *fakeStmt) Close() error  { return nil }
 func (s *fakeStmt) NumInput() int { return -1 }
 func (s *fakeStmt) Exec([]driver.Value) (driver.Result, error) {
+	if s.c.txMode {
+		s.c.execCalls++
+		if s.c.execCalls == s.c.failExecAt {
+			return nil, errors.New("exec boom")
+		}
+		return driver.RowsAffected(1), nil
+	}
 	return nil, errors.New("exec not supported")
 }
 func (s *fakeStmt) Query([]driver.Value) (driver.Rows, error) { return &fakeRows{c: s.c}, nil }
@@ -165,6 +201,38 @@ func TestStoreRowIterationFailures(t *testing.T) {
 		s := fakeStore(&fakeConnector{cols: []string{"a"}, rows: [][]driver.Value{{"x"}}})
 		if _, err := s.chatsWithName(""); err == nil || !strings.Contains(err.Error(), "destination arguments") {
 			t.Fatalf("err = %v", err)
+		}
+	})
+}
+
+func TestStoreHistoryBatchFailsClosed(t *testing.T) {
+	msgs := []historyMessage{{id: "a", content: "x"}, {id: "b", content: "y"}}
+	cases := []struct {
+		name string
+		c    *fakeConnector
+		want string
+	}{
+		{"begin", &fakeConnector{}, "begin: "},
+		{"chat upsert", &fakeConnector{txMode: true, failExecAt: 1}, "store chat: "},
+		{"prepare", &fakeConnector{txMode: true, failPrepareAt: 2}, "prepare: "},
+		{"message insert", &fakeConnector{txMode: true, failExecAt: 3}, "store message: "},
+		{"commit", &fakeConnector{txMode: true, failCommit: true}, "commit: "},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := fakeStore(tc.c).storeHistoryBatch("a@s.whatsapp.net", "A", time.Now(), msgs)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want %q", err, tc.want)
+			}
+		})
+	}
+	t.Run("success", func(t *testing.T) {
+		c := &fakeConnector{txMode: true}
+		if err := fakeStore(c).storeHistoryBatch("a@s.whatsapp.net", "A", time.Now(), msgs); err != nil {
+			t.Fatal(err)
+		}
+		if c.execCalls != 3 {
+			t.Fatalf("exec calls = %d, want chat upsert + 2 messages", c.execCalls)
 		}
 	})
 }

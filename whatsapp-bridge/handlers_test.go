@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -300,6 +301,8 @@ func TestSyncConversationMergesSeparateLIDJIDField(t *testing.T) {
 	captureStderr(t, func() { syncConversation(ctx, r, "me", ms, conv, logger) })
 }
 
+// A failing insert rolls the whole conversation back, so nothing is stored and the failure
+// is logged once for the conversation.
 func TestSyncConversationLogsStoreFailure(t *testing.T) {
 	ctx := context.Background()
 	r, ms := newTestResolver(t, nil, newFakeLIDs(), nil)
@@ -310,7 +313,7 @@ func TestSyncConversationLogsStoreFailure(t *testing.T) {
 	conv := &waHistorySync.Conversation{ID: proto.String(chat), Messages: []*waHistorySync.HistorySyncMsg{histMsg(chat, "a", uint64(time.Now().Unix()), text("hi"))}}
 	var n int
 	logs := captureStderr(t, func() { n = syncConversation(ctx, r, "me", ms, conv, newStderrLogger("T", "WARN")) })
-	if n != 0 || !strings.Contains(logs, "Failed to store history message:") || !strings.Contains(logs, "insert-boom") {
+	if n != 0 || !strings.Contains(logs, "Failed to store history conversation") || !strings.Contains(logs, "insert-boom") {
 		t.Fatalf("n=%d logs=%q", n, logs)
 	}
 }
@@ -324,7 +327,7 @@ func TestSyncConversationLogsChatStoreFailure(t *testing.T) {
 	chat := pnJID(testPN).String()
 	conv := &waHistorySync.Conversation{ID: proto.String(chat), Messages: []*waHistorySync.HistorySyncMsg{histMsg(chat, "a", uint64(time.Now().Unix()), text("hi"))}}
 	logs := captureStderr(t, func() { syncConversation(ctx, r, "me", ms, conv, newStderrLogger("T", "WARN")) })
-	if !strings.Contains(logs, "Failed to store chat:") || !strings.Contains(logs, "chat-boom") {
+	if !strings.Contains(logs, "Failed to store history conversation") || !strings.Contains(logs, "chat-boom") {
 		t.Fatalf("logs=%q", logs)
 	}
 }
@@ -379,5 +382,108 @@ func TestRequestHistorySync(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// syncAt builds a one-text conversation for chat whose messages carry the given timestamps.
+func syncAt(chat string, tss ...int64) *waHistorySync.Conversation {
+	conv := &waHistorySync.Conversation{ID: proto.String(chat)}
+	for i, ts := range tss {
+		conv.Messages = append(conv.Messages, histMsg(chat, fmt.Sprintf("m%d-%d", ts, i), uint64(ts), text("hi")))
+	}
+	return conv
+}
+
+func TestSyncConversationChatTimeOnlyMovesForward(t *testing.T) {
+	ctx := context.Background()
+	r, ms := newTestResolver(t, nil, newFakeLIDs(), nil)
+	logger := newStderrLogger("T", "WARN")
+	chat := pnJID(testPN).String()
+	// Local zone: stored times compare as text, so the offsets must match
+	newer := time.Date(2026, 5, 6, 7, 8, 9, 0, time.Local)
+	if err := ms.StoreChat(chat, "Stored", newer); err != nil {
+		t.Fatal(err)
+	}
+
+	// An older chunk must not move the stored time backward
+	if n := syncConversation(ctx, r, "me", ms, syncAt(chat, newer.Add(-time.Hour).Unix()), logger); n != 1 {
+		t.Fatalf("n = %d", n)
+	}
+	if _, last, _ := chatRow(t, ms, chat); !last.Equal(newer) {
+		t.Fatalf("last_message_time = %v, want %v", last, newer)
+	}
+
+	// A newer chunk moves it to the newest timestamp of the batch, whatever the message order
+	newest := newer.Add(2 * time.Hour)
+	if n := syncConversation(ctx, r, "me", ms, syncAt(chat, newer.Add(time.Hour).Unix(), newest.Unix()), logger); n != 2 {
+		t.Fatalf("n = %d", n)
+	}
+	if _, last, _ := chatRow(t, ms, chat); !last.Equal(newest) {
+		t.Fatalf("last_message_time = %v, want %v", last, newest)
+	}
+}
+
+func TestSyncConversationEmptyMessagesStillUpsertChat(t *testing.T) {
+	ctx := context.Background()
+	r, ms := newTestResolver(t, nil, newFakeLIDs(), nil)
+	chat := pnJID(testPN).String()
+	conv := &waHistorySync.Conversation{
+		ID:       proto.String(chat),
+		Messages: []*waHistorySync.HistorySyncMsg{histMsg(chat, "empty", uint64(time.Now().Unix()), &waE2E.Message{})},
+	}
+	if n := syncConversation(ctx, r, "me", ms, conv, newStderrLogger("T", "WARN")); n != 0 {
+		t.Fatalf("n = %d", n)
+	}
+	if _, _, ok := chatRow(t, ms, chat); !ok || countMsgs(t, ms, chat) != 0 {
+		t.Fatal("the chat row must exist with no messages")
+	}
+}
+
+func TestSyncConversationWithoutMessagesWritesNothing(t *testing.T) {
+	ctx := context.Background()
+	r, ms := newTestResolver(t, nil, newFakeLIDs(), nil)
+	chat := pnJID(testPN).String()
+	for _, msgs := range [][]*waHistorySync.HistorySyncMsg{nil, {nil}} {
+		conv := &waHistorySync.Conversation{ID: proto.String(chat), Messages: msgs}
+		if n := syncConversation(ctx, r, "me", ms, conv, newStderrLogger("T", "WARN")); n != 0 {
+			t.Fatalf("n = %d", n)
+		}
+	}
+	if _, _, ok := chatRow(t, ms, chat); ok {
+		t.Fatal("no chat row may be written")
+	}
+}
+
+func TestSyncConversationRollsBackWholeBatch(t *testing.T) {
+	ctx := context.Background()
+	r, ms := newTestResolver(t, nil, newFakeLIDs(), nil)
+	chat := pnJID(testPN).String()
+	ts := time.Now().Unix()
+	conv := &waHistorySync.Conversation{ID: proto.String(chat)}
+	for i := 1; i <= 100; i++ {
+		conv.Messages = append(conv.Messages, histMsg(chat, fmt.Sprintf("id%03d", i), uint64(ts), text("hi")))
+	}
+	// The fake driver keeps no row state, so a conditional trigger fails the 50th insert
+	if _, err := ms.db.Exec("CREATE TRIGGER x BEFORE INSERT ON messages WHEN new.id = 'id050' BEGIN SELECT RAISE(ABORT, 'insert-boom'); END"); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	logs := captureStderr(t, func() { n = syncConversation(ctx, r, "me", ms, conv, newStderrLogger("T", "WARN")) })
+	if n != 0 || !strings.Contains(logs, "insert-boom") {
+		t.Fatalf("n=%d logs=%q", n, logs)
+	}
+	if got := countMsgs(t, ms, chat); got != 0 {
+		t.Fatalf("%d messages visible after rollback", got)
+	}
+	if _, _, ok := chatRow(t, ms, chat); ok {
+		t.Fatal("the chat upsert must be rolled back too")
+	}
+
+	// Without the failure all 100 are stored in one batch
+	if _, err := ms.db.Exec("DROP TRIGGER x"); err != nil {
+		t.Fatal(err)
+	}
+	if n := syncConversation(ctx, r, "me", ms, conv, newStderrLogger("T", "WARN")); n != 100 {
+		t.Fatalf("n = %d", n)
 	}
 }

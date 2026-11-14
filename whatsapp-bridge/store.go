@@ -119,6 +119,75 @@ func (store *MessageStore) Close() error {
 	return store.db.Close()
 }
 
+// upsertMessageSQL inserts a message or updates it in place. Unlike INSERT OR REPLACE it keeps
+// the row's rowid stable, which an external-content FTS index keyed on rowid relies on.
+const upsertMessageSQL = `INSERT INTO messages
+	(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT(id, chat_jid) DO UPDATE SET
+		sender = excluded.sender,
+		content = excluded.content,
+		timestamp = excluded.timestamp,
+		is_from_me = excluded.is_from_me,
+		media_type = excluded.media_type,
+		filename = excluded.filename,
+		url = excluded.url,
+		media_key = excluded.media_key,
+		file_sha256 = excluded.file_sha256,
+		file_enc_sha256 = excluded.file_enc_sha256,
+		file_length = excluded.file_length`
+
+// upsertHistoryChatSQL upserts a chat for a history batch. The stored last_message_time only
+// moves forward (compared as stored text, like every timestamp in this table).
+const upsertHistoryChatSQL = `INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)
+	ON CONFLICT(jid) DO UPDATE SET
+		name = excluded.name,
+		last_message_time = CASE
+			WHEN chats.last_message_time IS NULL
+			  OR chats.last_message_time < excluded.last_message_time
+			THEN excluded.last_message_time
+			ELSE chats.last_message_time
+		END`
+
+// historyMessage is one history-sync message ready to be stored.
+type historyMessage struct {
+	id, sender, content                 string
+	timestamp                           time.Time
+	isFromMe                            bool
+	mediaType, filename, url            string
+	mediaKey, fileSHA256, fileEncSHA256 []byte
+	fileLength                          uint64
+}
+
+// storeHistoryBatch writes one conversation in a single transaction: the chat upsert first
+// (the foreign key needs the chat row), then every message. Any failure rolls everything back.
+func (store *MessageStore) storeHistoryBatch(chatJID, name string, latest time.Time, msgs []historyMessage) error {
+	tx, err := store.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.Exec(upsertHistoryChatSQL, chatJID, name, latest); err != nil {
+		return fmt.Errorf("store chat: %w", err)
+	}
+	stmt, err := tx.Prepare(upsertMessageSQL)
+	if err != nil {
+		return fmt.Errorf("prepare: %w", err)
+	}
+	defer func() { _ = stmt.Close() }()
+	for _, m := range msgs {
+		if _, err := stmt.Exec(m.id, chatJID, m.sender, m.content, m.timestamp, m.isFromMe,
+			m.mediaType, m.filename, m.url, m.mediaKey, m.fileSHA256, m.fileEncSHA256, m.fileLength); err != nil {
+			return fmt.Errorf("store message: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+	return nil
+}
+
 // Store a chat in the database
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
 	_, err := store.db.Exec(
@@ -137,9 +206,7 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 	}
 
 	_, err := store.db.Exec(
-		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		upsertMessageSQL,
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
 	)
 	return err

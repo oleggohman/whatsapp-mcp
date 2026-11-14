@@ -399,110 +399,96 @@ func syncConversation(ctx context.Context, r *chatResolver, self string, message
 
 	// Process messages
 	messages := conversation.Messages
-	if len(messages) > 0 {
-		// Update chat with latest message timestamp
-		latestMsg := messages[0]
-		if latestMsg == nil || latestMsg.Message == nil {
-			return syncedCount
-		}
-
-		// Get timestamp from message info
-		timestamp := time.Time{}
-		if ts := latestMsg.Message.GetMessageTimestamp(); ts != 0 {
-			timestamp = time.Unix(int64(ts), 0) //nolint:gosec // G115: seconds since epoch, far below MaxInt64
-		} else {
-			return syncedCount
-		}
-
-		if err := messageStore.StoreChat(chatJID, name, timestamp); err != nil {
-			logger.Warnf("Failed to store chat: %v", err)
-		}
-
-		// Store messages
-		for _, msg := range messages {
-			if msg == nil || msg.Message == nil {
-				continue
-			}
-
-			// Extract text content
-			var content string
-			if msg.Message.Message != nil {
-				if conv := msg.Message.Message.GetConversation(); conv != "" {
-					content = conv
-				} else if ext := msg.Message.Message.GetExtendedTextMessage(); ext != nil {
-					content = ext.GetText()
-				}
-			}
-
-			// Extract media info
-			var mediaType, filename, url string
-			var mediaKey, fileSHA256, fileEncSHA256 []byte
-			var fileLength uint64
-
-			if msg.Message.Message != nil {
-				mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message)
-			}
-
-			// Log the message content for debugging
-			logger.Infof("Message: %d text bytes, Media Type: %v", len(content), mediaType)
-
-			// Skip messages with no content and no media
-			if content == "" && mediaType == "" {
-				continue
-			}
-
-			// Determine sender (always bare user digits)
-			isFromMe := false
-			participant := ""
-			if msg.Message.Key != nil {
-				if msg.Message.Key.FromMe != nil {
-					isFromMe = *msg.Message.Key.FromMe
-				}
-				if msg.Message.Key.Participant != nil {
-					participant = *msg.Message.Key.Participant
-				}
-			}
-			sender := historySender(ctx, r.lidStore(), participant, isFromMe, jid, self)
-
-			// Store message
-			msgID := ""
-			if msg.Message.Key != nil && msg.Message.Key.ID != nil {
-				msgID = *msg.Message.Key.ID
-			}
-
-			// Get message timestamp
-			timestamp := time.Time{}
-			if ts := msg.Message.GetMessageTimestamp(); ts != 0 {
-				timestamp = time.Unix(int64(ts), 0) //nolint:gosec // G115: seconds since epoch, far below MaxInt64
-			} else {
-				continue
-			}
-
-			err = messageStore.StoreMessage(
-				msgID,
-				chatJID,
-				sender,
-				content,
-				timestamp,
-				isFromMe,
-				mediaType,
-				filename,
-				url,
-				mediaKey,
-				fileSHA256,
-				fileEncSHA256,
-				fileLength,
-			)
-			if err != nil {
-				logger.Warnf("Failed to store history message: %v", err)
-			} else {
-				syncedCount++
-				// Log metadata only, never message bodies or file names
-				logger.Infof("Stored message: [%s] %s -> %s: %d text bytes, media %q",
-					timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, len(content), mediaType)
-			}
-		}
+	if len(messages) == 0 {
+		return syncedCount
 	}
+	latestMsg := messages[0]
+	if latestMsg == nil || latestMsg.Message == nil || latestMsg.Message.GetMessageTimestamp() == 0 {
+		return syncedCount
+	}
+
+	// The chat time is the newest timestamp in the batch; the store keeps the newer of that
+	// and the stored value, so an older chunk never moves the chat backward.
+	latest := time.Time{}
+	var batch []historyMessage
+	for _, msg := range messages {
+		if msg == nil || msg.Message == nil {
+			continue
+		}
+
+		// Get message timestamp
+		ts := msg.Message.GetMessageTimestamp()
+		if ts == 0 {
+			continue
+		}
+		timestamp := time.Unix(int64(ts), 0) //nolint:gosec // G115: seconds since epoch, far below MaxInt64
+		if timestamp.After(latest) {
+			latest = timestamp
+		}
+
+		// Extract text content
+		var content string
+		if msg.Message.Message != nil {
+			if conv := msg.Message.Message.GetConversation(); conv != "" {
+				content = conv
+			} else if ext := msg.Message.Message.GetExtendedTextMessage(); ext != nil {
+				content = ext.GetText()
+			}
+		}
+
+		// Extract media info
+		var mediaType, filename, url string
+		var mediaKey, fileSHA256, fileEncSHA256 []byte
+		var fileLength uint64
+
+		if msg.Message.Message != nil {
+			mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message)
+		}
+
+		// Log the message content for debugging
+		logger.Debugf("Message: %d text bytes, Media Type: %v", len(content), mediaType)
+
+		// Skip messages with no content and no media
+		if content == "" && mediaType == "" {
+			continue
+		}
+
+		// Determine sender (always bare user digits)
+		isFromMe := false
+		participant := ""
+		if msg.Message.Key != nil {
+			if msg.Message.Key.FromMe != nil {
+				isFromMe = *msg.Message.Key.FromMe
+			}
+			if msg.Message.Key.Participant != nil {
+				participant = *msg.Message.Key.Participant
+			}
+		}
+		sender := historySender(ctx, r.lidStore(), participant, isFromMe, jid, self)
+
+		msgID := ""
+		if msg.Message.Key != nil && msg.Message.Key.ID != nil {
+			msgID = *msg.Message.Key.ID
+		}
+
+		// Log metadata only, never message bodies or file names
+		logger.Debugf("Storing message: [%s] %s -> %s: %d text bytes, media %q",
+			timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, len(content), mediaType)
+		batch = append(batch, historyMessage{
+			id: msgID, sender: sender, content: content, timestamp: timestamp, isFromMe: isFromMe,
+			mediaType: mediaType, filename: filename, url: url,
+			mediaKey: mediaKey, fileSHA256: fileSHA256, fileEncSHA256: fileEncSHA256, fileLength: fileLength,
+		})
+	}
+
+	// One transaction per conversation: the repair lock is held for a single commit, and a
+	// failed insert rolls the whole conversation back, chat upsert included.
+	if err := messageStore.storeHistoryBatch(chatJID, name, latest, batch); err != nil {
+		logger.Warnf("Failed to store history conversation %s: %v", chatJID, err)
+		return syncedCount
+	}
+	syncedCount = len(batch)
+	logger.Infof("Stored message batch: %d messages -> %s", syncedCount, chatJID)
 	return syncedCount
 }
 
