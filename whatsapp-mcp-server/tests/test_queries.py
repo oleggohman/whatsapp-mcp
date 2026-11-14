@@ -87,6 +87,30 @@ def test_list_messages_with_context_opens_one_connection(store_dir, monkeypatch)
     assert len(opened) == 1 and "second" in out and "from lid" in out
 
 
+def test_list_messages_context_survives_concurrent_chat_merge(store_dir, monkeypatch):
+    # The bridge's LID -> PN merge moves rows to another chat in its own transaction. A move
+    # committed between the hit query and the context lookup must not fail the listing.
+    real = whatsapp._name_resolver
+
+    def merge_then_resolve(conn):
+        writer = sqlite3.connect(whatsapp._db_path())
+        writer.execute(
+            "INSERT INTO chats VALUES ('15550001111@s.whatsapp.net', 'Alice PN', "
+            "'2025-01-01 10:02:00+00:00')"
+        )
+        writer.execute(
+            "UPDATE messages SET chat_jid = '15550001111@s.whatsapp.net' "
+            "WHERE chat_jid = '111@s.whatsapp.net'"
+        )
+        writer.commit()
+        writer.close()
+        return real(conn)
+
+    monkeypatch.setattr(whatsapp, "_name_resolver", merge_then_resolve)
+    out = whatsapp.list_messages(query="second", context_before=1, context_after=1)
+    assert out.index("hello") < out.index("second") < out.index("third")
+
+
 def test_sender_names_do_not_match_by_substring(tmp_path, monkeypatch):
     db = tmp_path / "messages.db"
     make_messages_db(db)

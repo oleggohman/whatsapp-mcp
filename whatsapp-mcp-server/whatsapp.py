@@ -294,6 +294,9 @@ def list_messages(
     """Get messages matching the specified criteria with optional context."""
     try:
         with _connect() as conn:
+            # One read transaction: every query below sees the same WAL snapshot, so a
+            # bridge LID -> PN merge cannot move a hit between the listing and its context.
+            conn.execute("BEGIN")
             cursor = conn.cursor()
 
             # Build base query
