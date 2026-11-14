@@ -20,11 +20,26 @@ published in the [oleggohman/cc-things](https://github.com/oleggohman/cc-things)
   listening and before WhatsApp connects. Search uses `LIKE` until that finishes. During that
   window `POST /api/reconnect`, `POST /api/start-pairing` and `POST /api/pair-phone` return 503
   `bridge is starting` and do not connect. `POST /api/send` keeps its "Not connected" answer.
+  On later starts an FTS index that missed writes (a missing trigger, or fewer indexed rows than
+  messages) is dropped before it is rebuilt, so search uses `LIKE` during the rebuild and after a
+  failed one instead of silently missing messages. An index FTS5 can no longer open, or one that
+  fails the FTS5 `integrity-check` (damaged segments, records or shadow tables), is treated the
+  same way.
+  Its triggers are dropped first, so writes to `messages` keep working even when the broken table
+  itself cannot be dropped; the bridge then logs the error on each start, connects, and search
+  stays on `LIKE`. Triggers left behind by a dropped `messages_fts` are removed before anything
+  else, even when the start is cancelled.
+- Every start runs the FTS5 `integrity-check` on an existing `messages_fts` before WhatsApp
+  connects, in its content-checking form (`rank` 1): it re-reads every message and compares its
+  tokens with the index, because the plain check misses damage that makes writes fail. It reads
+  the whole index and `messages`, so it adds time to each start that grows with the archive
+  (about 1.4 times the plain check; roughly 0.2 s per 100,000 short messages, half a full
+  rebuild); `bridge.log` records how long it took.
 - Text search: queries of 3 or more characters use FTS5 trigram and still match substrings
   (including Hebrew), with Unicode case folding. Shorter queries use `LIKE`. `%` and `_` in a
   query are now literal characters on every path; before they acted as `LIKE` wildcards. If
-  `messages_fts` is missing or `MATCH` fails, search falls back to `LIKE` and does not return an
-  empty list.
+  `messages_fts` or any of its three triggers is missing, or `MATCH` fails, search falls back to
+  `LIKE` and does not return an empty list.
 - `list_messages` `after` / `before` are strict (`>` and `<`) and use the stored timestamp layout.
   The MCP server converts the bound to its own local time zone (a naive value is read as local
   time), so the MCP server and the bridge must run in the same time zone. Offset-aware values and

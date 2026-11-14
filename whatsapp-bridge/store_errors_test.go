@@ -260,28 +260,39 @@ func TestStoreHistoryBatchFailsClosed(t *testing.T) {
 }
 
 func TestMigrateSearchFailsClosed(t *testing.T) {
-	// counts answers the migration's count query: all three triggers present, then docsize and messages
-	counts := func(indexed, total int64) func(string) [][]driver.Value {
-		return func(string) [][]driver.Value { return [][]driver.Value{{int64(3), indexed, total}} }
+	// state answers the migration's two queries: whether messages_fts exists and how many of its
+	// triggers do, then the docsize and messages counts of an existing index plus the probe
+	state := func(exists, triggers, indexed, total int64) func(string) [][]driver.Value {
+		return func(q string) [][]driver.Value {
+			if strings.Contains(q, "type = 'table'") {
+				return [][]driver.Value{{exists, triggers}}
+			}
+			return [][]driver.Value{{indexed, total, int64(1)}}
+		}
 	}
+	absent := state(0, 0, 0, 0)
+	fresh := state(1, 3, 2, 2)
+	stale := state(1, 3, 1, 2)
 	cases := []struct {
 		name string
 		c    *fakeConnector
 		want string
 	}{
 		{"index creation", &fakeConnector{txMode: true, failSQL: "idx_messages_chat_time"}, "create indexes: "},
+		{"existence check", &fakeConnector{txMode: true, failSQL: "type = 'table'"}, "check messages_fts: "},
+		{"drop orphaned triggers", &fakeConnector{txMode: true, failSQL: "DROP TRIGGER", queryRows: state(0, 3, 0, 0)}, "drop orphaned messages_fts triggers: "},
+		{"drop triggers", &fakeConnector{txMode: true, failSQL: "DROP TRIGGER", queryRows: stale}, "drop stale messages_fts: triggers: "},
+		{"drop table", &fakeConnector{txMode: true, failSQL: "DROP TABLE", queryRows: stale}, "drop stale messages_fts: table: "},
 		{"begin", &fakeConnector{txMode: true, failBegin: true}, "begin: "},
 		{"fts table", &fakeConnector{txMode: true, failSQL: "CREATE VIRTUAL TABLE"}, "create messages_fts: "},
 		{"triggers", &fakeConnector{txMode: true, failSQL: "CREATE TRIGGER"}, "create messages_fts triggers: "},
-		{"count", &fakeConnector{txMode: true, failSQL: "messages_fts_docsize"}, "count indexed messages: "},
-		// The docsize count differs from the messages count, so the rebuild runs
-		{"rebuild", &fakeConnector{txMode: true, failSQL: "'rebuild'", queryRows: counts(1, 2)}, "rebuild messages_fts: "},
-		{"commit", &fakeConnector{txMode: true, failCommit: true, queryRows: counts(2, 2)}, "commit: "},
+		{"rebuild", &fakeConnector{txMode: true, failSQL: "'rebuild'"}, "rebuild messages_fts: "},
+		{"commit", &fakeConnector{txMode: true, failCommit: true, queryRows: fresh}, "commit: "},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.c.queryRows == nil {
-				tc.c.queryRows = counts(0, 0)
+				tc.c.queryRows = absent
 			}
 			err := fakeStore(tc.c).migrateSearch(context.Background())
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
@@ -289,18 +300,18 @@ func TestMigrateSearchFailsClosed(t *testing.T) {
 			}
 		})
 	}
-	t.Run("matching counts skip the rebuild", func(t *testing.T) {
-		c := &fakeConnector{txMode: true, queryRows: counts(2, 2)}
+	t.Run("current index skips the rebuild", func(t *testing.T) {
+		c := &fakeConnector{txMode: true, queryRows: fresh}
 		if err := fakeStore(c).migrateSearch(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		// indexes, virtual table, triggers; no rebuild
-		if c.execCalls != 3 {
-			t.Fatalf("exec calls = %d, want 3", c.execCalls)
+		// indexes, integrity check, virtual table, triggers; no drop, no rebuild
+		if c.execCalls != 4 {
+			t.Fatalf("exec calls = %d, want 4", c.execCalls)
 		}
 	})
-	t.Run("mismatched counts rebuild", func(t *testing.T) {
-		c := &fakeConnector{txMode: true, queryRows: counts(0, 2)}
+	t.Run("new table is built", func(t *testing.T) {
+		c := &fakeConnector{txMode: true, queryRows: absent}
 		if err := fakeStore(c).migrateSearch(context.Background()); err != nil {
 			t.Fatal(err)
 		}
@@ -308,15 +319,64 @@ func TestMigrateSearchFailsClosed(t *testing.T) {
 			t.Fatalf("exec calls = %d, want 4", c.execCalls)
 		}
 	})
-	t.Run("missing trigger rebuilds at matching counts", func(t *testing.T) {
-		c := &fakeConnector{txMode: true, queryRows: func(string) [][]driver.Value {
-			return [][]driver.Value{{int64(2), int64(2), int64(2)}}
+	t.Run("orphaned triggers are dropped, then the table is built", func(t *testing.T) {
+		c := &fakeConnector{txMode: true, queryRows: state(0, 2, 0, 0)}
+		if err := fakeStore(c).migrateSearch(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		// drop triggers, indexes, virtual table, triggers, rebuild
+		if c.execCalls != 5 {
+			t.Fatalf("exec calls = %d, want 5", c.execCalls)
+		}
+	})
+	// A cancelled health check says nothing about the index: return, drop nothing
+	t.Run("cancelled health check", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		c := &fakeConnector{txMode: true, queryRows: func(q string) [][]driver.Value {
+			if strings.Contains(q, "type = 'table'") {
+				return [][]driver.Value{{int64(1), int64(3)}}
+			}
+			cancel()
+			return [][]driver.Value{{int64(2), int64(2), int64(1)}}
 		}}
-		if err := fakeStore(c).migrateSearch(context.Background()); err != nil {
-			t.Fatal(err)
+		err := fakeStore(c).migrateSearch(ctx)
+		if !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "check messages_fts: ") {
+			t.Fatalf("err = %v, want a cancelled check", err)
 		}
-		if c.execCalls != 4 {
-			t.Fatalf("exec calls = %d, want 4", c.execCalls)
+		// indexes only
+		if c.execCalls != 1 {
+			t.Fatalf("exec calls = %d, want 1", c.execCalls)
+		}
+	})
+	for name, c := range map[string]*fakeConnector{
+		"mismatched counts":               {txMode: true, queryRows: stale},
+		"missing trigger at equal counts": {txMode: true, queryRows: state(1, 2, 2, 2)},
+		// The count or the probe of the virtual table fails: FTS5 cannot open the index
+		"unreadable index": {txMode: true, failSQL: "messages_fts_docsize", queryRows: fresh},
+		// Counts and probe pass, the integrity check finds damaged segments
+		"failed integrity check": {txMode: true, failSQL: "'integrity-check'", queryRows: fresh},
+	} {
+		t.Run(name+" drop then rebuild", func(t *testing.T) {
+			if err := fakeStore(c).migrateSearch(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			// indexes, drop triggers, drop table, virtual table, triggers, rebuild
+			if c.execCalls != 6 {
+				t.Fatalf("exec calls = %d, want 6", c.execCalls)
+			}
+		})
+	}
+	// A failed rebuild of a stale index must not leave it readable: the drop has already run
+	t.Run("stale index is dropped before a failing rebuild", func(t *testing.T) {
+		c := &fakeConnector{txMode: true, failSQL: "'rebuild'", queryRows: stale}
+		err := fakeStore(c).migrateSearch(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "rebuild messages_fts: ") {
+			t.Fatalf("err = %v", err)
+		}
+		// indexes, drop triggers, drop table, virtual table, triggers; the rebuild fails at prepare
+		if c.execCalls != 5 {
+			t.Fatalf("exec calls = %d, want 5", c.execCalls)
 		}
 	})
 }

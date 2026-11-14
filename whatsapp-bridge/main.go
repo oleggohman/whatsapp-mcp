@@ -302,8 +302,13 @@ func run() int {
 	// Health polls do not count as activity, so a long migration must not use up the idle window
 	idle.Touch()
 	// The watcher has returned, so nothing cancels migCtx from here on
-	stopped := migCtx.Err() != nil
-	if !stopped {
+	cancelled := migCtx.Err() != nil
+	if !cancelled {
+		if c := messageStore.ftsCheck; c.err != nil {
+			logger.Warnf("Search index failed its integrity check after %s, rebuilding it: %v", c.took.Round(time.Millisecond), c.err)
+		} else if c.took > 0 {
+			logger.Infof("Search index integrity check passed in %s", c.took.Round(time.Millisecond))
+		}
 		if migErr != nil {
 			// Search stays on LIKE; the bridge still serves
 			logger.Errorf("Search index migration failed after %s: %v", time.Since(migStart).Round(time.Millisecond), migErr)
@@ -311,6 +316,9 @@ func run() int {
 			logger.Infof("Search index ready in %s", time.Since(migStart).Round(time.Millisecond))
 		}
 	}
+	// A stop sent as the migration returned can lose the watcher's select to migrationDone.
+	// It is still queued, so do not connect; the final select reads it.
+	stopped := cancelled || stopPending(exitChan, api.shutdown)
 
 	idleCtx, stopIdle := context.WithCancel(context.Background())
 	defer stopIdle()
@@ -343,6 +351,26 @@ func run() int {
 	logln("Disconnecting...")
 	pm.current().Disconnect()
 	return 0
+}
+
+// stopPending reports whether a signal or an API shutdown request is queued. It puts the value
+// back (non-blocking, like the watcher) so the final select still reads it.
+func stopPending(exitChan chan os.Signal, shutdown chan struct{}) bool {
+	select {
+	case sig := <-exitChan:
+		select {
+		case exitChan <- sig:
+		default:
+		}
+	case <-shutdown:
+		select {
+		case shutdown <- struct{}{}:
+		default:
+		}
+	default:
+		return false
+	}
+	return true
 }
 
 // runMigrateSearch is a seam so tests can replace the search migration.

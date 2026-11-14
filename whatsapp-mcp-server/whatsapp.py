@@ -264,9 +264,15 @@ _LIKE_CLAUSE = "LOWER(messages.content) LIKE LOWER(?) ESCAPE '\\'"
 
 
 def _fts_available(conn: sqlite3.Connection) -> bool:
-    """True when the bridge has built the messages_fts index."""
-    row = conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'messages_fts'").fetchone()
-    return row is not None
+    """True when the bridge has built the messages_fts index and its three triggers exist.
+
+    Without a trigger the index misses writes, so search must use LIKE instead.
+    """
+    row = conn.execute(
+        "SELECT count(*) FROM sqlite_master WHERE name IN ('messages_fts', "
+        "'messages_fts_insert', 'messages_fts_delete', 'messages_fts_update')"
+    ).fetchone()
+    return row[0] == 4
 
 
 def _fts_phrase(text: str) -> str:

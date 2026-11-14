@@ -63,6 +63,14 @@ type Message struct {
 // Database handler for storing message history
 type MessageStore struct {
 	db *sql.DB
+	// ftsCheck is the last integrity check of messages_fts that migrateSearch ran; run logs it.
+	ftsCheck ftsCheck
+}
+
+// ftsCheck is how long an integrity check of messages_fts took and what it found (nil: healthy).
+type ftsCheck struct {
+	took time.Duration
+	err  error
 }
 
 // Initialize message store
@@ -149,16 +157,57 @@ const migrateFTSTriggersSQL = `
 		INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
 	END;`
 
-// migrateSearch creates the message indexes and the FTS table with its triggers, and rebuilds
-// the FTS index when a trigger was missing or the index does not cover every message. A missing
-// trigger means writes went unindexed: an older bridge's INSERT OR REPLACE renumbers rowids, so
-// the index can be stale even at an equal row count. The virtual table, the triggers and the
-// rebuild share one transaction: a crash rolls all of it back and the next start retries.
-// External-content count(*) on messages_fts reads messages, so the docsize shadow table is
-// what says how many rows are really indexed.
+// dropFTSTriggersSQL removes the triggers that write to messages_fts. DROP TRIGGER never opens
+// the virtual table, so it works even when FTS5 can no longer read the index.
+const dropFTSTriggersSQL = `
+	DROP TRIGGER IF EXISTS messages_fts_insert;
+	DROP TRIGGER IF EXISTS messages_fts_delete;
+	DROP TRIGGER IF EXISTS messages_fts_update;`
+
+// migrateSearch creates the message indexes and the FTS table with its triggers, and builds the
+// FTS index when the table is new. An existing index is stale when a trigger is missing or it
+// does not cover every message. A missing trigger means writes went unindexed: an older bridge's
+// INSERT OR REPLACE renumbers rowids, so the index can be stale even at an equal row count.
+// An index FTS5 cannot read is treated as stale too: its triggers would make every write to
+// messages fail. See ftsHealthy for how that is checked. A stale index is dropped before the
+// rebuild starts. Readers use MATCH whenever messages_fts exists with its three triggers, so a
+// stale table kept while the rebuild runs, or after it fails or is cancelled, would silently miss
+// rows instead of falling back to LIKE. The triggers are only created in the transaction that
+// also creates the table or finds it healthy, so they never point at a broken index. Triggers
+// left behind by a dropped table are removed before anything else, even when ctx is cancelled.
+// The virtual table, the triggers and the build share one transaction: a crash rolls all of it
+// back and the next start retries.
+// Nothing writes messages while this runs: it runs before Connect.
 func (store *MessageStore) migrateSearch(ctx context.Context) error {
+	// Triggers without their table fail every write to messages, so this step ignores
+	// cancellation: it is two quick statements, and a later step that fails can no longer leave them.
+	safe := context.WithoutCancel(ctx)
+	var exists, triggers int
+	if err := store.db.QueryRowContext(safe, `SELECT
+		(SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'),
+		(SELECT count(*) FROM sqlite_master WHERE type = 'trigger'
+			AND name IN ('messages_fts_insert', 'messages_fts_delete', 'messages_fts_update'))`).Scan(&exists, &triggers); err != nil {
+		return fmt.Errorf("check messages_fts: %w", err)
+	}
+	if exists == 0 && triggers > 0 {
+		if _, err := store.db.ExecContext(safe, dropFTSTriggersSQL); err != nil {
+			return fmt.Errorf("drop orphaned messages_fts triggers: %w", err)
+		}
+	}
 	if _, err := store.db.ExecContext(ctx, migrateIndexesSQL); err != nil {
 		return fmt.Errorf("create indexes: %w", err)
+	}
+	if exists > 0 {
+		healthy, err := store.ftsHealthy(ctx, triggers)
+		if err != nil {
+			return fmt.Errorf("check messages_fts: %w", err)
+		}
+		if !healthy {
+			if err := store.dropFTS(ctx); err != nil {
+				return fmt.Errorf("drop stale messages_fts: %w", err)
+			}
+			exists = 0
+		}
 	}
 	tx, err := store.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -168,24 +217,60 @@ func (store *MessageStore) migrateSearch(ctx context.Context) error {
 	if _, err := tx.ExecContext(ctx, migrateFTSTableSQL); err != nil {
 		return fmt.Errorf("create messages_fts: %w", err)
 	}
-	// Counted before the triggers are created, so a trigger that was missing is still seen
-	var triggers, indexed, total int
-	if err := tx.QueryRowContext(ctx, `SELECT
-		(SELECT count(*) FROM sqlite_master WHERE type = 'trigger'
-			AND name IN ('messages_fts_insert', 'messages_fts_delete', 'messages_fts_update')),
-		(SELECT count(*) FROM messages_fts_docsize), (SELECT count(*) FROM messages)`).Scan(&triggers, &indexed, &total); err != nil {
-		return fmt.Errorf("count indexed messages: %w", err)
-	}
 	if _, err := tx.ExecContext(ctx, migrateFTSTriggersSQL); err != nil {
 		return fmt.Errorf("create messages_fts triggers: %w", err)
 	}
-	if triggers != 3 || indexed != total {
+	if exists == 0 {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO messages_fts(messages_fts) VALUES('rebuild')`); err != nil {
 			return fmt.Errorf("rebuild messages_fts: %w", err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit: %w", err)
+	}
+	return nil
+}
+
+// ftsHealthy reports whether the existing messages_fts can be kept: all three triggers are
+// there, the docsize shadow table counts every message, and FTS5 can read the whole index.
+// External-content count(*) on messages_fts reads messages, so docsize is what says how many rows
+// are really indexed. The probe only opens the virtual table (it reads messages_fts_config); the
+// segments in messages_fts_data and messages_fts_idx, which the triggers write, are only read by
+// the integrity check. It runs with rank 1, which also rebuilds every row's tokens from messages
+// and compares them with the index: the plain check passes a damaged averages record (id 1) or
+// structure record (id 10) that then fails writes. It scans the whole index and messages, so it
+// runs last and its duration is recorded in store.ftsCheck. Any failure means stale; the error
+// is only returned when ctx was cancelled, since an interrupted check says nothing about the
+// index.
+func (store *MessageStore) ftsHealthy(ctx context.Context, triggers int) (bool, error) {
+	var indexed, total, probe int
+	err := store.db.QueryRowContext(ctx, `SELECT
+		(SELECT count(*) FROM messages_fts_docsize), (SELECT count(*) FROM messages),
+		(SELECT count(*) FROM (SELECT 1 FROM messages_fts LIMIT 1))`).Scan(&indexed, &total, &probe)
+	if err == nil && triggers == 3 && indexed == total {
+		start := time.Now()
+		_, err = store.db.ExecContext(ctx, `INSERT INTO messages_fts(messages_fts, rank) VALUES('integrity-check', 1)`)
+		store.ftsCheck = ftsCheck{took: time.Since(start), err: err}
+		if err == nil {
+			return true, nil
+		}
+	}
+	if ctx.Err() != nil {
+		return false, ctx.Err()
+	}
+	return false, nil
+}
+
+// dropFTS drops the triggers first and lets them commit on their own: from then on writes to
+// messages no longer touch the index, and readers ignore a table without its triggers. Then it
+// drops the table. FTS5 must open a table to drop it, so a broken one stays behind; it is
+// harmless without triggers, and the next start tries again. run logs the error and connects.
+func (store *MessageStore) dropFTS(ctx context.Context) error {
+	if _, err := store.db.ExecContext(ctx, dropFTSTriggersSQL); err != nil {
+		return fmt.Errorf("triggers: %w", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `DROP TABLE IF EXISTS messages_fts`); err != nil {
+		return fmt.Errorf("table: %w", err)
 	}
 	return nil
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -491,5 +492,371 @@ func TestMigrateSearchCancelledLeavesNothingAndRetries(t *testing.T) {
 	}
 	if n := ftsObjects(); n == 0 {
 		t.Fatal("retry did not create messages_fts")
+	}
+}
+
+// A stale index whose rebuild fails must not stay readable: readers would MATCH against it and
+// miss rows instead of falling back to LIKE. Writes keep working and the next start rebuilds.
+func TestMigrateSearchFailedRepairLeavesNoStaleIndex(t *testing.T) {
+	s := newTestStore(t)
+	// One connection, so the page limit below applies to the migration
+	s.db.SetMaxOpenConns(1)
+	chat := "a@s.whatsapp.net"
+	if err := s.StoreChat(chat, "A", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.migrateSearch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	body := strings.Repeat("pelican albatross heron osprey ", 40)
+	for i := range 300 {
+		if err := s.StoreMessage(fmt.Sprintf("m%d", i), chat, "111", fmt.Sprintf("%s %d", body, i), time.Now(), false, "", "", "", nil, nil, nil, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The index diverges (as after a crash), then the disk is full for the repair
+	if _, err := s.db.Exec("INSERT INTO messages_fts(messages_fts) VALUES('delete-all')"); err != nil {
+		t.Fatal(err)
+	}
+	// Compact the file so the freed index pages cannot hold the rebuild
+	if _, err := s.db.Exec("VACUUM"); err != nil {
+		t.Fatal(err)
+	}
+	var pages int
+	if err := s.db.QueryRow("PRAGMA page_count").Scan(&pages); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(fmt.Sprintf("PRAGMA max_page_count = %d", pages)); err != nil {
+		t.Fatal(err)
+	}
+	// SQLite reports the full disk at the rebuild or, in WAL mode, at commit
+	if err := s.migrateSearch(context.Background()); err == nil || !strings.Contains(err.Error(), "full") {
+		t.Fatalf("err = %v, want a failed repair", err)
+	}
+	var n int
+	if err := s.db.QueryRow("SELECT count(*) FROM sqlite_master WHERE name LIKE 'messages_fts%'").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("%d messages_fts objects after a failed repair, want 0", n)
+	}
+	if _, err := s.db.Exec("PRAGMA max_page_count = 1073741823"); err != nil {
+		t.Fatal(err)
+	}
+	// No trigger is left pointing at the dropped table
+	if err := s.StoreMessage("late", chat, "111", "kingfisher", time.Now(), false, "", "", "", nil, nil, nil, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.migrateSearch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if indexed, total := ftsCounts(t, s); indexed != 301 || total != 301 {
+		t.Fatalf("after retry: docsize = %d, messages = %d, want 301", indexed, total)
+	}
+	if got := ftsHits(t, s, "kingfisher"); len(got) != 1 || got[0] != "late" {
+		t.Fatalf("MATCH kingfisher = %v", got)
+	}
+}
+
+// An index FTS5 can no longer open cannot be dropped. Its triggers must still go, or every write
+// to messages would fail; without them readers use LIKE. Later starts retry the drop, never put
+// the triggers back on the broken table, and the bridge keeps storing messages.
+func TestMigrateSearchUnreadableIndexKeepsWritesWorking(t *testing.T) {
+	for name, corrupt := range map[string][]string{
+		// Stale (nothing indexed) and unreadable
+		"stale": {"INSERT INTO messages_fts(messages_fts) VALUES('delete-all')", "DROP TABLE messages_fts_config"},
+		// Counts and triggers look current, only the probe sees the damage
+		"current counts": {"DROP TABLE messages_fts_config"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := newTestStore(t)
+			chat := "a@s.whatsapp.net"
+			if err := s.StoreChat(chat, "A", time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.StoreMessage("m1", chat, "111", "pelican", time.Now(), false, "", "", "", nil, nil, nil, 0); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.migrateSearch(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			for _, q := range corrupt {
+				if _, err := s.db.Exec(q); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// A connection that already opened messages_fts keeps it open; use fresh ones like a restart
+			s.db.SetMaxIdleConns(0)
+			if err := s.StoreMessage("setup", chat, "111", "heron", time.Now(), false, "", "", "", nil, nil, nil, 0); err == nil {
+				t.Fatal("setup: a write through the triggers must fail on the broken index")
+			}
+			ftsObjects := func() (triggers, tables int) {
+				t.Helper()
+				// The objects the MCP server's _fts_available counts
+				if err := s.db.QueryRow(`SELECT
+					(SELECT count(*) FROM sqlite_master WHERE type = 'trigger'
+						AND name IN ('messages_fts_insert', 'messages_fts_delete', 'messages_fts_update')),
+					(SELECT count(*) FROM sqlite_master WHERE name = 'messages_fts')`).Scan(&triggers, &tables); err != nil {
+					t.Fatal(err)
+				}
+				return triggers, tables
+			}
+			for attempt := 1; attempt <= 2; attempt++ {
+				err := s.migrateSearch(context.Background())
+				if err == nil || !strings.Contains(err.Error(), "drop stale messages_fts: table: ") {
+					t.Fatalf("attempt %d: err = %v, want a failed table drop", attempt, err)
+				}
+				if triggers, tables := ftsObjects(); triggers != 0 || tables != 1 {
+					t.Fatalf("attempt %d: %d triggers, %d messages_fts tables, want 0 and 1", attempt, triggers, tables)
+				}
+				id := fmt.Sprintf("live%d", attempt)
+				if err := s.StoreMessage(id, chat, "111", "osprey", time.Now(), false, "", "", "", nil, nil, nil, 0); err != nil {
+					t.Fatalf("attempt %d: StoreMessage: %v", attempt, err)
+				}
+				batch := []historyMessage{{id: id + "h", sender: "111", content: "albatross", timestamp: time.Now()}}
+				if err := s.storeHistoryBatch(chat, "A", time.Now(), batch); err != nil {
+					t.Fatalf("attempt %d: storeHistoryBatch: %v", attempt, err)
+				}
+			}
+			var n int
+			if err := s.db.QueryRow("SELECT count(*) FROM messages").Scan(&n); err != nil || n != 5 {
+				t.Fatalf("messages = %d, %v, want 5", n, err)
+			}
+		})
+	}
+}
+
+// ftsTriggers counts the messages_fts triggers the MCP server's _fts_available requires.
+func ftsTriggers(t *testing.T, s *MessageStore) int {
+	t.Helper()
+	var n int
+	if err := s.db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type = 'trigger'
+		AND name IN ('messages_fts_insert', 'messages_fts_delete', 'messages_fts_update')`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// checkWritesWork runs every write path that fires the messages_fts triggers: insert, upsert,
+// a history batch, a content update and the LID merge (update and delete).
+func checkWritesWork(t *testing.T, s *MessageStore, chat string) {
+	t.Helper()
+	// Removing a row from the index goes first: a successful insert rewrites the averages record
+	if _, err := s.db.Exec("UPDATE messages SET content = content || ' grebe' WHERE rowid = (SELECT min(rowid) FROM messages)"); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if _, err := s.db.Exec("DELETE FROM messages WHERE rowid = (SELECT max(rowid) FROM messages)"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	for i := range 50 {
+		if err := s.StoreMessage(fmt.Sprintf("w%d", i), chat, "111", fmt.Sprintf("kingfisher %d", i), time.Now(), false, "", "", "", nil, nil, nil, 0); err != nil {
+			t.Fatalf("StoreMessage %d: %v", i, err)
+		}
+	}
+	if err := s.StoreMessage("w0", chat, "111", "kingfisher upserted", time.Now(), false, "", "", "", nil, nil, nil, 0); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	batch := []historyMessage{{id: "h1", sender: "111", content: "albatross", timestamp: time.Now()}}
+	if err := s.storeHistoryBatch(chat, "A", time.Now(), batch); err != nil {
+		t.Fatalf("storeHistoryBatch: %v", err)
+	}
+	if _, err := s.db.Exec("UPDATE messages SET content = 'cormorant' WHERE id = 'w1'"); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	lid, pn := testLID+"@lid", testPN+"@s.whatsapp.net"
+	for _, c := range []string{lid, pn} {
+		if err := s.StoreChat(c, "", time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.StoreMessage("dup", c, "111", "puffin", time.Now(), false, "", "", "", nil, nil, nil, 0); err != nil {
+			t.Fatalf("StoreMessage %s: %v", c, err)
+		}
+	}
+	if err := s.mergeChat(context.Background(), lid, pn, nil); err != nil {
+		t.Fatalf("mergeChat: %v", err)
+	}
+}
+
+// FTS5 opens an index whose segments or idx table are damaged, so the counts and the probe
+// pass, but the triggers fail on the first write that touches the damage. The integrity check
+// sees it: the index is dropped and rebuilt, and every write works afterwards.
+func TestMigrateSearchDamagedIndexIsRebuilt(t *testing.T) {
+	for name, corrupt := range map[string]string{
+		"zeroed segment blocks":    "UPDATE messages_fts_data SET block = zeroblob(length(block)) WHERE id > 10",
+		"garbage segment blocks":   "UPDATE messages_fts_data SET block = randomblob(length(block)) WHERE id > 10",
+		"deleted segment rows":     "DELETE FROM messages_fts_data WHERE id > 10",
+		"dropped messages_fts_idx": "DROP TABLE messages_fts_idx",
+		// The averages record (id 1) and the structure record (id 10): only the content-checking
+		// integrity check reads them through
+		"zeroed averages record":  "UPDATE messages_fts_data SET block = zeroblob(length(block)) WHERE id = 1",
+		"empty averages record":   "UPDATE messages_fts_data SET block = x'' WHERE id = 1",
+		"garbage averages record": "UPDATE messages_fts_data SET block = x'ffffffffffffffffffffffffffffffff' WHERE id = 1",
+		"deleted averages record": "DELETE FROM messages_fts_data WHERE id = 1",
+		"zeroed structure record": "UPDATE messages_fts_data SET block = zeroblob(length(block)) WHERE id = 10",
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := newTestStore(t)
+			chat := "a@s.whatsapp.net"
+			if err := s.StoreChat(chat, "A", time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.migrateSearch(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			body := strings.Repeat("pelican albatross heron osprey ", 40)
+			for i := range 400 {
+				if err := s.StoreMessage(fmt.Sprintf("m%d", i), chat, "111", fmt.Sprintf("%s %d", body, i), time.Now(), false, "", "", "", nil, nil, nil, 0); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := s.db.Exec(corrupt); err != nil {
+				t.Fatal(err)
+			}
+			// A connection that already opened messages_fts keeps it open; use fresh ones like a restart
+			s.db.SetMaxIdleConns(0)
+			failed := 0
+			// Damaged averages only show when the index removes a row (an upsert or a delete),
+			// and a successful insert rewrites them, so these go first and the inserts only run
+			// when they did not fail
+			if err := s.StoreMessage("m0", chat, "111", "heron upserted", time.Now(), false, "", "", "", nil, nil, nil, 0); err != nil {
+				failed++
+			}
+			if _, err := s.db.Exec("DELETE FROM messages WHERE id = 'm1'"); err != nil {
+				failed++
+			}
+			for i := 0; i < 400 && failed == 0; i++ {
+				if err := s.StoreMessage(fmt.Sprintf("setup%d", i), chat, "111", body, time.Now(), false, "", "", "", nil, nil, nil, 0); err != nil {
+					failed++
+				}
+			}
+			if failed == 0 {
+				t.Fatal("setup: writes through the triggers must fail on the damaged index")
+			}
+
+			if err := s.migrateSearch(context.Background()); err != nil {
+				t.Fatalf("migrateSearch: %v", err)
+			}
+			checkWritesWork(t, s, chat)
+			if s.ftsCheck.err == nil || s.ftsCheck.took <= 0 {
+				t.Fatalf("ftsCheck = %+v, want the failed integrity check and its duration", s.ftsCheck)
+			}
+			if n := ftsTriggers(t, s); n != 3 {
+				t.Fatalf("triggers = %d, want 3 on the rebuilt index", n)
+			}
+			if _, err := s.db.Exec(`INSERT INTO messages_fts(messages_fts, rank) VALUES('integrity-check', 1)`); err != nil {
+				t.Fatalf("rebuilt index fails the integrity check: %v", err)
+			}
+			if indexed, total := ftsCounts(t, s); indexed != total {
+				t.Fatalf("docsize = %d, messages = %d", indexed, total)
+			}
+			if got := ftsHits(t, s, "cormorant"); len(got) != 1 || got[0] != "w1" {
+				t.Fatalf("MATCH cormorant = %v", got)
+			}
+			// Every row with the token, including the setup writes that got through
+			var want int
+			if err := s.db.QueryRow("SELECT count(*) FROM messages WHERE content LIKE '%osprey%'").Scan(&want); err != nil {
+				t.Fatal(err)
+			}
+			if got := ftsHits(t, s, "osprey"); len(got) != want || want < 390 {
+				t.Fatalf("MATCH osprey = %d hits, want %d (at least 390)", len(got), want)
+			}
+		})
+	}
+}
+
+// A healthy index passes the integrity check, including rows with NULL or empty content, and
+// is kept as it is: no drop, no rebuild.
+func TestMigrateSearchHealthyIndexIsKept(t *testing.T) {
+	s := newTestStore(t)
+	chat := "a@s.whatsapp.net"
+	if err := s.StoreChat(chat, "A", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.StoreMessage("m1", chat, "111", "pelican", time.Now(), false, "", "", "", nil, nil, nil, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.StoreMessage("m2", chat, "111", "", time.Now(), false, "image", "a.jpg", "", nil, nil, nil, 0); err != nil {
+		t.Fatal(err)
+	}
+	for id, content := range map[string]string{"h": "שלום עולם", "c": "Привет мир", "e": "🦩🦩 ok", "s": "ab"} {
+		if err := s.StoreMessage(id, chat, "111", content, time.Now(), false, "", "", "", nil, nil, nil, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.migrateSearch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		"DELETE FROM messages WHERE id = 's'",
+		"UPDATE messages SET content = 'Пока мир' WHERE id = 'c'",
+		`INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me) VALUES ('m3', 'a@s.whatsapp.net', '111', NULL, '2024-01-01', 0)`,
+		"UPDATE messages SET content = NULL WHERE id = 'm1'",
+		"UPDATE messages SET content = 'heron' WHERE id = 'm3'",
+		// A rebuild recreates the table and resets this setting, so it marks the original index
+		"INSERT INTO messages_fts(messages_fts, rank) VALUES('automerge', 7)",
+	} {
+		if _, err := s.db.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.migrateSearch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if s.ftsCheck.err != nil || s.ftsCheck.took <= 0 {
+		t.Fatalf("ftsCheck = %+v, want a passed check with its duration", s.ftsCheck)
+	}
+	var automerge int
+	if err := s.db.QueryRow("SELECT v FROM messages_fts_config WHERE k = 'automerge'").Scan(&automerge); err != nil || automerge != 7 {
+		t.Fatalf("automerge = %d, %v: the healthy index was rebuilt", automerge, err)
+	}
+	if n := ftsTriggers(t, s); n != 3 {
+		t.Fatalf("triggers = %d, want 3", n)
+	}
+	if got := ftsHits(t, s, "heron"); len(got) != 1 || got[0] != "m3" {
+		t.Fatalf("MATCH heron = %v", got)
+	}
+}
+
+// messages_fts gone but its triggers left behind make every write fail. They are dropped before
+// anything that can fail, even when the migration is cancelled before it starts.
+func TestMigrateSearchDropsOrphanedTriggersFirst(t *testing.T) {
+	s := newTestStore(t)
+	chat := "a@s.whatsapp.net"
+	if err := s.StoreChat(chat, "A", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.StoreMessage("m1", chat, "111", "pelican", time.Now(), false, "", "", "", nil, nil, nil, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.migrateSearch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec("DROP TABLE messages_fts"); err != nil {
+		t.Fatal(err)
+	}
+	if n := ftsTriggers(t, s); n != 3 {
+		t.Fatalf("setup: triggers = %d, want 3 left behind", n)
+	}
+	if err := s.StoreMessage("setup", chat, "111", "heron", time.Now(), false, "", "", "", nil, nil, nil, 0); err == nil {
+		t.Fatal("setup: a write through the orphaned triggers must fail")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := s.migrateSearch(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if n := ftsTriggers(t, s); n != 0 {
+		t.Fatalf("triggers = %d after a cancelled migration, want 0", n)
+	}
+	checkWritesWork(t, s, chat)
+	// The next start builds the index over everything written meanwhile
+	if err := s.migrateSearch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := ftsTriggers(t, s); n != 3 {
+		t.Fatalf("triggers = %d after the retry, want 3", n)
+	}
+	if got := ftsHits(t, s, "cormorant"); len(got) != 1 || got[0] != "w1" {
+		t.Fatalf("MATCH cormorant = %v", got)
 	}
 }

@@ -548,6 +548,16 @@ def test_search_without_fts_table_falls_back_to_like(store_dir):
     assert "bob says hi" in whatsapp.list_messages(query="BOB says", include_context=False)
 
 
+def test_search_with_missing_fts_trigger_falls_back_to_like(store_dir):
+    # A table without its insert trigger no longer sees writes, so it must not answer MATCH.
+    conn = sqlite3.connect(store_dir / "messages.db")
+    conn.execute("DROP TRIGGER messages_fts_insert")
+    conn.commit()
+    conn.close()
+    _add_search_message(store_dir, "late", "kingfisher")
+    assert "kingfisher" in whatsapp.list_messages(query="kingfisher", include_context=False)
+
+
 def test_search_match_error_falls_back_to_like(store_dir, caplog):
     conn = sqlite3.connect(store_dir / "messages.db")
     conn.execute("DROP TABLE messages_fts_data")  # break the index but keep messages_fts

@@ -710,6 +710,30 @@ func TestRunSignalAfterMigrationExits(t *testing.T) {
 	}
 }
 
+// run logs how long the integrity check of an existing search index took and what it found.
+func TestRunLogsIntegrityCheck(t *testing.T) {
+	for name, tc := range map[string]struct {
+		check ftsCheck
+		want  string
+	}{
+		"passed": {ftsCheck{took: 1500 * time.Millisecond}, "Search index integrity check passed in 1.5s"},
+		"failed": {ftsCheck{took: 2 * time.Second, err: io.ErrUnexpectedEOF},
+			"Search index failed its integrity check after 2s, rebuilding it: unexpected EOF"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newRunHarness(t, &fakeContainer{dev: &store.Device{}})
+			h.configure = pairedConfigure
+			stubMigration(t, func(ms *MessageStore, _ context.Context) error { ms.ftsCheck = tc.check; return nil })
+			code := h.start()
+			h.registered()
+			waitForText(t, h.logs, tc.want)
+			if c := h.stop(code); c != 0 {
+				t.Fatalf("code = %d", c)
+			}
+		})
+	}
+}
+
 // While the migration runs the connecting routes answer 503 and a stop request cancels it:
 // run skips Connect, returns 0 and closes the message store.
 func TestRunStopDuringMigration(t *testing.T) {
@@ -756,6 +780,52 @@ func TestRunStopDuringMigration(t *testing.T) {
 				t.Fatalf("a cancelled migration must not log a result:\n%s", h.logs.String())
 			}
 		})
+	}
+}
+
+// A stop that arrives as the migration returns races the watcher's migrationDone case. Either way
+// run must not connect: the stop is still pending when the migration is over.
+func TestRunStopAsMigrationReturnsSkipsConnect(t *testing.T) {
+	for _, how := range []string{"signal", "api shutdown"} {
+		t.Run(how, func(t *testing.T) {
+			for range 20 {
+				h := newRunHarness(t, &fakeContainer{dev: &store.Device{}})
+				h.configure = pairedConfigure
+				stubMigration(t, func(*MessageStore, context.Context) error {
+					if how == "signal" {
+						c := <-h.sig
+						h.sig <- c
+						c <- os.Interrupt
+					} else if st := h.post("/api/shutdown", `{"version":"`+bridgeVersion+`"}`); st != http.StatusOK {
+						t.Errorf("shutdown status = %d", st)
+					}
+					return nil
+				})
+				if c := h.wait(h.start()); c != 0 {
+					t.Fatalf("code = %d", c)
+				}
+				if connects, _, _ := h.client(0).counts(); connects != 0 {
+					t.Fatalf("connects = %d, want 0 with a stop pending after the migration", connects)
+				}
+				h.restore()
+			}
+		})
+	}
+}
+
+func TestStopPendingLeavesTheStopQueued(t *testing.T) {
+	exitChan, shutdown := make(chan os.Signal, 1), make(chan struct{}, 1)
+	if stopPending(exitChan, shutdown) {
+		t.Fatal("nothing queued, want false")
+	}
+	exitChan <- os.Interrupt
+	if !stopPending(exitChan, shutdown) || len(exitChan) != 1 {
+		t.Fatalf("queued signal: want true and the signal still queued (len %d)", len(exitChan))
+	}
+	<-exitChan
+	shutdown <- struct{}{}
+	if !stopPending(exitChan, shutdown) || len(shutdown) != 1 {
+		t.Fatalf("queued shutdown: want true and the request still queued (len %d)", len(shutdown))
 	}
 }
 
