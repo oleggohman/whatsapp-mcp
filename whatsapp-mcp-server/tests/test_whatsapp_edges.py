@@ -67,12 +67,26 @@ def test_last_interaction_and_get_chat_return_none_on_db_error(db_broken, caplog
 # --- formatting and lookups --------------------------------------------------------------------
 
 
-def test_sender_name_for_bare_number_matches_by_substring(store_dir):
-    # No "@" in the sender: the number itself is matched against chat JIDs.
+def test_sender_name_for_lid_jid(store_dir):
+    # A bare number resolves through user@s.whatsapp.net.
     assert whatsapp.get_sender_name("222") == "Bob"
     assert whatsapp.get_sender_name("no-such-number") == "no-such-number"
-    # A JID with another server suffix is matched by its number part.
+    # A JID with another server suffix resolves by its user part.
     assert whatsapp.get_sender_name("222@lid") == "Bob"
+    # A user that only has a LID chat resolves through user@lid.
+    assert whatsapp.get_sender_name("999000") == "Carol"
+
+
+def test_sender_name_resolver_memoizes_and_survives_db_error(store_dir, caplog):
+    with whatsapp._connect() as conn:
+        resolve = whatsapp._name_resolver(conn)
+        assert resolve("222") == "Bob"
+        assert resolve("nobody") == "nobody"
+        conn.close()  # cached answers need no database
+        assert resolve("222") == "Bob"
+        assert resolve("nobody") == "nobody"
+        assert resolve("111") == "111"  # uncached lookup on a closed connection
+    assert any("Database error while getting sender name" in m for m in _logged(caplog))
 
 
 def _msg(**kw):

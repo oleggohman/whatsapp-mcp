@@ -68,6 +68,66 @@ def test_list_messages_context(store_dir):
     assert "hello" not in out and "third" not in out
 
 
+def test_list_messages_with_context_opens_one_connection(store_dir, monkeypatch):
+    opened = []
+    real = whatsapp._connect
+
+    def counting():
+        opened.append(1)
+        return real()
+
+    monkeypatch.setattr(whatsapp, "_connect", counting)
+    out = whatsapp.list_messages(query="hello", context_before=1, context_after=1)
+    assert "group hello" in out and "Alice" in out
+    assert len(opened) == 1
+
+    # Five hits with context still use a single connection.
+    opened.clear()
+    out = whatsapp.list_messages(sender_phone_number="111", limit=5)
+    assert len(opened) == 1 and "second" in out
+
+
+def test_sender_names_do_not_match_by_substring(tmp_path, monkeypatch):
+    db = tmp_path / "messages.db"
+    make_messages_db(db)
+    conn = sqlite3.connect(db)
+    conn.executemany(
+        "INSERT INTO chats VALUES (?, ?, ?)",
+        [
+            ("551212@s.whatsapp.net", "Short", "2025-01-01 08:00:00+00:00"),
+            ("15551212@s.whatsapp.net", "Long", "2025-01-01 08:00:00+00:00"),
+        ],
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("WHATSAPP_DB_PATH", str(db))
+    assert whatsapp.get_sender_name("551212@s.whatsapp.net") == "Short"
+    assert whatsapp.get_sender_name("15551212@s.whatsapp.net") == "Long"
+    assert whatsapp.get_sender_name("1212") == "1212"  # no LIKE fallback
+    assert whatsapp.get_sender_name("5551212") == "5551212"
+
+
+def test_message_context_picks_requested_chat_for_shared_id(store_dir):
+    # The same message id exists in two chats; chat_jid decides which one is used.
+    path = whatsapp._db_path()
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me) "
+        "VALUES ('m1', '222@s.whatsapp.net', '222', 'bob m1', '2025-01-01 11:00:00+00:00', 0)"
+    )
+    conn.commit()
+    conn.close()
+    with whatsapp._connect() as c:
+        ctx = whatsapp._message_context(c, "m1", 1, 1, chat_jid="111@s.whatsapp.net")
+        assert ctx.message.content == "hello" and ctx.after[0].content == "second"
+        ctx = whatsapp._message_context(c, "m1", 1, 1, chat_jid="222@s.whatsapp.net")
+        assert ctx.message.content == "bob m1" and ctx.before[0].content == "bob says hi"
+        # Without chat_jid the newest row wins.
+        assert whatsapp._message_context(c, "m1", 0, 0).message.content == "bob m1"
+    out = whatsapp.list_messages(query="hello", context_before=0, context_after=0)
+    assert "group hello" in out and "bob m1" not in out
+
+
 def test_message_context_missing(store_dir):
     with pytest.raises(ValueError, match="not found"):
         whatsapp.get_message_context("nope")

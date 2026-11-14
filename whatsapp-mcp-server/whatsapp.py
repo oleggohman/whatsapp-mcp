@@ -2,7 +2,7 @@ import logging
 import os.path
 import pathlib
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -140,56 +140,53 @@ class MessageContext:
     after: list[Message]
 
 
+def _name_resolver(conn: sqlite3.Connection) -> Callable[[str], str]:
+    """Return a sender -> display name lookup bound to one open connection.
+
+    The stored sender is the user part of a JID. Its `@server` suffix is dropped and
+    `user@s.whatsapp.net`, then `user@lid`, are looked up by primary key. There is no
+    substring match, so `15551212` never takes the name of `551212`. Results are memoized
+    for the life of the resolver; a sender with no named chat resolves to itself.
+    """
+    cache: dict[str, str] = {}
+
+    def resolve(sender: str) -> str:
+        if sender in cache:
+            return cache[sender]
+        user = sender.split("@")[0]
+        try:
+            for jid in (f"{user}@s.whatsapp.net", f"{user}@lid"):
+                row = conn.execute("SELECT name FROM chats WHERE jid = ?", (jid,)).fetchone()
+                if row and row[0]:
+                    cache[sender] = row[0]
+                    return row[0]
+        except sqlite3.Error as e:
+            logger.error("Database error while getting sender name: %s", e)
+            return sender
+        cache[sender] = sender
+        return sender
+
+    return resolve
+
+
 def get_sender_name(sender_jid: str) -> str:
     try:
         with _connect() as conn:
-            cursor = conn.cursor()
-
-            # First try matching by exact JID
-            cursor.execute(
-                """
-                SELECT name
-                FROM chats
-                WHERE jid = ?
-                LIMIT 1
-            """,
-                (sender_jid,),
-            )
-
-            result = cursor.fetchone()
-
-            # If no result, try looking for the number within JIDs
-            if not result:
-                # Extract the phone number part if it's a JID
-                if "@" in sender_jid:
-                    phone_part = sender_jid.split("@")[0]
-                else:
-                    phone_part = sender_jid
-
-                cursor.execute(
-                    """
-                    SELECT name
-                    FROM chats
-                    WHERE jid LIKE ?
-                    LIMIT 1
-                """,
-                    (f"%{phone_part}%",),
-                )
-
-                result = cursor.fetchone()
-
-            if result and result[0]:
-                return result[0]
-            else:
-                return sender_jid
-
+            return _name_resolver(conn)(sender_jid)
     except sqlite3.Error as e:
         logger.error("Database error while getting sender name: %s", e)
         return sender_jid
 
 
-def format_message(message: Message, show_chat_info: bool = True) -> str:
-    """Print a single message with consistent formatting."""
+def format_message(
+    message: Message,
+    show_chat_info: bool = True,
+    resolve_name: Callable[[str], str] | None = None,
+) -> str:
+    """Print a single message with consistent formatting.
+
+    resolve_name reuses an open connection; without it the sender lookup opens its own.
+    """
     output = ""
 
     if show_chat_info and message.chat_name:
@@ -204,21 +201,26 @@ def format_message(message: Message, show_chat_info: bool = True) -> str:
         )
 
     try:
-        sender_name = get_sender_name(message.sender) if not message.is_from_me else "Me"
+        lookup = resolve_name or get_sender_name
+        sender_name = lookup(message.sender) if not message.is_from_me else "Me"
         output += f"From: {sender_name}: {content_prefix}{message.content}\n"
     except Exception as e:
         logger.error("Error formatting message: %s", e)
     return output
 
 
-def format_messages_list(messages: list[Message], show_chat_info: bool = True) -> str:
+def format_messages_list(
+    messages: list[Message],
+    show_chat_info: bool = True,
+    resolve_name: Callable[[str], str] | None = None,
+) -> str:
     output = ""
     if not messages:
         output += "No messages to display."
         return output
 
     for message in messages:
-        output += format_message(message, show_chat_info)
+        output += format_message(message, show_chat_info, resolve_name)
     return output
 
 
@@ -315,6 +317,7 @@ def list_messages(
             cursor.execute(" ".join(query_parts), tuple(params))
             messages = cursor.fetchall()
 
+            resolve_name = _name_resolver(conn)
             result = []
             for msg in messages:
                 message = Message(
@@ -333,15 +336,19 @@ def list_messages(
                 # Add context for each message
                 messages_with_context = []
                 for msg in result:
-                    context = get_message_context(msg.id, context_before, context_after)
+                    context = _message_context(
+                        conn, msg.id, context_before, context_after, chat_jid=msg.chat_jid
+                    )
                     messages_with_context.extend(context.before)
                     messages_with_context.append(context.message)
                     messages_with_context.extend(context.after)
 
-                return format_messages_list(messages_with_context, show_chat_info=True)
+                return format_messages_list(
+                    messages_with_context, show_chat_info=True, resolve_name=resolve_name
+                )
 
             # Format and display messages without context
-            return format_messages_list(result, show_chat_info=True)
+            return format_messages_list(result, show_chat_info=True, resolve_name=resolve_name)
 
     except sqlite3.Error as e:
         logger.error("Database error: %s", e)
@@ -352,101 +359,116 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5) -> Mes
     """Get context around a specific message."""
     try:
         with _connect() as conn:
-            cursor = conn.cursor()
-
-            # Get the target message first
-            cursor.execute(
-                """
-                SELECT messages.timestamp, messages.sender, chats.name, messages.content,
-                       messages.is_from_me, chats.jid, messages.id, messages.chat_jid,
-                       messages.media_type
-                FROM messages
-                JOIN chats ON messages.chat_jid = chats.jid
-                WHERE messages.id = ?
-            """,
-                (message_id,),
-            )
-            msg_data = cursor.fetchone()
-
-            if not msg_data:
-                raise ValueError(f"Message with ID {message_id} not found")
-
-            target_message = Message(
-                timestamp=datetime.fromisoformat(msg_data[0]),
-                sender=msg_data[1],
-                chat_name=msg_data[2],
-                content=msg_data[3],
-                is_from_me=msg_data[4],
-                chat_jid=msg_data[5],
-                id=msg_data[6],
-                media_type=msg_data[8],
-            )
-
-            # Get messages before
-            cursor.execute(
-                """
-                SELECT messages.timestamp, messages.sender, chats.name, messages.content,
-                       messages.is_from_me, chats.jid, messages.id, messages.media_type
-                FROM messages
-                JOIN chats ON messages.chat_jid = chats.jid
-                WHERE messages.chat_jid = ? AND messages.timestamp < ?
-                ORDER BY messages.timestamp DESC
-                LIMIT ?
-            """,
-                (msg_data[7], msg_data[0], before),
-            )
-
-            before_messages = []
-            for msg in cursor.fetchall():
-                before_messages.append(
-                    Message(
-                        timestamp=datetime.fromisoformat(msg[0]),
-                        sender=msg[1],
-                        chat_name=msg[2],
-                        content=msg[3],
-                        is_from_me=msg[4],
-                        chat_jid=msg[5],
-                        id=msg[6],
-                        media_type=msg[7],
-                    )
-                )
-
-            # Get messages after
-            cursor.execute(
-                """
-                SELECT messages.timestamp, messages.sender, chats.name, messages.content,
-                       messages.is_from_me, chats.jid, messages.id, messages.media_type
-                FROM messages
-                JOIN chats ON messages.chat_jid = chats.jid
-                WHERE messages.chat_jid = ? AND messages.timestamp > ?
-                ORDER BY messages.timestamp ASC
-                LIMIT ?
-            """,
-                (msg_data[7], msg_data[0], after),
-            )
-
-            after_messages = []
-            for msg in cursor.fetchall():
-                after_messages.append(
-                    Message(
-                        timestamp=datetime.fromisoformat(msg[0]),
-                        sender=msg[1],
-                        chat_name=msg[2],
-                        content=msg[3],
-                        is_from_me=msg[4],
-                        chat_jid=msg[5],
-                        id=msg[6],
-                        media_type=msg[7],
-                    )
-                )
-
-            return MessageContext(
-                message=target_message, before=before_messages, after=after_messages
-            )
-
+            return _message_context(conn, message_id, before, after)
     except sqlite3.Error as e:
         logger.error("Database error: %s", e)
         raise
+
+
+def _message_context(
+    conn: sqlite3.Connection,
+    message_id: str,
+    before: int,
+    after: int,
+    chat_jid: str | None = None,
+) -> MessageContext:
+    """Context around a message on an already open connection.
+
+    The same id can exist in two chats; chat_jid picks the right one. Without it the
+    newest row wins (timestamp, then rowid).
+    """
+    cursor = conn.cursor()
+
+    # Get the target message first
+    target_sql = """
+        SELECT messages.timestamp, messages.sender, chats.name, messages.content,
+               messages.is_from_me, chats.jid, messages.id, messages.chat_jid,
+               messages.media_type
+        FROM messages
+        JOIN chats ON messages.chat_jid = chats.jid
+        WHERE messages.id = ?
+    """
+    target_params: tuple = (message_id,)
+    if chat_jid is not None:
+        target_sql += " AND messages.chat_jid = ?"
+        target_params += (chat_jid,)
+    target_sql += " ORDER BY messages.timestamp DESC, messages.rowid DESC LIMIT 1"
+    cursor.execute(target_sql, target_params)
+    msg_data = cursor.fetchone()
+
+    if not msg_data:
+        raise ValueError(f"Message with ID {message_id} not found")
+
+    target_message = Message(
+        timestamp=datetime.fromisoformat(msg_data[0]),
+        sender=msg_data[1],
+        chat_name=msg_data[2],
+        content=msg_data[3],
+        is_from_me=msg_data[4],
+        chat_jid=msg_data[5],
+        id=msg_data[6],
+        media_type=msg_data[8],
+    )
+
+    # Get messages before
+    cursor.execute(
+        """
+        SELECT messages.timestamp, messages.sender, chats.name, messages.content,
+               messages.is_from_me, chats.jid, messages.id, messages.media_type
+        FROM messages
+        JOIN chats ON messages.chat_jid = chats.jid
+        WHERE messages.chat_jid = ? AND messages.timestamp < ?
+        ORDER BY messages.timestamp DESC
+        LIMIT ?
+    """,
+        (msg_data[7], msg_data[0], before),
+    )
+
+    before_messages = []
+    for msg in cursor.fetchall():
+        before_messages.append(
+            Message(
+                timestamp=datetime.fromisoformat(msg[0]),
+                sender=msg[1],
+                chat_name=msg[2],
+                content=msg[3],
+                is_from_me=msg[4],
+                chat_jid=msg[5],
+                id=msg[6],
+                media_type=msg[7],
+            )
+        )
+
+    # Get messages after
+    cursor.execute(
+        """
+        SELECT messages.timestamp, messages.sender, chats.name, messages.content,
+               messages.is_from_me, chats.jid, messages.id, messages.media_type
+        FROM messages
+        JOIN chats ON messages.chat_jid = chats.jid
+        WHERE messages.chat_jid = ? AND messages.timestamp > ?
+        ORDER BY messages.timestamp ASC
+        LIMIT ?
+    """,
+        (msg_data[7], msg_data[0], after),
+    )
+
+    after_messages = []
+    for msg in cursor.fetchall():
+        after_messages.append(
+            Message(
+                timestamp=datetime.fromisoformat(msg[0]),
+                sender=msg[1],
+                chat_name=msg[2],
+                content=msg[3],
+                is_from_me=msg[4],
+                chat_jid=msg[5],
+                id=msg[6],
+                media_type=msg[7],
+            )
+        )
+
+    return MessageContext(message=target_message, before=before_messages, after=after_messages)
 
 
 def list_chats(
@@ -676,7 +698,7 @@ def get_last_interaction(jid: str) -> str:
                 media_type=msg_data[7],
             )
 
-            return format_message(message)
+            return format_message(message, resolve_name=_name_resolver(conn))
 
     except sqlite3.Error as e:
         logger.error("Database error: %s", e)
