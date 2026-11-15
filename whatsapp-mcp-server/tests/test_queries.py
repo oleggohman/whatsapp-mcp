@@ -638,3 +638,134 @@ def test_search_plan_reads_messages_fts(store_dir):
             )
         )
     assert "messages_fts" in plan
+
+
+# --- macOS Contacts name fallback --------------------------------------------------------------
+
+MIA = "972585529067@s.whatsapp.net"
+LID_CHAT = "1999000111@lid"
+
+
+def _chat_names(chats) -> dict:
+    return {c.jid: c.name for c in chats}
+
+
+def test_chat_names_fall_back_to_contacts(contacts_on):
+    names = _chat_names(whatsapp.list_chats(limit=50))
+    assert names[MIA] == "Mia Gohman"
+    assert names[ALICE] == "Alice"  # WhatsApp name wins
+    assert names["g1@g.us"] == "HY.group Support"
+    assert names[LID_CHAT] == "LID 1999000111"  # LID chats are never renamed
+    assert names["12345585529067@s.whatsapp.net"] == "Stranger"
+    assert whatsapp.get_chat(MIA).name == "Mia Gohman"
+    assert whatsapp.get_chat(ALICE).name == "Alice"
+    assert whatsapp.get_direct_chat_by_contact("+972 585529067").name == "Mia Gohman"
+    chats = whatsapp.get_contact_chats("972585529067")
+    assert [c.name for c in chats] == ["Mia Gohman"]
+
+
+def test_chat_names_stay_stored_when_contacts_off(contacts_on, monkeypatch):
+    monkeypatch.setenv("WHATSAPP_MACOS_CONTACTS", "0")
+    assert whatsapp.get_chat(MIA).name == "+972585529067"
+    assert _chat_names(whatsapp.list_chats(limit=50))[MIA] == "+972585529067"
+    assert whatsapp.get_direct_chat_by_contact("972585529067").name == "+972585529067"
+    assert whatsapp.get_contact_chats("972585529067")[0].name == "+972585529067"
+
+
+def test_message_chat_names_fall_back_to_contacts(contacts_on):
+    out = whatsapp.list_messages(chat_jid=MIA, include_context=False)
+    assert "Chat: Mia Gohman" in out and "From: Mia Gohman:" in out
+    ctx = whatsapp.get_message_context("p2", before=1, after=1)
+    assert ctx.message.chat_name == "Mia Gohman"
+    assert [m.chat_name for m in ctx.before + ctx.after] == ["Mia Gohman", "Mia Gohman"]
+    assert "Chat: Mia Gohman" in whatsapp.get_last_interaction("972585529067")
+    lid_out = whatsapp.list_messages(chat_jid=LID_CHAT, include_context=False)
+    assert "Chat: LID 1999000111" in lid_out and "Lid Trap" not in lid_out
+
+
+def test_name_resolver_rules(contacts_on):
+    writer = sqlite3.connect(contacts_on / "messages.db")
+    writer.execute("INSERT INTO chats VALUES ('972520002222@s.whatsapp.net', NULL, NULL)")
+    writer.execute("INSERT INTO chats VALUES ('888888@lid', NULL, NULL)")
+    writer.commit()
+    writer.close()
+    with whatsapp._connect() as conn:
+        resolve = whatsapp._name_resolver(conn)
+        assert resolve("972585529067") == "Mia Gohman"  # placeholder @s.whatsapp.net row
+        assert resolve("972585529067:12") == "Mia Gohman"  # device suffix dropped
+        assert resolve("1999000111") == "LID 1999000111"  # only a @lid row: no Contacts
+        assert resolve("1999000111@lid") == "LID 1999000111"
+        assert resolve("111") == "Alice"
+        assert resolve("972520001111") == "Dan Levi"  # no chat row, number in Contacts
+        assert resolve("5550000") == "5550000"  # no chat row, not in Contacts
+        assert resolve("777777@lid") == "777777@lid"  # LID without a row
+        assert resolve("222@lid") == "Bob"  # no lid row: stored WhatsApp name, no Contacts
+        assert resolve("972520002222") == "972520002222"  # nameless row, not in Contacts
+        assert resolve("888888") == "888888"  # nameless @lid row
+        assert resolve("972585529067") == "Mia Gohman"  # memoized
+
+
+def test_name_resolver_database_error_resolves_to_sender(contacts_on):
+    with whatsapp._connect() as conn:
+        resolve = whatsapp._name_resolver(conn)
+        conn.close()  # any query now raises sqlite3.ProgrammingError
+        assert resolve("111") == "111"
+
+
+def test_search_contacts_by_contacts_name(contacts_on):
+    expected = [
+        whatsapp.Contact(phone_number="972585529067", name="Mia Gohman", jid=MIA),
+    ]
+    assert whatsapp.search_contacts("Mia Gohman") == expected
+    assert whatsapp.search_contacts("Mia") == expected  # no duplicate for the second entry
+    assert [c.name for c in whatsapp.search_contacts("Alice")] == ["Alice"]
+    assert whatsapp.search_contacts("Lid Trap") == []  # LID chats are not matched
+    assert whatsapp.search_contacts("Dan Levi") == []  # no WhatsApp chat for that entry
+
+
+def test_search_contacts_ignores_contacts_when_off(contacts_on, monkeypatch):
+    monkeypatch.setenv("WHATSAPP_MACOS_CONTACTS", "0")
+    assert whatsapp.search_contacts("Mia Gohman") == []
+
+
+@pytest.mark.parametrize("sql_hits,expect_mia", [(50, False), (49, True)])
+def test_search_contacts_caps_at_50(store_dir, tmp_path, monkeypatch, sql_hits, expect_mia):
+    from conftest import enable_contacts
+
+    enable_contacts(tmp_path / "ab", monkeypatch, {"": [("Bulk", "Mia", "", ["+972585529067"])]})
+    conn = sqlite3.connect(store_dir / "messages.db")
+    conn.executemany(
+        "INSERT INTO chats VALUES (?, ?, ?)",
+        [(f"9725000000{n:02d}@s.whatsapp.net", f"Bulk {n:02d}", None) for n in range(sql_hits)],
+    )
+    conn.execute("INSERT INTO chats VALUES (?, ?, ?)", (MIA, "+972585529067", None))
+    conn.commit()
+    conn.close()
+    result = whatsapp.search_contacts("Bulk")
+    assert len(result) == 50
+    assert (MIA in [c.jid for c in result]) is expect_mia
+    if expect_mia:
+        assert [c.name for c in result if c.jid == MIA] == ["Bulk Mia"]
+
+
+@pytest.mark.parametrize(
+    "name,jid,expected",
+    [
+        ("", "972585529067@s.whatsapp.net", True),
+        (None, "972585529067@s.whatsapp.net", True),
+        ("972585529067", "972585529067@s.whatsapp.net", True),
+        ("+972 58-552 9067", "972585529067@s.whatsapp.net", True),
+        ("LID 123", "123@lid", True),
+        ("Group g1", "g1@g.us", True),
+        ("HY.group Support", "g1@g.us", False),
+        ("Alice", "111@s.whatsapp.net", False),
+        ("+1 Support", "111@s.whatsapp.net", False),
+    ],
+)
+def test_is_placeholder_name(name, jid, expected):
+    assert whatsapp._is_placeholder_name(name, jid) is expected
+
+
+def test_user_part_drops_device_suffix():
+    assert whatsapp._user_part("972585529067:12@s.whatsapp.net") == "972585529067"
+    assert whatsapp._user_part("972585529067") == "972585529067"

@@ -95,7 +95,8 @@ def search_contacts(query: str) -> list[dict[str, Any]]:
     """Search WhatsApp contacts by name or phone number.
 
     Args:
-        query: Search term to match against contact names or phone numbers
+        query: Search term to match against contact names or phone numbers. On macOS, names
+            from the Contacts app are also matched for chats WhatsApp has no name for.
     """
     contacts = _read(whatsapp_search_contacts, query)
     return to_jsonable(contacts)

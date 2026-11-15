@@ -1,6 +1,7 @@
 import logging
 import os.path
 import pathlib
+import re
 import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -12,6 +13,7 @@ import httpx
 
 import audio
 import bridge_manager
+import contacts_macos
 
 # stdout is the MCP stdio transport: all diagnostics go through logging (stderr).
 logger = logging.getLogger(__name__)
@@ -95,13 +97,43 @@ _LAST_ROWID = (
 
 
 def _user_part(jid: str) -> str:
-    """Return the user part of a JID or phone number (drops `@server`)."""
-    return jid.split("@")[0]
+    """Return the user part of a JID or phone number (drops `@server` and a `:device` suffix)."""
+    return jid.split("@")[0].split(":")[0]
 
 
 def _is_group_jid(jid: str) -> bool:
     """Return True for a group JID (`...@g.us`), the rule behind `NOT LIKE '%@g.us'`."""
     return jid.endswith("@g.us")
+
+
+_PLACEHOLDER_LID = re.compile(r"^LID \d+$")
+_PLACEHOLDER_NUMBER = re.compile(r"^\+?[\d\s\-()]+$")
+
+
+def _is_placeholder_name(name: str | None, jid: str) -> bool:
+    """True when name is empty or a generated fallback rather than a real name.
+
+    Mirrors isPlaceholderName in whatsapp-bridge/chatname.go: empty, the bare user part,
+    "LID <digits>", "Group <id>" for a group, or a number-like string.
+    """
+    name = (name or "").strip()
+    user = jid.split("@")[0]
+    if not name or name == user or _PLACEHOLDER_LID.match(name):
+        return True
+    if _is_group_jid(jid):
+        return name == f"Group {user}"
+    return _PLACEHOLDER_NUMBER.match(name) is not None
+
+
+def _display_name(jid: str, name: str | None) -> str | None:
+    """Chat name with the macOS Contacts fallback.
+
+    WhatsApp names win. Only a placeholder name of a direct chat is replaced; group and LID
+    chats are left alone because a LID is not a phone number.
+    """
+    if _is_group_jid(jid) or jid.endswith("@lid") or not _is_placeholder_name(name, jid):
+        return name
+    return contacts_macos.get_index().name_for(_user_part(jid)) or name
 
 
 def to_jsonable(obj: Any) -> Any:
@@ -161,28 +193,47 @@ class MessageContext:
 def _name_resolver(conn: sqlite3.Connection) -> Callable[[str], str]:
     """Return a sender -> display name lookup bound to one open connection.
 
-    The stored sender is the user part of a JID. Its `@server` suffix is dropped and
-    `user@s.whatsapp.net`, then `user@lid`, are looked up by primary key. There is no
-    substring match, so `15551212` never takes the name of `551212`. Results are memoized
-    for the life of the resolver; a sender with no named chat, or whose lookup fails, resolves
-    to itself.
+    The stored sender is the user part of a JID; its `@server` and `:device` suffixes are
+    dropped. A sender ending in `@lid` is looked up as `user@lid` only. Any other sender is
+    looked up as `user@s.whatsapp.net` by primary key: a placeholder name there, or no chat row
+    at all (the bare sender is then a phone number), falls back to macOS Contacts. A sender
+    that only has a `user@lid` row keeps that name: its digits are a LID, never matched against
+    Contacts. There is no substring match, so `15551212` never takes the name of `551212`.
+    Results are memoized for the life of the resolver; a sender with no name, or whose lookup
+    fails, resolves to itself.
     """
     cache: dict[str, str] = {}
+
+    def lookup(jid: str) -> tuple[bool, str | None]:
+        row = conn.execute("SELECT name FROM chats WHERE jid = ?", (jid,)).fetchone()
+        return row is not None, (row[0] if row else None)
+
+    def compute(sender: str) -> str:
+        user = _user_part(sender)
+        if sender.endswith("@lid"):
+            # No Contacts lookup for a LID. Without a `user@lid` row the stored WhatsApp name of
+            # `user@s.whatsapp.net` is still used, as before the Contacts fallback existed.
+            return lookup(f"{user}@lid")[1] or lookup(f"{user}@s.whatsapp.net")[1] or sender
+        pn_jid = f"{user}@s.whatsapp.net"
+        found, name = lookup(pn_jid)
+        if found:
+            if name and not _is_placeholder_name(name, pn_jid):
+                return name
+            return contacts_macos.get_index().name_for(user) or name or sender
+        found, name = lookup(f"{user}@lid")
+        if found:
+            return name or sender
+        return contacts_macos.get_index().name_for(user) or sender
 
     def resolve(sender: str) -> str:
         if sender in cache:
             return cache[sender]
-        user = _user_part(sender)
         try:
-            for jid in (f"{user}@s.whatsapp.net", f"{user}@lid"):
-                row = conn.execute("SELECT name FROM chats WHERE jid = ?", (jid,)).fetchone()
-                if row and row[0]:
-                    cache[sender] = row[0]
-                    return row[0]
+            cache[sender] = compute(sender)
         except sqlite3.Error as e:
             logger.error("Database error while getting sender name: %s", e)
-        cache[sender] = sender
-        return sender
+            cache[sender] = sender
+        return cache[sender]
 
     return resolve
 
@@ -390,7 +441,7 @@ def list_messages(
                 message = Message(
                     timestamp=datetime.fromisoformat(msg[0]),
                     sender=msg[1],
-                    chat_name=msg[2],
+                    chat_name=_display_name(msg[5], msg[2]),
                     content=msg[3],
                     is_from_me=msg[4],
                     chat_jid=msg[5],
@@ -469,7 +520,7 @@ def _message_context(
     target_message = Message(
         timestamp=datetime.fromisoformat(msg_data[0]),
         sender=msg_data[1],
-        chat_name=msg_data[2],
+        chat_name=_display_name(msg_data[5], msg_data[2]),
         content=msg_data[3],
         is_from_me=msg_data[4],
         chat_jid=msg_data[5],
@@ -497,7 +548,7 @@ def _message_context(
             Message(
                 timestamp=datetime.fromisoformat(msg[0]),
                 sender=msg[1],
-                chat_name=msg[2],
+                chat_name=_display_name(msg[5], msg[2]),
                 content=msg[3],
                 is_from_me=msg[4],
                 chat_jid=msg[5],
@@ -526,7 +577,7 @@ def _message_context(
             Message(
                 timestamp=datetime.fromisoformat(msg[0]),
                 sender=msg[1],
-                chat_name=msg[2],
+                chat_name=_display_name(msg[5], msg[2]),
                 content=msg[3],
                 is_from_me=msg[4],
                 chat_jid=msg[5],
@@ -605,7 +656,7 @@ def list_chats(
             for chat_data in chats:
                 chat = Chat(
                     jid=chat_data[0],
-                    name=chat_data[1],
+                    name=_display_name(chat_data[0], chat_data[1]),
                     last_message_time=datetime.fromisoformat(chat_data[2])
                     if chat_data[2]
                     else None,
@@ -620,6 +671,35 @@ def list_chats(
     except sqlite3.Error as e:
         logger.error("Database error: %s", e)
         return []
+
+
+_SEARCH_LIMIT = 50
+
+
+def _add_contacts_matches(cursor: sqlite3.Cursor, query: str, result: list[Contact]) -> None:
+    """Append direct chats whose number belongs to a macOS Contacts entry matching query.
+
+    Only `@s.whatsapp.net` chats are considered (a LID is not a phone number). A chat matches
+    the entry's full digits exactly, or its national digits after a 1-3 digit country code.
+    Chats already in result are skipped and the list stops at _SEARCH_LIMIT contacts.
+    """
+    seen = {c.jid for c in result}
+    for entry in contacts_macos.get_index().entries_matching(query):
+        rows = cursor.execute(
+            "SELECT jid, name FROM chats WHERE jid LIKE '%@s.whatsapp.net' "
+            "AND (jid = ? || '@s.whatsapp.net' OR jid LIKE '%' || ? || '@s.whatsapp.net')",
+            (entry.full, entry.national),
+        ).fetchall()
+        for jid, name in rows:
+            if len(result) >= _SEARCH_LIMIT:
+                return
+            user = _user_part(jid)
+            if jid in seen or (
+                user != entry.full and not 1 <= len(user) - len(entry.national) <= 3
+            ):
+                continue
+            seen.add(jid)
+            result.append(Contact(phone_number=user, name=_display_name(jid, name), jid=jid))
 
 
 def search_contacts(query: str) -> list[Contact]:
@@ -658,10 +738,13 @@ def search_contacts(query: str) -> list[Contact]:
             for contact_data in contacts:
                 contact = Contact(
                     phone_number=contact_data[0].split("@")[0],
-                    name=contact_data[1],
+                    name=_display_name(contact_data[0], contact_data[1]),
                     jid=contact_data[0],
                 )
                 result.append(contact)
+
+            if contacts_macos.enabled():
+                _add_contacts_matches(cursor, query, result)
 
             return result
 
@@ -732,7 +815,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> list[Chat]:
             for chat_data in chats:
                 chat = Chat(
                     jid=chat_data[0],
-                    name=chat_data[1],
+                    name=_display_name(chat_data[0], chat_data[1]),
                     last_message_time=datetime.fromisoformat(chat_data[2])
                     if chat_data[2]
                     else None,
@@ -809,7 +892,7 @@ def get_last_interaction(jid: str) -> str:
             message = Message(
                 timestamp=datetime.fromisoformat(msg_data[0]),
                 sender=msg_data[1],
-                chat_name=msg_data[2],
+                chat_name=_display_name(msg_data[5], msg_data[2]),
                 content=msg_data[3],
                 is_from_me=msg_data[4],
                 chat_jid=msg_data[5],
@@ -860,7 +943,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Chat | None:
 
             return Chat(
                 jid=chat_data[0],
-                name=chat_data[1],
+                name=_display_name(chat_data[0], chat_data[1]),
                 last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
                 last_message=chat_data[3],
                 last_sender=chat_data[4],
@@ -908,7 +991,7 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Chat | None:
 
             return Chat(
                 jid=chat_data[0],
-                name=chat_data[1],
+                name=_display_name(chat_data[0], chat_data[1]),
                 last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
                 last_message=chat_data[3],
                 last_sender=chat_data[4],

@@ -200,3 +200,72 @@ def store_dir(tmp_path, monkeypatch):
     monkeypatch.delenv("WHATSAPP_API_BASE_URL", raising=False)
     monkeypatch.delenv("WHATSAPP_BRIDGE_TOKEN", raising=False)
     return tmp_path
+
+
+def enable_contacts(root: Path, monkeypatch, sources, default: str | None = None) -> None:
+    """Point contacts_macos at a fake AddressBook tree under root, as if running on macOS."""
+    prefs = make_addressbook(root, sources, default)
+    monkeypatch.setattr(contacts_macos, "_is_macos", lambda: True)
+    monkeypatch.setattr(contacts_macos, "addressbook_dir", lambda: root)
+    monkeypatch.setattr(contacts_macos, "preferences_path", lambda: prefs)
+    monkeypatch.setenv("WHATSAPP_MACOS_CONTACTS", "1")
+    contacts_macos.reset()
+
+
+# Placeholder-named direct chat (Mia), a LID chat whose digits also sit in Contacts, and a
+# chat whose number matches Mia's national digits only behind a 5 digit prefix.
+CONTACTS_CHATS = [
+    ("972585529067@s.whatsapp.net", "+972585529067", "2025-01-04 08:00:00+00:00"),
+    ("1999000111@lid", "LID 1999000111", "2025-01-05 08:00:00+00:00"),
+    ("12345585529067@s.whatsapp.net", "Stranger", "2025-01-06 08:00:00+00:00"),
+]
+# (id, chat_jid, sender, content, timestamp, is_from_me)
+CONTACTS_MESSAGES = [
+    (
+        "p1",
+        "972585529067@s.whatsapp.net",
+        "972585529067",
+        "mia one",
+        "2025-01-04 08:00:00+00:00",
+        0,
+    ),
+    (
+        "p2",
+        "972585529067@s.whatsapp.net",
+        "972585529067",
+        "mia two",
+        "2025-01-04 08:01:00+00:00",
+        0,
+    ),
+    ("p3", "972585529067@s.whatsapp.net", "Me", "mia three", "2025-01-04 08:02:00+00:00", 1),
+    ("p4", "1999000111@lid", "1999000111", "from lid", "2025-01-05 08:00:00+00:00", 0),
+]
+
+
+@pytest.fixture
+def contacts_on(store_dir, tmp_path, monkeypatch):
+    """store_dir plus a fake AddressBook and Contacts-eligible chats; Contacts enabled."""
+    enable_contacts(
+        tmp_path / "ab",
+        monkeypatch,
+        {
+            "a": [
+                ("Mia", "Gohman", "", ["0585529067"]),
+                ("Lid", "Trap", "", ["+1 999000111"]),
+                ("Dan", "Levi", "", ["+972 52 000 1111"]),
+            ],
+            "b": [("Mia", "Gohman", "", ["+972 58-552-9067"])],
+        },
+        default="a",
+    )
+    conn = sqlite3.connect(store_dir / "messages.db")
+    conn.executemany("INSERT INTO chats VALUES (?, ?, ?)", CONTACTS_CHATS)
+    conn.executemany(
+        "INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        CONTACTS_MESSAGES,
+    )
+    conn.execute("INSERT INTO messages_fts(messages_fts) VALUES ('rebuild')")
+    conn.commit()
+    conn.close()
+    return store_dir

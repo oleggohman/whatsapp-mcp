@@ -279,3 +279,10 @@ async def test_tool_schemas_match_baseline():
     }
     for name, schema in baseline.items():
         assert _normalize(tools[name]) == _normalize(schema), name
+
+
+async def test_search_contacts_by_contacts_name(contacts_on):
+    res = await call("search_contacts", query="Mia Gohman")
+    assert res == [
+        {"phone_number": "972585529067", "name": "Mia Gohman", "jid": "972585529067@s.whatsapp.net"}
+    ]
