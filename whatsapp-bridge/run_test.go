@@ -716,8 +716,8 @@ func TestRunLogsIntegrityCheck(t *testing.T) {
 		check ftsCheck
 		want  string
 	}{
-		"passed": {ftsCheck{took: 1500 * time.Millisecond}, "Search index integrity check passed in 1.5s"},
-		"failed": {ftsCheck{took: 2 * time.Second, err: io.ErrUnexpectedEOF},
+		"passed": {ftsCheck{ran: true, took: 1500 * time.Millisecond}, "Search index integrity check passed in 1.5s"},
+		"failed": {ftsCheck{ran: true, took: 2 * time.Second, err: io.ErrUnexpectedEOF},
 			"Search index failed its integrity check after 2s, rebuilding it: unexpected EOF"},
 	} {
 		t.Run(name, func(t *testing.T) {

@@ -737,8 +737,8 @@ func TestMigrateSearchDamagedIndexIsRebuilt(t *testing.T) {
 				t.Fatalf("migrateSearch: %v", err)
 			}
 			checkWritesWork(t, s, chat)
-			if s.ftsCheck.err == nil || s.ftsCheck.took <= 0 {
-				t.Fatalf("ftsCheck = %+v, want the failed integrity check and its duration", s.ftsCheck)
+			if s.ftsCheck.err == nil || !s.ftsCheck.ran {
+				t.Fatalf("ftsCheck = %+v, want the failed integrity check that ran", s.ftsCheck)
 			}
 			if n := ftsTriggers(t, s); n != 3 {
 				t.Fatalf("triggers = %d, want 3 on the rebuilt index", n)
@@ -802,8 +802,8 @@ func TestMigrateSearchHealthyIndexIsKept(t *testing.T) {
 	if err := s.migrateSearch(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if s.ftsCheck.err != nil || s.ftsCheck.took <= 0 {
-		t.Fatalf("ftsCheck = %+v, want a passed check with its duration", s.ftsCheck)
+	if s.ftsCheck.err != nil || !s.ftsCheck.ran {
+		t.Fatalf("ftsCheck = %+v, want a passed check that ran", s.ftsCheck)
 	}
 	var automerge int
 	if err := s.db.QueryRow("SELECT v FROM messages_fts_config WHERE k = 'automerge'").Scan(&automerge); err != nil || automerge != 7 {

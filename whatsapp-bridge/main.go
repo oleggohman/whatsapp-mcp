@@ -306,7 +306,7 @@ func run() int {
 	if !cancelled {
 		if c := messageStore.ftsCheck; c.err != nil {
 			logger.Warnf("Search index failed its integrity check after %s, rebuilding it: %v", c.took.Round(time.Millisecond), c.err)
-		} else if c.took > 0 {
+		} else if c.ran {
 			logger.Infof("Search index integrity check passed in %s", c.took.Round(time.Millisecond))
 		}
 		if migErr != nil {

@@ -68,7 +68,9 @@ type MessageStore struct {
 }
 
 // ftsCheck is how long an integrity check of messages_fts took and what it found (nil: healthy).
+// ran is set once the check executed: took alone cannot tell, as a coarse clock (Windows) can report 0.
 type ftsCheck struct {
+	ran  bool
 	took time.Duration
 	err  error
 }
@@ -250,7 +252,7 @@ func (store *MessageStore) ftsHealthy(ctx context.Context, triggers int) (bool, 
 	if err == nil && triggers == 3 && indexed == total {
 		start := time.Now()
 		_, err = store.db.ExecContext(ctx, `INSERT INTO messages_fts(messages_fts, rank) VALUES('integrity-check', 1)`)
-		store.ftsCheck = ftsCheck{took: time.Since(start), err: err}
+		store.ftsCheck = ftsCheck{ran: true, took: time.Since(start), err: err}
 		if err == nil {
 			return true, nil
 		}
