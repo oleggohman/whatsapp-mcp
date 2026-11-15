@@ -1,5 +1,6 @@
 """Shared fixtures: a temp messages.db with the bridge schema plus an optional whatsapp.db."""
 
+import plistlib
 import sqlite3
 import sys
 from pathlib import Path
@@ -9,6 +10,8 @@ import pytest
 SERVER_DIR = Path(__file__).resolve().parent.parent
 if str(SERVER_DIR) not in sys.path:
     sys.path.insert(0, str(SERVER_DIR))
+
+import contacts_macos  # noqa: E402
 
 DEFAULT_STORE = SERVER_DIR.parent / "whatsapp-bridge" / "store"
 
@@ -25,10 +28,53 @@ def _isolate_store(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("WHATSAPP_DB_PATH", str(store / "messages.db"))
     monkeypatch.setenv("WHATSAPP_BRIDGE_AUTOSTART", "0")
     monkeypatch.delenv("WHATSAPP_BRIDGE_TOKEN", raising=False)
+    # Never read the real AddressBook; Contacts tests opt in with their own fake tree.
+    monkeypatch.setenv("WHATSAPP_MACOS_CONTACTS", "0")
+    contacts_macos.reset()
     yield
+    contacts_macos.reset()
     assert not (DEFAULT_STORE / "bridge.token").exists(), (
         f"test wrote into the real default store {DEFAULT_STORE}"
     )
+
+
+def make_addressbook(
+    root: Path,
+    sources: dict[str, list[tuple[str, str, str, list[str]]]],
+    default: str | None = None,
+) -> Path:
+    """Write a fake AddressBook tree under root and return the path of its prefs plist.
+
+    sources maps a source key to records (first, last, organization, numbers); key "" is the
+    root database, any other key is root/Sources/<key>/. A binary plist with
+    ABDefaultSourceID is written to root/prefs.plist when default is given.
+    """
+    for key, records in sources.items():
+        folder = root / "Sources" / key if key else root
+        folder.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(folder / "AddressBook-v22.abcddb")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            "CREATE TABLE ZABCDRECORD (Z_PK INTEGER PRIMARY KEY, "
+            "ZFIRSTNAME TEXT, ZLASTNAME TEXT, ZORGANIZATION TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE ZABCDPHONENUMBER (Z_PK INTEGER PRIMARY KEY, ZOWNER INTEGER, "
+            "ZFULLNUMBER TEXT)"
+        )
+        for pk, (first, last, org, numbers) in enumerate(records, start=1):
+            conn.execute("INSERT INTO ZABCDRECORD VALUES (?, ?, ?, ?)", (pk, first, last, org))
+            for number in numbers:
+                conn.execute(
+                    "INSERT INTO ZABCDPHONENUMBER (ZOWNER, ZFULLNUMBER) VALUES (?, ?)",
+                    (pk, number),
+                )
+        conn.commit()
+        conn.close()
+    prefs = root / "prefs.plist"
+    if default is not None:
+        prefs.write_bytes(plistlib.dumps({"ABDefaultSourceID": default}, fmt=plistlib.FMT_BINARY))
+    return prefs
 
 
 # The index, FTS and trigger DDL below copies migrateIndexesSQL, migrateFTSTableSQL and
