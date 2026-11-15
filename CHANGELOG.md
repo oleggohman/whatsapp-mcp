@@ -14,8 +14,9 @@ published in the [oleggohman/cc-things](https://github.com/oleggohman/cc-things)
 - An FTS index with segments that have no `messages_fts_idx` entry is now detected. FTS5 finds a
   term through that table, so such a segment made search return no hits for its terms while both
   `integrity-check` forms and the row count passed. The start-up check now counts these segments
-  first; on a hit the next start drops and rebuilds the index, and search uses `LIKE` meanwhile.
-  The check cannot see a segment that keeps at least one idx row and lost others.
+  before the integrity check; on a hit that start drops and rebuilds the index, and search uses
+  `LIKE` while the rebuild runs. The check cannot see a segment that keeps at least one idx row
+  and lost others.
 - `get_contact_chats` and `get_last_interaction` match a group JID (`...@g.us`) only to its own
   chat. Before, a group JID could also match chats through the contact and sender lookups.
 
@@ -26,12 +27,14 @@ published in the [oleggohman/cc-things](https://github.com/oleggohman/cc-things)
   second entry, "Search misses messages that exist", covers damage the start-up checks cannot see.
   Messages stay stored and search keeps working through `LIKE`.
 - The bridge bundles go-sqlite3 1.14.53 (SQLite 3.54.1, was 1.14.52).
-- The MCP server runs on mcp 2.x (`mcp[cli]>=2.3.0,<3`) and pulls in the new `mcp-types` and
-  `opentelemetry-api` packages. The tools and their error texts are unchanged. The server now
-  reports the release as its `serverInfo.version`.
-- `list_messages` reads the hits and their context in one read transaction. This does not block
-  bridge writes on a WAL database, which is what the bridge always creates. On a rollback-journal
-  `messages.db` a bridge write waits until the call ends.
+- The MCP server runs on mcp 2.x (`mcp[cli]>=2.3.0,<3`). The lock file adds `mcp-types`,
+  `opentelemetry-api`, `httpx2`, `httpcore2`, `truststore` and `httpx2-jsfetch` (Emscripten only),
+  and drops `httpx-sse` and `pydantic-settings`. The tools and their error texts are unchanged. The
+  server now reports the release as its `serverInfo.version`.
+- `list_messages` reads the hits and their context in one read transaction. The bridge switches
+  `messages.db` to WAL mode each time it opens it, and in WAL mode this does not block bridge
+  writes. Where WAL is not in effect, a bridge write waits up to 5 s for the call to end and then
+  fails with `database is locked`.
 
 ## [0.4.0] - 2026-11-15
 

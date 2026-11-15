@@ -833,13 +833,17 @@ func TestMigrateSearchIndexWithoutIdxEntriesIsRebuilt(t *testing.T) {
 			if err := s.migrateSearch(context.Background()); err != nil {
 				t.Fatal(err)
 			}
+			// Small pages give multi-leaf segments from a small corpus; the rebuild resets pgsz
+			if _, err := s.db.Exec("INSERT INTO messages_fts(messages_fts, rank) VALUES('pgsz', 64)"); err != nil {
+				t.Fatal(err)
+			}
 			// Three transactions through the triggers give several segments of several leaves each
 			rng := rand.New(rand.NewSource(1))
 			for b := range 3 {
-				batch := make([]historyMessage, 0, 1000)
-				for i := range 1000 {
-					words := make([]string, 0, 150)
-					for len(words) < 150 {
+				batch := make([]historyMessage, 0, 100)
+				for i := range 100 {
+					words := make([]string, 0, 30)
+					for len(words) < 30 {
 						w := make([]byte, 3+rng.Intn(6))
 						for j := range w {
 							w[j] = byte('a' + rng.Intn(26))
@@ -901,6 +905,42 @@ func TestMigrateSearchIndexWithoutIdxEntriesIsRebuilt(t *testing.T) {
 				t.Fatalf("second start: ftsCheck = %+v, want a passed check", s.ftsCheck)
 			}
 		})
+	}
+}
+
+// Segment ids are 16-bit. A damaged row with a far higher id used to make (seg.id + 1) << 37 wrap
+// to a negative value, so the segment walk restarted forever and the start never finished. The
+// walk now stops there and counts the row as a damaged segment.
+func TestMigrateSearchOutOfRangeSegmentIDIsRebuilt(t *testing.T) {
+	s := newTestStore(t)
+	chat := "a@s.whatsapp.net"
+	if err := s.StoreChat(chat, "A", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.StoreMessage("m1", chat, "111", "pelican", time.Now(), false, "", "", "", nil, nil, nil, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.migrateSearch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec("INSERT INTO messages_fts_data (id, block) VALUES (?, x'')", int64(1<<26-1)<<37+1); err != nil {
+		t.Fatal(err)
+	}
+	s.db.SetMaxIdleConns(0)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := s.migrateSearch(ctx); err != nil {
+		t.Fatalf("migrateSearch: %v", err)
+	}
+	if !s.ftsCheck.ran || s.ftsCheck.err == nil || !strings.Contains(s.ftsCheck.err.Error(), "1 index segments have no entry") {
+		t.Fatalf("ftsCheck = %+v, want the failed segment check", s.ftsCheck)
+	}
+	if got := ftsHits(t, s, "pelican"); len(got) != 1 || got[0] != "m1" {
+		t.Fatalf("MATCH pelican = %v, want [m1]", got)
+	}
+	var high int
+	if err := s.db.QueryRow("SELECT count(*) FROM messages_fts_data WHERE id >= (65536 << 37)").Scan(&high); err != nil || high != 0 {
+		t.Fatalf("rows with out-of-range segment ids = %d, %v, want 0 after the rebuild", high, err)
 	}
 }
 
@@ -984,12 +1024,21 @@ func TestMigrateSearchSegmentCheckKeepsHealthyIndexes(t *testing.T) {
 				for i := range 300 {
 					store(t, s, chat, fmt.Sprintf("w%d", i), fmt.Sprintf("kingfisher %d", i))
 				}
+				segments := func() int {
+					t.Helper()
+					var n int
+					if err := s.db.QueryRow("SELECT count(DISTINCT id >> 37) FROM messages_fts_data WHERE id >= (1 << 37)").Scan(&n); err != nil {
+						t.Fatal(err)
+					}
+					return n
+				}
+				before := segments()
 				if _, err := s.db.Exec("INSERT INTO messages_fts(messages_fts, rank) VALUES('merge', 2)"); err != nil {
 					t.Fatal(err)
 				}
-				var segments int
-				if err := s.db.QueryRow("SELECT count(DISTINCT id >> 37) FROM messages_fts_data WHERE id >= (1 << 37)").Scan(&segments); err != nil || segments < 2 {
-					t.Fatalf("segments = %d, %v: the merge must be unfinished", segments, err)
+				// An unfinished merge adds its output segment while every input is still there
+				if after := segments(); after <= before {
+					t.Fatalf("segments = %d before the merge step, %d after: the merge must be unfinished", before, after)
 				}
 			},
 			matches: 300,
@@ -1079,7 +1128,8 @@ func TestBundledSQLiteVersionFloor(t *testing.T) {
 	}
 }
 
-// The statements of the README entry "Search index cannot be removed". Keep them in step with it.
+// The statements of the README entry "Search index cannot be removed".
+// TestFTSRecoverySectionExistsInREADME checks that the entry holds each of them.
 var documentedFTSRecovery = []string{
 	`DROP TRIGGER IF EXISTS messages_fts_insert`,
 	`DROP TRIGGER IF EXISTS messages_fts_delete`,
@@ -1144,13 +1194,23 @@ func TestDocumentedFTSRecoveryRemovesBrokenTable(t *testing.T) {
 	}
 }
 
-// The log line names a README section; it must not point at one that was renamed.
+// The log line names a README section; it must not point at one that was renamed, and the
+// statements in it must be the ones TestDocumentedFTSRecoveryRemovesBrokenTable runs.
 func TestFTSRecoverySectionExistsInREADME(t *testing.T) {
 	b, err := os.ReadFile("../README.md")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(b), ftsRecoverySection) {
-		t.Fatalf("README.md has no %q section", ftsRecoverySection)
+	// A Windows checkout may have CRLF line ends
+	readme := strings.ReplaceAll(string(b), "\r\n", "\n")
+	_, entry, ok := strings.Cut(readme, "\n- **"+ftsRecoverySection+".**")
+	if !ok {
+		t.Fatalf("README.md has no %q Troubleshooting entry", ftsRecoverySection)
+	}
+	entry, _, _ = strings.Cut(entry, "\n- **")
+	for _, q := range documentedFTSRecovery {
+		if !strings.Contains(entry, "\n     "+q+";\n") {
+			t.Errorf("README entry %q lacks the statement %q", ftsRecoverySection, q+";")
+		}
 	}
 }

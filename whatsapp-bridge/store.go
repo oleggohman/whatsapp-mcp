@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	sqlite3 "github.com/mattn/go-sqlite3"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 )
@@ -242,7 +242,9 @@ func (store *MessageStore) migrateSearch(ctx context.Context) error {
 // so records its first leaf. Segment leaves live in messages_fts_data under id = segid << 37 | ...
 // (FTS5_DATA_PAGE_B 31 + FTS5_DATA_HEIGHT_B 5 + FTS5_DATA_DLI_B 1); ids 1 and 10 are the averages
 // and structure records and sit below 1 << 37. The recursion hops from one segment id to the next
-// with one index seek each, so it never scans the table.
+// with one index seek each, so it never scans the table. Segment ids are 16-bit, so the walk stops
+// at the first id of 65536 or more and counts it as a damaged segment: a higher id would make
+// (seg.id + 1) << 37 wrap to a negative value and restart the walk forever.
 // This depends on the FTS5 on-disk layout and assumes messages_fts does not use contentless_delete:
 // that option stores tombstone pages under segid + 65536 (FTS5_TOMBSTONE_ROWID), which this query
 // would read as segments without idx rows. messages_fts is an external-content table, so it has
@@ -252,10 +254,10 @@ const ftsSegmentsWithoutIdxSQL = `
 		SELECT min(id) >> 37 FROM messages_fts_data WHERE id >= (1 << 37)
 		UNION ALL
 		SELECT (SELECT min(id) >> 37 FROM messages_fts_data WHERE id >= ((seg.id + 1) << 37))
-		FROM seg WHERE seg.id IS NOT NULL
+		FROM seg WHERE seg.id IS NOT NULL AND seg.id < 65536
 	)
 	SELECT count(*) FROM seg
-	WHERE id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM messages_fts_idx WHERE segid = seg.id)`
+	WHERE id IS NOT NULL AND (id >= 65536 OR NOT EXISTS (SELECT 1 FROM messages_fts_idx WHERE segid = seg.id))`
 
 // ftsHealthy reports whether the existing messages_fts can be kept: all three triggers are
 // there, the docsize shadow table counts every message, no index segment lacks its
@@ -309,12 +311,21 @@ const ftsRecoverySection = "Search index cannot be removed"
 // messages no longer touch the index, and readers ignore a table without its triggers. Then it
 // drops the table. FTS5 must open a table to drop it, so a broken one stays behind; it is
 // harmless without triggers, and the next start tries again. A failed table drop wraps
-// errFTSNotDroppable. run logs the error and connects.
+// errFTSNotDroppable unless SQLite reports a transient or file-level failure (busy, locked, disk
+// full, read-only, I/O error), which the README recovery would not fix. run logs the error and
+// connects.
 func (store *MessageStore) dropFTS(ctx context.Context) error {
 	if _, err := store.db.ExecContext(ctx, dropFTSTriggersSQL); err != nil {
 		return fmt.Errorf("triggers: %w", err)
 	}
 	if _, err := store.db.ExecContext(ctx, `DROP TABLE IF EXISTS messages_fts`); err != nil {
+		var se sqlite3.Error
+		if errors.As(err, &se) {
+			switch se.Code {
+			case sqlite3.ErrBusy, sqlite3.ErrLocked, sqlite3.ErrFull, sqlite3.ErrReadonly, sqlite3.ErrIoErr:
+				return fmt.Errorf("table: %w", err)
+			}
+		}
 		return fmt.Errorf("table: %w: %w", errFTSNotDroppable, err)
 	}
 	return nil

@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	sqlite3 "github.com/mattn/go-sqlite3"
 )
 
 // fakeConnector is a database/sql driver that answers every query with canned rows, so tests
@@ -32,6 +34,8 @@ type fakeConnector struct {
 	// failSQL fails the Prepare of any statement containing this text, so one chosen statement
 	// of a multi-statement flow can fail (Exec and Query both prepare first).
 	failSQL string
+	// failSQLErr, when set, is the error a failSQL statement returns instead of "statement boom".
+	failSQLErr error
 	// queryRows, when set, answers a Query per statement text; the column count follows the row width.
 	queryRows func(query string) [][]driver.Value
 }
@@ -51,6 +55,9 @@ func (f *fakeConn) Prepare(query string) (driver.Stmt, error) {
 		return nil, errors.New("prepare boom")
 	}
 	if f.c.failSQL != "" && strings.Contains(query, f.c.failSQL) {
+		if f.c.failSQLErr != nil {
+			return nil, f.c.failSQLErr
+		}
 		return nil, errors.New("statement boom")
 	}
 	return &fakeStmt{f.c, query}, nil
@@ -307,6 +314,28 @@ func TestMigrateSearchFailsClosed(t *testing.T) {
 			}
 		})
 	}
+	// A busy, locked, full, read-only or failing file is not a damaged table: no recovery hint
+	for name, code := range map[string]sqlite3.ErrNo{
+		"busy": sqlite3.ErrBusy, "locked": sqlite3.ErrLocked, "full": sqlite3.ErrFull,
+		"readonly": sqlite3.ErrReadonly, "ioerr": sqlite3.ErrIoErr,
+	} {
+		t.Run("drop table "+name, func(t *testing.T) {
+			c := &fakeConnector{txMode: true, failSQL: "DROP TABLE", failSQLErr: sqlite3.Error{Code: code}, queryRows: stale}
+			err := fakeStore(c).migrateSearch(context.Background())
+			if err == nil || !strings.Contains(err.Error(), "drop stale messages_fts: table: ") {
+				t.Fatalf("err = %v, want a failed table drop", err)
+			}
+			if errors.Is(err, errFTSNotDroppable) {
+				t.Fatalf("err = %v wraps errFTSNotDroppable", err)
+			}
+		})
+	}
+	t.Run("drop table sqlite error", func(t *testing.T) {
+		c := &fakeConnector{txMode: true, failSQL: "DROP TABLE", failSQLErr: sqlite3.Error{Code: sqlite3.ErrError}, queryRows: stale}
+		if err := fakeStore(c).migrateSearch(context.Background()); !errors.Is(err, errFTSNotDroppable) {
+			t.Fatalf("err = %v, want errFTSNotDroppable", err)
+		}
+	})
 	t.Run("current index skips the rebuild", func(t *testing.T) {
 		c := &fakeConnector{txMode: true, queryRows: fresh}
 		if err := fakeStore(c).migrateSearch(context.Background()); err != nil {

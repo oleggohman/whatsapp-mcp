@@ -200,16 +200,38 @@ def test_connect_is_read_only(store_dir):
 # --- read errors keep their text (mcp 2.x only forwards ToolError text) -------------------------
 
 
-async def test_read_tool_errors_keep_their_text(store_dir, monkeypatch):
+async def test_read_tool_errors_keep_their_text(store_dir):
     with pytest.raises(ToolError, match="Invalid date format"):
         await call("list_messages", after="garbage")
-    with pytest.raises(ToolError, match="not found"):
+    with pytest.raises(ToolError) as exc:
         await call("get_message_context", message_id="missing")
+    assert (
+        str(exc.value)
+        == "Error executing tool get_message_context: Message with ID missing not found"
+    )
+    # OverflowError arm: sqlite3 cannot bind an integer this large
+    with pytest.raises(ToolError, match="too large to convert to SQLite INTEGER"):
+        await call("list_chats", limit=2**70)
 
-    # RuntimeError arm: the database file is missing
+
+READ_TOOLS = [
+    ("search_contacts", {"query": "Alice"}),
+    ("list_messages", {}),
+    ("list_chats", {}),
+    ("get_chat", {"chat_jid": "111@s.whatsapp.net"}),
+    ("get_direct_chat_by_contact", {"sender_phone_number": "111"}),
+    ("get_contact_chats", {"jid": "111"}),
+    ("get_last_interaction", {"jid": "111"}),
+    ("get_message_context", {"message_id": "m1"}),
+]
+
+
+@pytest.mark.parametrize(("name", "args"), READ_TOOLS, ids=[name for name, _ in READ_TOOLS])
+async def test_read_tools_report_missing_database(store_dir, monkeypatch, name, args):
+    # RuntimeError arm: every read goes through _read, so the client sees the text
     monkeypatch.setenv("WHATSAPP_DB_PATH", str(store_dir / "absent.db"))
     with pytest.raises(ToolError, match="database not found"):
-        await call("get_chat", chat_jid="111@s.whatsapp.net")
+        await call(name, **args)
 
 
 async def test_read_tool_sqlite_error_arm_and_swallowed_errors(store_dir, monkeypatch):

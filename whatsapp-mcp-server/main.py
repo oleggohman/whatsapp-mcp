@@ -84,8 +84,9 @@ def _read(fn, *args, **kwargs):
     """Run a database read; report its anticipated failures to the client with their own text."""
     try:
         return fn(*args, **kwargs)
-    # sqlite3.Error is here for get_message_context, the one read that re-raises it
-    except (ValueError, RuntimeError, sqlite3.Error) as e:
+    # sqlite3.Error is here for get_message_context, the one read that re-raises it;
+    # OverflowError is sqlite3 refusing to bind an integer parameter past 64 bits
+    except (ValueError, RuntimeError, OverflowError, sqlite3.Error) as e:
         raise ToolError(str(e)) from e
 
 

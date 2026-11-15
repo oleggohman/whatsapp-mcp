@@ -307,10 +307,10 @@ def list_messages(
         with _connect() as conn:
             # One read transaction: every query below sees the same snapshot, so a
             # bridge LID -> PN merge cannot move a hit between the listing and its context.
-            # The bridge always opens messages.db in WAL mode, where the snapshot does not
-            # block its writes. On a rollback-journal file (one not created by the bridge) the
-            # read is still consistent, but it holds a shared lock until the call ends, so a
-            # writer waits.
+            # The bridge switches messages.db to WAL mode on every open, where the snapshot does
+            # not block its writes. Where WAL is not in effect the read is still consistent, but
+            # it holds a shared lock until the call ends, so a bridge write waits up to its 5 s
+            # busy timeout and then fails with "database is locked".
             conn.execute("BEGIN")
             cursor = conn.cursor()
 
@@ -688,7 +688,6 @@ _GROUP_CHAT_SQL = (
     _CHAT_ROWS_SELECT
     + """
     WHERE c.jid = ?
-    ORDER BY c.last_message_time DESC
     LIMIT ? OFFSET ?
 """
 )
