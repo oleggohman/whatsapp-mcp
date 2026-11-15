@@ -265,6 +265,27 @@ The bridge repairs chats stored under a LID (`LID <digits>`) after connecting an
 - **Device limit reached.** Remove a device under **Linked devices** in WhatsApp.
 - **No messages after pairing.** History takes several minutes to arrive.
 - **New messages missing.** The bridge may have exited after `WHATSAPP_BRIDGE_IDLE_EXIT`. Call `get_connection_status` to start it.
+- **Search index cannot be removed.** `bridge.log` says the `messages_fts` table is damaged and SQLite cannot drop it. Messages are still stored and search works through `LIKE`, only slower. To clear it by hand:
+  1. Stop the bridge.
+  2. Copy `messages.db`, `messages.db-wal` and `messages.db-shm` somewhere safe.
+  3. Run in `sqlite3 <store>/messages.db`:
+
+     ```sql
+     DROP TRIGGER IF EXISTS messages_fts_insert;
+     DROP TRIGGER IF EXISTS messages_fts_delete;
+     DROP TRIGGER IF EXISTS messages_fts_update;
+     PRAGMA writable_schema=ON;
+     DELETE FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts' AND rootpage = 0;
+     PRAGMA writable_schema=RESET;
+     DROP TABLE IF EXISTS messages_fts_data;
+     DROP TABLE IF EXISTS messages_fts_idx;
+     DROP TABLE IF EXISTS messages_fts_docsize;
+     DROP TABLE IF EXISTS messages_fts_config;
+     PRAGMA integrity_check;
+     ```
+
+  4. `integrity_check` must print `ok`. Start the bridge; it rebuilds the index. If it does not print `ok`, restore the copy and use "Out of sync".
+- **Search misses messages that exist.** Stop the bridge and run `DROP TRIGGER IF EXISTS messages_fts_insert;`, `DROP TRIGGER IF EXISTS messages_fts_delete;`, `DROP TRIGGER IF EXISTS messages_fts_update;` and `DROP TABLE IF EXISTS messages_fts;` in `sqlite3 <store>/messages.db`. Start the bridge. This forces a rebuild and covers damage the start-up checks cannot see.
 - **Out of sync.** Stop the bridge. Delete `messages.db*` and `whatsapp.db*` in the store directory, including the `-wal` and `-shm` files. This unlinks the device. Restart and pair again.
 
 See also the [MCP documentation](https://modelcontextprotocol.io/quickstart/server#claude-for-desktop-integration-issues) for Claude Desktop issues.

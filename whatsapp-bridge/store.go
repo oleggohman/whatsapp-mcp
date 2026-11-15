@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -296,16 +297,25 @@ func (store *MessageStore) ftsHealthy(ctx context.Context, triggers int) (bool, 
 	return false, nil
 }
 
+// errFTSNotDroppable marks a messages_fts table that SQLite cannot drop. run turns it into a
+// log line that points at the README recovery steps.
+var errFTSNotDroppable = errors.New("messages_fts cannot be dropped")
+
+// ftsRecoverySection is the README Troubleshooting entry the log line names. A test checks that
+// README.md still holds it.
+const ftsRecoverySection = "Search index cannot be removed"
+
 // dropFTS drops the triggers first and lets them commit on their own: from then on writes to
 // messages no longer touch the index, and readers ignore a table without its triggers. Then it
 // drops the table. FTS5 must open a table to drop it, so a broken one stays behind; it is
-// harmless without triggers, and the next start tries again. run logs the error and connects.
+// harmless without triggers, and the next start tries again. A failed table drop wraps
+// errFTSNotDroppable. run logs the error and connects.
 func (store *MessageStore) dropFTS(ctx context.Context) error {
 	if _, err := store.db.ExecContext(ctx, dropFTSTriggersSQL); err != nil {
 		return fmt.Errorf("triggers: %w", err)
 	}
 	if _, err := store.db.ExecContext(ctx, `DROP TABLE IF EXISTS messages_fts`); err != nil {
-		return fmt.Errorf("table: %w", err)
+		return fmt.Errorf("table: %w: %w", errFTSNotDroppable, err)
 	}
 	return nil
 }

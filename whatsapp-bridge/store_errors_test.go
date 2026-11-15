@@ -302,6 +302,9 @@ func TestMigrateSearchFailsClosed(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("err = %v, want %q", err, tc.want)
 			}
+			if tc.name == "drop table" && !errors.Is(err, errFTSNotDroppable) {
+				t.Fatalf("err = %v, want errFTSNotDroppable", err)
+			}
 		})
 	}
 	t.Run("current index skips the rebuild", func(t *testing.T) {

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -682,6 +683,30 @@ func TestRunLogsMigrationFailureAndStillConnects(t *testing.T) {
 		t.Fatalf("connects = %d, want 1 after a failed migration", connects)
 	}
 	waitForText(t, h.logs, "Search index migration failed after")
+	if c := h.stop(code); c != 0 {
+		t.Fatalf("code = %d", c)
+	}
+	// Stderr is closed after restore, so the whole log is read: an unrelated error gets no hint
+	h.restore()
+	if strings.Contains(h.logs.String(), ftsRecoverySection) {
+		t.Fatalf("unexpected recovery hint:\n%s", h.logs.String())
+	}
+}
+
+// A table SQLite cannot drop gets a log line that names the README recovery section, and the
+// bridge still connects.
+func TestRunLogsRecoveryHintForUndroppableIndex(t *testing.T) {
+	h := newRunHarness(t, &fakeContainer{dev: &store.Device{}})
+	h.configure = pairedConfigure
+	stubMigration(t, func(*MessageStore, context.Context) error {
+		return fmt.Errorf("drop stale messages_fts: table: %w: %w", errFTSNotDroppable, io.ErrClosedPipe)
+	})
+	code := h.start()
+	h.registered()
+	if connects, _, _ := h.client(0).counts(); connects != 1 {
+		t.Fatalf("connects = %d, want 1 after a failed migration", connects)
+	}
+	waitForText(t, h.logs, ftsRecoverySection)
 	if c := h.stop(code); c != 0 {
 		t.Fatalf("code = %d", c)
 	}

@@ -312,6 +312,12 @@ func run() int {
 		if migErr != nil {
 			// Search stays on LIKE; the bridge still serves
 			logger.Errorf("Search index migration failed after %s: %v", time.Since(migStart).Round(time.Millisecond), migErr)
+			if errors.Is(migErr, errFTSNotDroppable) {
+				logger.Errorf("The search index table messages_fts in %s is damaged and SQLite cannot drop it. "+
+					"Messages are still stored and search still works through LIKE, only slower. This repeats on every "+
+					"start until the table is removed by hand: stop the bridge and follow %q under Troubleshooting in README.md",
+					messagesDBPath(), ftsRecoverySection)
+			}
 		} else {
 			logger.Infof("Search index ready in %s", time.Since(migStart).Round(time.Millisecond))
 		}

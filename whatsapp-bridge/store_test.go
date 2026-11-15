@@ -606,7 +606,7 @@ func TestMigrateSearchUnreadableIndexKeepsWritesWorking(t *testing.T) {
 			}
 			for attempt := 1; attempt <= 2; attempt++ {
 				err := s.migrateSearch(context.Background())
-				if err == nil || !strings.Contains(err.Error(), "drop stale messages_fts: table: ") {
+				if err == nil || !strings.Contains(err.Error(), "drop stale messages_fts: table: ") || !errors.Is(err, errFTSNotDroppable) {
 					t.Fatalf("attempt %d: err = %v, want a failed table drop", attempt, err)
 				}
 				if triggers, tables := ftsObjects(); triggers != 0 || tables != 1 {
@@ -1076,5 +1076,81 @@ func TestBundledSQLiteVersionFloor(t *testing.T) {
 	version, number, _ := sqlite3.Version()
 	if number < 3054001 {
 		t.Fatalf("bundled SQLite %s (%d) is older than 3.54.1", version, number)
+	}
+}
+
+// The statements of the README entry "Search index cannot be removed". Keep them in step with it.
+var documentedFTSRecovery = []string{
+	`DROP TRIGGER IF EXISTS messages_fts_insert`,
+	`DROP TRIGGER IF EXISTS messages_fts_delete`,
+	`DROP TRIGGER IF EXISTS messages_fts_update`,
+	`PRAGMA writable_schema=ON`,
+	`DELETE FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts' AND rootpage = 0`,
+	`PRAGMA writable_schema=RESET`,
+	`DROP TABLE IF EXISTS messages_fts_data`,
+	`DROP TABLE IF EXISTS messages_fts_idx`,
+	`DROP TABLE IF EXISTS messages_fts_docsize`,
+	`DROP TABLE IF EXISTS messages_fts_config`,
+}
+
+// The README recovery removes a table SQLite cannot drop, and the next migration builds a
+// working index.
+func TestDocumentedFTSRecoveryRemovesBrokenTable(t *testing.T) {
+	s := newTestStore(t)
+	chat := "a@s.whatsapp.net"
+	if err := s.StoreChat(chat, "A", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.StoreMessage("m1", chat, "111", "pelican", time.Now(), false, "", "", "", nil, nil, nil, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.migrateSearch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec("DROP TABLE messages_fts_config"); err != nil {
+		t.Fatal(err)
+	}
+	// Fresh connections, like a restart
+	s.db.SetMaxIdleConns(0)
+	if err := s.migrateSearch(context.Background()); !errors.Is(err, errFTSNotDroppable) {
+		t.Fatalf("err = %v, want errFTSNotDroppable", err)
+	}
+	// writable_schema is per connection, so every statement runs on one
+	ctx := context.Background()
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range documentedFTSRecovery {
+		if _, err := conn.ExecContext(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	var check string
+	if err := conn.QueryRowContext(ctx, "PRAGMA integrity_check").Scan(&check); err != nil || check != "ok" {
+		t.Fatalf("integrity_check = %q, %v", check, err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.migrateSearch(ctx); err != nil {
+		t.Fatalf("migrateSearch after recovery: %v", err)
+	}
+	if got := ftsHits(t, s, "pelican"); len(got) != 1 || got[0] != "m1" {
+		t.Fatalf("hits = %v, want [m1]", got)
+	}
+	if n := ftsTriggers(t, s); n != 3 {
+		t.Fatalf("triggers = %d, want 3", n)
+	}
+}
+
+// The log line names a README section; it must not point at one that was renamed.
+func TestFTSRecoverySectionExistsInREADME(t *testing.T) {
+	b, err := os.ReadFile("../README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), ftsRecoverySection) {
+		t.Fatalf("README.md has no %q section", ftsRecoverySection)
 	}
 }
