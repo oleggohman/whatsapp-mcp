@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -816,6 +817,211 @@ func TestMigrateSearchHealthyIndexIsKept(t *testing.T) {
 	}
 	if got := ftsHits(t, s, "heron"); len(got) != 1 || got[0] != "m3" {
 		t.Fatalf("MATCH heron = %v", got)
+	}
+}
+
+// The integrity check only verifies idx rows that exist, so an index that lost them passes both
+// forms while MATCH silently misses rows. The segment check catches it and the index is rebuilt.
+func TestMigrateSearchIndexWithoutIdxEntriesIsRebuilt(t *testing.T) {
+	for name, damage := range map[string]string{
+		"all idx rows":            "DELETE FROM messages_fts_idx",
+		"idx rows of one segment": "DELETE FROM messages_fts_idx WHERE segid = (SELECT segid FROM messages_fts_idx GROUP BY segid ORDER BY count(*) DESC LIMIT 1)",
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := newTestStore(t)
+			chat := "a@s.whatsapp.net"
+			if err := s.migrateSearch(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			// Three transactions through the triggers give several segments of several leaves each
+			rng := rand.New(rand.NewSource(1))
+			for b := range 3 {
+				batch := make([]historyMessage, 0, 1000)
+				for i := range 1000 {
+					words := make([]string, 0, 150)
+					for len(words) < 150 {
+						w := make([]byte, 3+rng.Intn(6))
+						for j := range w {
+							w[j] = byte('a' + rng.Intn(26))
+						}
+						words = append(words, string(w))
+					}
+					batch = append(batch, historyMessage{id: fmt.Sprintf("m%d-%d", b, i), sender: "111",
+						content: "zebra " + strings.Join(words, " "), timestamp: time.Now()})
+				}
+				if err := s.storeHistoryBatch(chat, "A", time.Now(), batch); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := s.db.Exec(damage); err != nil {
+				t.Fatal(err)
+			}
+			// A connection that already opened messages_fts keeps it open; use fresh ones like a restart
+			s.db.SetMaxIdleConns(0)
+			// The gap itself: both integrity-check forms pass, MATCH finds fewer rows than LIKE
+			for _, rank := range []int{0, 1} {
+				if _, err := s.db.Exec("INSERT INTO messages_fts(messages_fts, rank) VALUES('integrity-check', ?)", rank); err != nil {
+					t.Fatalf("setup: integrity-check rank %d: %v", rank, err)
+				}
+			}
+			var like int
+			if err := s.db.QueryRow("SELECT count(*) FROM messages WHERE content LIKE '%zebra%'").Scan(&like); err != nil {
+				t.Fatal(err)
+			}
+			if got := ftsHits(t, s, "zebra"); len(got) >= like {
+				t.Fatalf("setup: MATCH zebra = %d hits, LIKE = %d, want fewer hits on the damaged index", len(got), like)
+			}
+			if err := s.StoreMessage("w", chat, "111", "heron", time.Now(), false, "", "", "", nil, nil, nil, 0); err != nil {
+				t.Fatalf("setup: write on the damaged index: %v", err)
+			}
+
+			if err := s.migrateSearch(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if !s.ftsCheck.ran || s.ftsCheck.err == nil || !strings.Contains(s.ftsCheck.err.Error(), "no entry in messages_fts_idx") {
+				t.Fatalf("ftsCheck = %+v, want the failed segment check", s.ftsCheck)
+			}
+			if n := ftsTriggers(t, s); n != 3 {
+				t.Fatalf("triggers = %d, want 3 on the rebuilt index", n)
+			}
+			if err := s.db.QueryRow("SELECT count(*) FROM messages WHERE content LIKE '%zebra%'").Scan(&like); err != nil {
+				t.Fatal(err)
+			}
+			if got := ftsHits(t, s, "zebra"); len(got) != like {
+				t.Fatalf("MATCH zebra = %d hits, want %d", len(got), like)
+			}
+			if indexed, total := ftsCounts(t, s); indexed != total {
+				t.Fatalf("docsize = %d, messages = %d", indexed, total)
+			}
+			// The rebuilt index is healthy: the next start keeps it
+			if err := s.migrateSearch(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if !s.ftsCheck.ran || s.ftsCheck.err != nil {
+				t.Fatalf("second start: ftsCheck = %+v, want a passed check", s.ftsCheck)
+			}
+		})
+	}
+}
+
+// The segment check must not flag indexes that are healthy but look odd: no segments at all, a
+// trigger-built index, and a merge that is only partly done.
+func TestMigrateSearchSegmentCheckKeepsHealthyIndexes(t *testing.T) {
+	const automergeMarker = "INSERT INTO messages_fts(messages_fts, rank) VALUES('automerge', 7)"
+	setup := func(t *testing.T) (*MessageStore, string) {
+		t.Helper()
+		s := newTestStore(t)
+		chat := "a@s.whatsapp.net"
+		if err := s.StoreChat(chat, "A", time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.migrateSearch(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		return s, chat
+	}
+	store := func(t *testing.T, s *MessageStore, chat, id, content string) {
+		t.Helper()
+		if err := s.StoreMessage(id, chat, "111", content, time.Now(), false, "", "", "", nil, nil, nil, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	automerge := func(t *testing.T, s *MessageStore) int {
+		t.Helper()
+		var v int
+		if err := s.db.QueryRow("SELECT v FROM messages_fts_config WHERE k = 'automerge'").Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	cases := map[string]struct {
+		prepare func(t *testing.T, s *MessageStore, chat string)
+		marker  string
+		matches int
+	}{
+		// Trigrams need 3 characters: the index has docsize rows and no segment at all
+		"short, empty and NULL content only": {
+			prepare: func(t *testing.T, s *MessageStore, chat string) {
+				store(t, s, chat, "s1", "ab")
+				store(t, s, chat, "s2", "")
+				if _, err := s.db.Exec(`INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me) VALUES ('s3', ?, '111', NULL, '2024-01-01', 0)`, chat); err != nil {
+					t.Fatal(err)
+				}
+			},
+			marker: automergeMarker,
+		},
+		"single-message writes": {
+			prepare: func(t *testing.T, s *MessageStore, chat string) {
+				for i := range 300 {
+					store(t, s, chat, fmt.Sprintf("w%d", i), fmt.Sprintf("kingfisher %d", i))
+				}
+			},
+			marker:  automergeMarker,
+			matches: 300,
+		},
+		"every message deleted": {
+			prepare: func(t *testing.T, s *MessageStore, chat string) {
+				for i := range 50 {
+					store(t, s, chat, fmt.Sprintf("w%d", i), fmt.Sprintf("kingfisher %d", i))
+				}
+				if _, err := s.db.Exec("DELETE FROM messages"); err != nil {
+					t.Fatal(err)
+				}
+			},
+			marker: automergeMarker,
+		},
+		// A rebuild recreates the table and resets automerge to its default 4, so 0 is the marker
+		"partly completed incremental merge": {
+			prepare: func(t *testing.T, s *MessageStore, chat string) {
+				for _, q := range []string{
+					"INSERT INTO messages_fts(messages_fts, rank) VALUES('pgsz', 64)",
+					"INSERT INTO messages_fts(messages_fts, rank) VALUES('automerge', 0)",
+				} {
+					if _, err := s.db.Exec(q); err != nil {
+						t.Fatal(err)
+					}
+				}
+				for i := range 300 {
+					store(t, s, chat, fmt.Sprintf("w%d", i), fmt.Sprintf("kingfisher %d", i))
+				}
+				if _, err := s.db.Exec("INSERT INTO messages_fts(messages_fts, rank) VALUES('merge', 2)"); err != nil {
+					t.Fatal(err)
+				}
+				var segments int
+				if err := s.db.QueryRow("SELECT count(DISTINCT id >> 37) FROM messages_fts_data WHERE id >= (1 << 37)").Scan(&segments); err != nil || segments < 2 {
+					t.Fatalf("segments = %d, %v: the merge must be unfinished", segments, err)
+				}
+			},
+			matches: 300,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			s, chat := setup(t)
+			tc.prepare(t, s, chat)
+			want := 0
+			if tc.marker != "" {
+				if _, err := s.db.Exec(tc.marker); err != nil {
+					t.Fatal(err)
+				}
+				want = 7
+			}
+			s.db.SetMaxIdleConns(0)
+			if err := s.migrateSearch(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if !s.ftsCheck.ran || s.ftsCheck.err != nil {
+				t.Fatalf("ftsCheck = %+v, want a passed check that ran", s.ftsCheck)
+			}
+			if got := automerge(t, s); got != want {
+				t.Fatalf("automerge = %d, want %d: the healthy index was rebuilt", got, want)
+			}
+			if tc.matches > 0 {
+				if got := ftsHits(t, s, "kingfisher"); len(got) != tc.matches {
+					t.Fatalf("MATCH kingfisher = %d hits, want %d", len(got), tc.matches)
+				}
+			}
+		})
 	}
 }
 

@@ -260,19 +260,23 @@ func TestStoreHistoryBatchFailsClosed(t *testing.T) {
 }
 
 func TestMigrateSearchFailsClosed(t *testing.T) {
-	// state answers the migration's two queries: whether messages_fts exists and how many of its
-	// triggers do, then the docsize and messages counts of an existing index plus the probe
-	state := func(exists, triggers, indexed, total int64) func(string) [][]driver.Value {
+	// state answers the migration's three queries: whether messages_fts exists and how many of its
+	// triggers do, the docsize and messages counts of an existing index plus the probe, and how
+	// many index segments have no messages_fts_idx entry
+	state := func(exists, triggers, indexed, total, orphaned int64) func(string) [][]driver.Value {
 		return func(q string) [][]driver.Value {
 			if strings.Contains(q, "type = 'table'") {
 				return [][]driver.Value{{exists, triggers}}
 			}
+			if strings.Contains(q, "messages_fts_idx") {
+				return [][]driver.Value{{orphaned}}
+			}
 			return [][]driver.Value{{indexed, total, int64(1)}}
 		}
 	}
-	absent := state(0, 0, 0, 0)
-	fresh := state(1, 3, 2, 2)
-	stale := state(1, 3, 1, 2)
+	absent := state(0, 0, 0, 0, 0)
+	fresh := state(1, 3, 2, 2, 0)
+	stale := state(1, 3, 1, 2, 0)
 	cases := []struct {
 		name string
 		c    *fakeConnector
@@ -280,7 +284,7 @@ func TestMigrateSearchFailsClosed(t *testing.T) {
 	}{
 		{"index creation", &fakeConnector{txMode: true, failSQL: "idx_messages_chat_time"}, "create indexes: "},
 		{"existence check", &fakeConnector{txMode: true, failSQL: "type = 'table'"}, "check messages_fts: "},
-		{"drop orphaned triggers", &fakeConnector{txMode: true, failSQL: "DROP TRIGGER", queryRows: state(0, 3, 0, 0)}, "drop orphaned messages_fts triggers: "},
+		{"drop orphaned triggers", &fakeConnector{txMode: true, failSQL: "DROP TRIGGER", queryRows: state(0, 3, 0, 0, 0)}, "drop orphaned messages_fts triggers: "},
 		{"drop triggers", &fakeConnector{txMode: true, failSQL: "DROP TRIGGER", queryRows: stale}, "drop stale messages_fts: triggers: "},
 		{"drop table", &fakeConnector{txMode: true, failSQL: "DROP TABLE", queryRows: stale}, "drop stale messages_fts: table: "},
 		{"begin", &fakeConnector{txMode: true, failBegin: true}, "begin: "},
@@ -320,7 +324,7 @@ func TestMigrateSearchFailsClosed(t *testing.T) {
 		}
 	})
 	t.Run("orphaned triggers are dropped, then the table is built", func(t *testing.T) {
-		c := &fakeConnector{txMode: true, queryRows: state(0, 2, 0, 0)}
+		c := &fakeConnector{txMode: true, queryRows: state(0, 2, 0, 0, 0)}
 		if err := fakeStore(c).migrateSearch(context.Background()); err != nil {
 			t.Fatal(err)
 		}
@@ -351,11 +355,17 @@ func TestMigrateSearchFailsClosed(t *testing.T) {
 	})
 	for name, c := range map[string]*fakeConnector{
 		"mismatched counts":               {txMode: true, queryRows: stale},
-		"missing trigger at equal counts": {txMode: true, queryRows: state(1, 2, 2, 2)},
+		"missing trigger at equal counts": {txMode: true, queryRows: state(1, 2, 2, 2, 0)},
 		// The count or the probe of the virtual table fails: FTS5 cannot open the index
 		"unreadable index": {txMode: true, failSQL: "messages_fts_docsize", queryRows: fresh},
 		// Counts and probe pass, the integrity check finds damaged segments
 		"failed integrity check": {txMode: true, failSQL: "'integrity-check'", queryRows: fresh},
+		// An index segment has no messages_fts_idx entry: the integrity check would not notice
+		"segment without idx entry": {txMode: true, queryRows: state(1, 3, 2, 2, 1)},
+		// failSQL fails every statement containing its text. This works only because the segment
+		// query is the one migration statement that names messages_fts_idx; pick a narrower marker
+		// if dropFTS or another step ever names that table.
+		"failing segment query": {txMode: true, failSQL: "messages_fts_idx", queryRows: fresh},
 	} {
 		t.Run(name+" drop then rebuild", func(t *testing.T) {
 			if err := fakeStore(c).migrateSearch(context.Background()); err != nil {

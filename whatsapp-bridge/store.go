@@ -170,7 +170,8 @@ const dropFTSTriggersSQL = `
 // FTS index when the table is new. An existing index is stale when a trigger is missing or it
 // does not cover every message. A missing trigger means writes went unindexed: an older bridge's
 // INSERT OR REPLACE renumbers rowids, so the index can be stale even at an equal row count.
-// An index FTS5 cannot read is treated as stale too: its triggers would make every write to
+// An index FTS5 cannot read, or one with segments that have no messages_fts_idx entry (MATCH
+// would find nothing), is treated as stale too: its triggers would make every write to
 // messages fail. See ftsHealthy for how that is checked. A stale index is dropped before the
 // rebuild starts. Readers use MATCH whenever messages_fts exists with its three triggers, so a
 // stale table kept while the rebuild runs, or after it fails or is cancelled, would silently miss
@@ -233,17 +234,42 @@ func (store *MessageStore) migrateSearch(ctx context.Context) error {
 	return nil
 }
 
+// ftsSegmentsWithoutIdxSQL counts index segments that have no row in messages_fts_idx. FTS5 finds
+// a term's leaf through messages_fts_idx, so a segment without rows there silently returns no
+// hits, and neither integrity-check form notices: they only verify rows that exist. A healthy
+// segment always has at least one idx row, because the segment writer starts with iBtPage = 1 and
+// so records its first leaf. Segment leaves live in messages_fts_data under id = segid << 37 | ...
+// (FTS5_DATA_PAGE_B 31 + FTS5_DATA_HEIGHT_B 5 + FTS5_DATA_DLI_B 1); ids 1 and 10 are the averages
+// and structure records and sit below 1 << 37. The recursion hops from one segment id to the next
+// with one index seek each, so it never scans the table.
+// This depends on the FTS5 on-disk layout and assumes messages_fts does not use contentless_delete:
+// that option stores tombstone pages under segid + 65536 (FTS5_TOMBSTONE_ROWID), which this query
+// would read as segments without idx rows. messages_fts is an external-content table, so it has
+// none; revisit the query if that ever changes.
+const ftsSegmentsWithoutIdxSQL = `
+	WITH RECURSIVE seg(id) AS (
+		SELECT min(id) >> 37 FROM messages_fts_data WHERE id >= (1 << 37)
+		UNION ALL
+		SELECT (SELECT min(id) >> 37 FROM messages_fts_data WHERE id >= ((seg.id + 1) << 37))
+		FROM seg WHERE seg.id IS NOT NULL
+	)
+	SELECT count(*) FROM seg
+	WHERE id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM messages_fts_idx WHERE segid = seg.id)`
+
 // ftsHealthy reports whether the existing messages_fts can be kept: all three triggers are
-// there, the docsize shadow table counts every message, and FTS5 can read the whole index.
+// there, the docsize shadow table counts every message, no index segment lacks its
+// messages_fts_idx entry, and FTS5 can read the whole index.
 // External-content count(*) on messages_fts reads messages, so docsize is what says how many rows
 // are really indexed. The probe only opens the virtual table (it reads messages_fts_config); the
 // segments in messages_fts_data and messages_fts_idx, which the triggers write, are only read by
-// the integrity check. It runs with rank 1, which also rebuilds every row's tokens from messages
-// and compares them with the index: the plain check passes a damaged averages record (id 1) or
-// structure record (id 10) that then fails writes. It scans the whole index and messages, so it
-// runs last and its duration is recorded in store.ftsCheck. Any failure means stale; the error
-// is only returned when ctx was cancelled, since an interrupted check says nothing about the
-// index.
+// the checks below. The segment check is cheap and runs first, because the integrity check passes
+// an index whose idx rows are gone while MATCH finds nothing. The integrity check runs with
+// rank 1, which also rebuilds every row's tokens from messages and compares them with the index:
+// the plain check passes a damaged averages record (id 1) or structure record (id 10) that then
+// fails writes. It scans the whole index and messages, so it runs last. The duration of both
+// checks is recorded in store.ftsCheck. Any failure, including an error from the segment query,
+// means stale; the error is only returned when ctx was cancelled, since an interrupted check
+// says nothing about the index.
 func (store *MessageStore) ftsHealthy(ctx context.Context, triggers int) (bool, error) {
 	var indexed, total, probe int
 	err := store.db.QueryRowContext(ctx, `SELECT
@@ -251,7 +277,14 @@ func (store *MessageStore) ftsHealthy(ctx context.Context, triggers int) (bool, 
 		(SELECT count(*) FROM (SELECT 1 FROM messages_fts LIMIT 1))`).Scan(&indexed, &total, &probe)
 	if err == nil && triggers == 3 && indexed == total {
 		start := time.Now()
-		_, err = store.db.ExecContext(ctx, `INSERT INTO messages_fts(messages_fts, rank) VALUES('integrity-check', 1)`)
+		var orphaned int
+		err = store.db.QueryRowContext(ctx, ftsSegmentsWithoutIdxSQL).Scan(&orphaned)
+		if err == nil && orphaned > 0 {
+			err = fmt.Errorf("%d index segments have no entry in messages_fts_idx", orphaned)
+		}
+		if err == nil {
+			_, err = store.db.ExecContext(ctx, `INSERT INTO messages_fts(messages_fts, rank) VALUES('integrity-check', 1)`)
+		}
 		store.ftsCheck = ftsCheck{ran: true, took: time.Since(start), err: err}
 		if err == nil {
 			return true, nil
