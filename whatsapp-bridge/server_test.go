@@ -456,12 +456,19 @@ func TestDownloadHandlerLogRedactsSignedURL(t *testing.T) {
 	urlErr := errors.New(`failed to download media from last host: Get "https://mmg.whatsapp.net/v/t62/x.enc?ccb=11-4&oh=SECRET&oe=6&hash=h": dial tcp: connection refused`)
 	fc := &fakeClient{connected: true, downloadErr: urlErr}
 	a := newAPIServer(func() bridgeClient { return fc }, store, "", "127.0.0.1:8080")
+	var rec *httptest.ResponseRecorder
 	stderr := captureStderr(t, func() {
-		do(a.handler(), http.MethodPost, "/api/download", `{"message_id":"m1","chat_jid":"1234@s.whatsapp.net"}`)
+		rec = do(a.handler(), http.MethodPost, "/api/download", `{"message_id":"m1","chat_jid":"1234@s.whatsapp.net"}`)
 	})
 	want := `Get "https://mmg.whatsapp.net/v/t62/x.enc?<redacted>": dial tcp: connection refused`
 	if !strings.Contains(stderr, want) || strings.Contains(stderr, "SECRET") {
 		t.Fatalf("stderr = %q", stderr)
+	}
+	var resp DownloadMediaResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil || resp.Success ||
+		resp.Message != "Failed to download media: download: failed to download media from last host: "+want ||
+		strings.Contains(rec.Body.String(), "SECRET") {
+		t.Fatalf("resp = %+v err=%v", resp, err)
 	}
 }
 

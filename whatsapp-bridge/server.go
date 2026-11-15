@@ -552,11 +552,12 @@ func (a *apiServer) handleSend(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, SendMessageResponse{Success: success, Message: message})
 }
 
-// handleDownload handles POST /api/download.
 // urlQuery matches the query of a URL inside an error message. A transport error from
-// whatsmeow embeds the signed media URL (oh=, oe=, hash=); the log keeps only host and path.
+// whatsmeow embeds the signed media URL (oh=, oe=, hash=); the log line and the response
+// keep only host and path.
 var urlQuery = regexp.MustCompile(`\?[^\s"]*`)
 
+// handleDownload handles POST /api/download.
 func (a *apiServer) handleDownload(w http.ResponseWriter, r *http.Request) {
 	// Only allow POST requests
 	if r.Method != http.MethodPost {
@@ -584,9 +585,9 @@ func (a *apiServer) handleDownload(w http.ResponseWriter, r *http.Request) {
 	if !success || err != nil {
 		errMsg := "Unknown error"
 		if err != nil {
-			errMsg = err.Error()
+			errMsg = urlQuery.ReplaceAllString(err.Error(), "?<redacted>")
 		}
-		logf("Media download failed (message %s, chat %s): %s\n", req.MessageID, req.ChatJID, urlQuery.ReplaceAllString(errMsg, "?<redacted>"))
+		logf("Media download failed (message %s, chat %s): %s\n", req.MessageID, req.ChatJID, errMsg)
 		writeJSON(w, http.StatusInternalServerError, DownloadMediaResponse{
 			Success: false,
 			Message: fmt.Sprintf("Failed to download media: %s", errMsg),
