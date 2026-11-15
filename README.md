@@ -24,6 +24,7 @@ This project is a fork of [lharries/whatsapp-mcp](https://github.com/lharries/wh
 ## Main features
 
 - **Search and read.** Find contacts, chats and messages by name, phone number, text, date range or sender. Chats that WhatsApp stores under hidden LID identifiers are found by phone number too.
+- **Names from macOS Contacts.** When WhatsApp has no name for a number, the server looks it up in the Contacts app (macOS only, read-only, local). WhatsApp names always win. `search_contacts` also finds people by their Contacts name; `list_chats` filters and sorts on the WhatsApp names.
 - **Message context.** Fetch the messages before and after any message.
 - **Send messages.** Send text to people and groups, and send files (images, video, documents).
 - **Voice notes.** Send audio as a playable voice message. With `ffmpeg` installed, other formats are converted to Opus automatically.
@@ -155,9 +156,9 @@ The bridge API has its own access token. It is unrelated to your WhatsApp login.
 
 | Tool | Key parameters | Returns |
 | --- | --- | --- |
-| `search_contacts` | `query` | Contacts whose name or phone number matches. |
+| `search_contacts` | `query` | Contacts whose WhatsApp name, phone number or (macOS) Contacts name matches. |
 | `list_messages` | `after`, `before` (ISO-8601, exclusive; a value without an offset is local time), `sender_phone_number`, `chat_jid`, `query`, `limit` (20), `page` (0), `include_context` (true), `context_before` (1), `context_after` (1) | Matching messages as formatted text, with surrounding context. |
-| `list_chats` | `query`, `limit` (20), `page` (0), `include_last_message` (true), `sort_by` (`last_active` or `name`) | Chats with metadata. |
+| `list_chats` | `query`, `limit` (20), `page` (0), `include_last_message` (true), `sort_by` (`last_active` or `name`) | Chats with metadata. `query` and `sort_by` use the stored WhatsApp names. |
 | `get_chat` | `chat_jid`, `include_last_message` (true) | Metadata of one chat, or nothing. |
 | `get_direct_chat_by_contact` | `sender_phone_number` | The direct chat with that number, or nothing. |
 | `get_contact_chats` | `jid` (JID or bare phone number), `limit` (20), `page` (0) | All chats that involve the contact. |
@@ -226,6 +227,7 @@ No variable is required. The Go bridge and the Python server read the same names
 | `WHATSAPP_BRIDGE_TOKEN` | token file | both | API token. Overrides `<store>/bridge.token`. |
 | `WHATSAPP_BRIDGE_IDLE_EXIT` | unset (never exits) | bridge | Go duration such as `30m` or `12h`. The bridge exits after this long without API activity. |
 | `WHATSAPP_BRIDGE_AUTOSTART` | `1` | server | `0`, `false`, `no` or `off` disables the build and start (manual mode). |
+| `WHATSAPP_MACOS_CONTACTS` | `1` | server | `0`, `false`, `no` or `off` disables the macOS Contacts name fallback. |
 | `WHATSAPP_BRIDGE_BIN` | `whatsapp-bridge/whatsapp-bridge` | server | Bridge binary to run, and where a build is written. |
 | `WHATSAPP_BRIDGE_SRC` | `whatsapp-bridge` | server | Bridge source directory used for builds. |
 | `WHATSAPP_BRIDGE_START_TIMEOUT` | `60` | server | Seconds to wait for a started bridge to answer. |
@@ -241,6 +243,7 @@ No variable is required. The Go bridge and the Python server read the same names
 - Every endpoint except `/api/health` requires the bearer token. See [The local bridge token](#the-local-bridge-token). A bridge started by hand without a token file has authentication disabled.
 - Downloaded media is written below `<store>/<chat>/` only. Chat names and file names from senders are reduced to a safe bare name, so a sender cannot write outside the store.
 - Message bodies are not logged.
+- Contacts names are read from `~/Library/Application Support/AddressBook` read-only, kept in memory only, and never written to the store or sent anywhere. macOS asks once for Contacts access for the app that runs the server (Claude Desktop, your terminal). Denying it only disables the fallback.
 - The store (`whatsapp-bridge/store/`), databases, token and logs are listed in `.gitignore`.
 
 **Prompt injection.** A message you receive can contain instructions aimed at the model. An injected instruction could make the model call `send_file` on a sensitive local file (an SSH key, a `.env`) or send your messages to a chat. Nothing in this server prevents that. Keep per-tool approval enabled in your MCP client and review every `send_file` and `send_message` call before you approve it.
@@ -264,6 +267,7 @@ The bridge repairs chats stored under a LID (`LID <digits>`) after connecting an
 - **QR code expired.** Codes rotate about every 20 seconds. Call `get_pairing_qr` again or use `pair_with_phone_number`.
 - **Device limit reached.** Remove a device under **Linked devices** in WhatsApp.
 - **No messages after pairing.** History takes several minutes to arrive.
+- **Contacts names missing on macOS.** Grant Contacts access to the app running the MCP server under System Settings > Privacy & Security > Contacts, then call any read tool again (the server retries after 60 s). `WHATSAPP_LOG_LEVEL=INFO` shows one `macOS Contacts not readable` line in the server log when access is denied.
 - **New messages missing.** The bridge may have exited after `WHATSAPP_BRIDGE_IDLE_EXIT`. Call `get_connection_status` to start it.
 - **Search index cannot be removed.** `bridge.log` says the `messages_fts` table is damaged and SQLite cannot drop it. Messages are still stored and search works through `LIKE`, only slower. To clear it by hand:
   1. Stop the bridge.
