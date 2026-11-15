@@ -696,7 +696,7 @@ def test_name_resolver_rules(contacts_on):
         assert resolve("1999000111") == "LID 1999000111"  # only a @lid row: no Contacts
         assert resolve("1999000111@lid") == "LID 1999000111"
         assert resolve("111") == "Alice"
-        assert resolve("972520001111") == "Dan Levi"  # no chat row, number in Contacts
+        assert resolve("972520001111") == "972520001111"  # no chat row: no Contacts lookup
         assert resolve("5550000") == "5550000"  # no chat row, not in Contacts
         assert resolve("777777@lid") == "777777@lid"  # LID without a row
         assert resolve("222@lid") == "Bob"  # no lid row: stored WhatsApp name, no Contacts
@@ -705,20 +705,30 @@ def test_name_resolver_rules(contacts_on):
         assert resolve("972585529067") == "Mia Gohman"  # memoized
 
 
-def test_name_resolver_skips_contacts_for_known_lid(contacts_on):
-    # Bare LID digits with no chat row (a group sender the bridge could not map when stored)
-    # that happen to match a Contacts number.
-    wa = sqlite3.connect(contacts_on / "whatsapp.db")
-    wa.execute("INSERT INTO whatsmeow_lid_map VALUES ('972520001111', '15550001111')")
-    wa.commit()
-    wa.close()
+def test_name_resolver_no_contacts_for_sender_without_chat_row(store_dir, tmp_path, monkeypatch):
+    # The bridge stores an unmapped LID as bare digits: here a 14-digit group sender with no
+    # chat row and no whatsmeow_lid_map entry whose tail matches a Contacts number.
+    from conftest import enable_contacts
+
+    us_eleven = ("Us", "Eleven", "", ["1 (415) 555-0100"])  # national form, 11 digits
+    enable_contacts(tmp_path / "ab", monkeypatch, {"": [us_eleven]})
+    lid = "27814155550100"
+    assert whatsapp.contacts_macos.get_index().name_for(lid) == "Us Eleven"
+    writer = sqlite3.connect(store_dir / "messages.db")
+    writer.execute(
+        "INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me) "
+        "VALUES ('q1', 'g1@g.us', ?, 'hi', '2025-01-06 08:00:00+00:00', 0)",
+        (lid,),
+    )
+    writer.execute("INSERT INTO chats VALUES ('14155550100@s.whatsapp.net', NULL, NULL)")
+    writer.commit()
+    writer.close()
     with whatsapp._connect() as conn:
         resolve = whatsapp._name_resolver(conn)
-        assert resolve("972520001111") == "972520001111"
-        assert resolve("972585529067") == "Mia Gohman"
-    (contacts_on / "whatsapp.db").unlink()
-    with whatsapp._connect() as conn:  # no LID map: the bare sender is taken as a phone number
-        assert whatsapp._name_resolver(conn)("972520001111") == "Dan Levi"
+        assert resolve(lid) == lid
+        assert resolve("14155550100") == "Us Eleven"  # placeholder @s.whatsapp.net row
+    out = whatsapp.list_messages(chat_jid="g1@g.us", include_context=False)
+    assert f"From: {lid}:" in out and "Us Eleven" not in out
 
 
 def test_name_resolver_database_error_resolves_to_sender(contacts_on):

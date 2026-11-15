@@ -15,7 +15,8 @@ published in the [oleggohman/cc-things](https://github.com/oleggohman/cc-things)
 
 - macOS Contacts name fallback. When WhatsApp has no name for a direct chat (the bridge stored a
   bare number), the MCP server looks the number up in the Contacts app. This covers chat names,
-  contact names, sender names and the `Chat:` prefix of formatted messages. The lookup is
+  contact names, sender names (senders with a direct chat only) and the `Chat:` prefix of
+  formatted messages. The lookup is
   read-only, local, in memory and macOS only; nothing is written to the store or sent anywhere.
   WhatsApp names always win. Set `WHATSAPP_MACOS_CONTACTS=0` (or `false`, `no`, `off`) to turn it
   off. A missing or denied Contacts database is skipped silently (one `INFO` log line).

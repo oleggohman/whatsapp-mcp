@@ -83,17 +83,6 @@ def _lid_map_available(conn: sqlite3.Connection) -> bool:
     return row is not None
 
 
-def _is_known_lid(conn: sqlite3.Connection, user: str) -> bool:
-    """True when whatsmeow_lid_map lists user (bare digits) as a LID.
-
-    The bridge stores a sender whose LID it could not map yet as bare LID digits.
-    """
-    if not _lid_map_available(conn):
-        return False
-    sql = "SELECT 1 FROM wa.whatsmeow_lid_map WHERE lid = ?"
-    return conn.execute(sql, (user,)).fetchone() is not None
-
-
 # Matches unmerged LID chats whose phone number (bare digits in whatsmeow_lid_map)
 # contains the query.
 _LID_PN_CLAUSE = "{jid} IN (SELECT m.lid || '@lid' FROM wa.whatsmeow_lid_map m WHERE m.pn LIKE ?)"
@@ -206,13 +195,12 @@ def _name_resolver(conn: sqlite3.Connection) -> Callable[[str], str]:
 
     The stored sender is the user part of a JID; its `@server` and `:device` suffixes are
     dropped. A sender ending in `@lid` is looked up as `user@lid` only. Any other sender is
-    looked up as `user@s.whatsapp.net` by primary key: a placeholder name there, or no chat row
-    at all (the bare sender is then a phone number), falls back to macOS Contacts. A sender
-    that only has a `user@lid` row keeps that name, and one without rows that whatsmeow_lid_map
-    lists as a LID stays as it is: known LID digits are never matched against Contacts. There
-    is no substring match, so `15551212` never takes the name of `551212`. Results are memoized
-    for the life of the resolver; a sender with no name, or whose lookup fails, resolves to
-    itself.
+    looked up as `user@s.whatsapp.net` by primary key; only a placeholder name there falls back
+    to macOS Contacts. Without that row the sender takes the name of a `user@lid` row or stays
+    as it is: the bridge stores an unmapped LID as bare digits, so a sender with no
+    `@s.whatsapp.net` row is never matched against Contacts. There is no substring match, so
+    `15551212` never takes the name of `551212`. Results are memoized for the life of the
+    resolver; a sender with no name, or whose lookup fails, resolves to itself.
     """
     cache: dict[str, str] = {}
 
@@ -232,12 +220,8 @@ def _name_resolver(conn: sqlite3.Connection) -> Callable[[str], str]:
             if name and not _is_placeholder_name(name, pn_jid):
                 return name
             return contacts_macos.get_index().name_for(user) or name or sender
-        found, name = lookup(f"{user}@lid")
-        if found:
-            return name or sender
-        if _is_known_lid(conn, user):
-            return sender
-        return contacts_macos.get_index().name_for(user) or sender
+        # No `@s.whatsapp.net` row: the digits may be an unmapped LID, so no Contacts lookup.
+        return lookup(f"{user}@lid")[1] or sender
 
     def resolve(sender: str) -> str:
         if sender in cache:
