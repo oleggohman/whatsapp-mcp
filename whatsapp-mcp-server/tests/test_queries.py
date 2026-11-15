@@ -739,6 +739,17 @@ def test_search_contacts_by_contacts_name(contacts_on):
     assert whatsapp.search_contacts("Dan Levi") == []  # no WhatsApp chat for that entry
 
 
+def test_search_contacts_suffix_bounds_match_name_for(contacts_on):
+    # "+972 58-552-9067" has 12 national digits, above MAX_NATIONAL_DIGITS: a chat whose
+    # number only ends in them gets no Contacts name, so search_contacts must not list it.
+    writer = sqlite3.connect(contacts_on / "messages.db")
+    writer.execute("INSERT INTO chats VALUES ('1972585529067@s.whatsapp.net', NULL, NULL)")
+    writer.commit()
+    writer.close()
+    assert whatsapp.contacts_macos.get_index().name_for("1972585529067") is None
+    assert [c.jid for c in whatsapp.search_contacts("Mia")] == [MIA]
+
+
 def test_search_contacts_ignores_contacts_when_off(contacts_on, monkeypatch):
     monkeypatch.setenv("WHATSAPP_MACOS_CONTACTS", "0")
     assert whatsapp.search_contacts("Mia Gohman") == []

@@ -694,7 +694,8 @@ def _add_contacts_matches(cursor: sqlite3.Cursor, query: str, result: list[Conta
     """Append direct chats whose number belongs to a macOS Contacts entry matching query.
 
     Only `@s.whatsapp.net` chats are considered (a LID is not a phone number). A chat matches
-    the entry's full digits exactly, or its national digits after a 1-3 digit country code.
+    the entry's full digits exactly, or its national digits (7-11 of them) after a 1-3 digit
+    country code.
     Chats already in result are skipped and the list stops at _SEARCH_LIMIT contacts.
     """
     seen = {c.jid for c in result}
@@ -708,9 +709,14 @@ def _add_contacts_matches(cursor: sqlite3.Cursor, query: str, result: list[Conta
             if len(result) >= _SEARCH_LIMIT:
                 return
             user = _user_part(jid)
-            if jid in seen or (
-                user != entry.full and not 1 <= len(user) - len(entry.national) <= 3
-            ):
+            # Same bounds as Index.name_for, so a listed chat also gets the entry's name.
+            national_hit = (
+                1 <= len(user) - len(entry.national) <= 3
+                and contacts_macos.MIN_NATIONAL_DIGITS
+                <= len(entry.national)
+                <= contacts_macos.MAX_NATIONAL_DIGITS
+            )
+            if jid in seen or (user != entry.full and not national_hit):
                 continue
             seen.add(jid)
             result.append(Contact(phone_number=user, name=_display_name(jid, name), jid=jid))
