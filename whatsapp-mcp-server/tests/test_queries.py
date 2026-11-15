@@ -387,6 +387,29 @@ def test_get_contact_chats_group_jid(store_dir):
     assert whatsapp.get_contact_chats("g2@g.us") == []
 
 
+def test_group_jid_does_not_match_a_contact_with_the_same_user_part(store_dir):
+    gid = "120363000000000001"
+    conn = sqlite3.connect(store_dir / "messages.db")
+    conn.execute("INSERT INTO chats VALUES (?, 'Other', NULL)", (gid + "@g.us",))
+    conn.execute("INSERT INTO chats VALUES (?, 'Lid', NULL)", (gid + "@lid",))
+    conn.commit()
+    conn.close()
+    _add_message(
+        store_dir, "g-1", gid + "@g.us", "222", "in the group", "2025-02-01 08:00:00+00:00"
+    )
+    _add_message(
+        store_dir, "g-2", gid + "@lid", gid, "newer lid message", "2025-03-01 08:00:00+00:00"
+    )
+    _add_message(store_dir, "g-3", "g1@g.us", gid, "sent as the id", "2025-02-02 08:00:00+00:00")
+
+    assert [c.jid for c in whatsapp.get_contact_chats(gid + "@g.us")] == [gid + "@g.us"]
+    last = whatsapp.get_last_interaction(gid + "@g.us")
+    assert "in the group" in last and "newer lid message" not in last
+
+    assert {c.jid for c in whatsapp.get_contact_chats(gid)} == {gid + "@lid", "g1@g.us"}
+    assert "newer lid message" in whatsapp.get_last_interaction(gid)
+
+
 def test_get_direct_chat_by_contact_is_exact(store_dir):
     conn = sqlite3.connect(store_dir / "messages.db")
     conn.execute("INSERT INTO chats VALUES ('15551212@s.whatsapp.net', 'Long', NULL)")
@@ -440,8 +463,17 @@ def test_last_interaction_uses_sender_and_chat_indexes(store_dir):
 
 
 def test_contact_chats_sender_lookup_uses_sender_index(store_dir):
-    plan = _plan(store_dir, "SELECT chat_jid FROM messages WHERE sender = ?", ("111",))
+    plan = _plan(store_dir, whatsapp._CONTACT_CHATS_SQL, ("111", "111", ALICE, "111", 20, 0))
     assert "INDEX idx_messages_sender_time" in plan
+
+
+def test_group_lookups_use_indexes(store_dir):
+    last = _plan(store_dir, whatsapp._LAST_CHAT_MESSAGE_SQL, ("g1@g.us",))
+    assert "sqlite_autoindex_chats_1" in last
+    assert "idx_messages_chat_time" in last
+    chat = _plan(store_dir, whatsapp._GROUP_CHAT_SQL, ("g1@g.us", 20, 0))
+    assert "sqlite_autoindex_chats_1" in chat
+    assert "idx_messages_chat_time" in chat
 
 
 # --- FTS search (Task 5c) ---

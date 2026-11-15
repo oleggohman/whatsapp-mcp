@@ -99,6 +99,11 @@ def _user_part(jid: str) -> str:
     return jid.split("@")[0]
 
 
+def _is_group_jid(jid: str) -> bool:
+    """Return True for a group JID (`...@g.us`), the rule behind `NOT LIKE '%@g.us'`."""
+    return jid.endswith("@g.us")
+
+
 def to_jsonable(obj: Any) -> Any:
     """Convert dataclasses (recursively) to plain dicts with datetimes as ISO-8601 strings."""
     if hasattr(obj, "__dataclass_fields__"):
@@ -136,7 +141,7 @@ class Chat:
     @property
     def is_group(self) -> bool:
         """Determine if chat is a group based on JID pattern."""
-        return self.jid.endswith("@g.us")
+        return _is_group_jid(self.jid)
 
 
 @dataclass
@@ -661,43 +666,62 @@ def search_contacts(query: str) -> list[Contact]:
         return []
 
 
+# One row per chat with its newest message attached.
+_CHAT_ROWS_SELECT = f"""
+    SELECT
+        c.jid,
+        c.name,
+        c.last_message_time,
+        m.content as last_message,
+        m.sender as last_sender,
+        m.is_from_me as last_is_from_me
+    FROM chats c
+    LEFT JOIN messages m ON m.rowid = {_LAST_ROWID.format(a="m2", jid="c.jid")}
+"""
+
+# A group matches only its own chat: primary-key lookup, no contact or sender lookup.
+_GROUP_CHAT_SQL = (
+    _CHAT_ROWS_SELECT
+    + """
+    WHERE c.jid = ?
+    ORDER BY c.last_message_time DESC
+    LIMIT ? OFFSET ?
+"""
+)
+
+# Chat ids first (direct chat by JID or the exact JID given, other chats by sender index).
+_CONTACT_CHATS_SQL = (
+    _CHAT_ROWS_SELECT
+    + """
+    WHERE c.jid IN (
+        SELECT jid FROM chats WHERE jid IN (? || '@s.whatsapp.net', ? || '@lid', ?)
+        UNION
+        SELECT chat_jid FROM messages WHERE sender = ?
+    )
+    ORDER BY c.last_message_time DESC
+    LIMIT ? OFFSET ?
+"""
+)
+
+
 def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> list[Chat]:
     """Get all chats involving the contact.
 
     Args:
-        jid: The contact's JID or bare sender (user part) to search for. Any other JID (a
-            group, for example) matches its own chat exactly.
+        jid: The contact's JID or bare sender (user part) to search for. A group JID
+            (`...@g.us`) matches only its own chat; any other JID matches its own chat exactly.
         limit: Maximum number of chats to return (default 20)
         page: Page number for pagination (default 0)
     """
-    user = _user_part(jid)
     try:
         with _connect() as conn:
             cursor = conn.cursor()
 
-            # Chat ids first (direct chat by JID or the exact JID given, other chats by sender
-            # index), then one row per chat with its newest message attached.
-            cursor.execute(
-                f"""
-                SELECT
-                    c.jid,
-                    c.name,
-                    c.last_message_time,
-                    m.content as last_message,
-                    m.sender as last_sender,
-                    m.is_from_me as last_is_from_me
-                FROM chats c
-                LEFT JOIN messages m ON m.rowid = {_LAST_ROWID.format(a="m2", jid="c.jid")}
-                WHERE c.jid IN (
-                    SELECT jid FROM chats WHERE jid IN (? || '@s.whatsapp.net', ? || '@lid', ?)
-                    UNION
-                    SELECT chat_jid FROM messages WHERE sender = ?
-                )
-                ORDER BY c.last_message_time DESC
-                LIMIT ? OFFSET ?
-            """,
-                (user, user, jid, user, limit, page * limit),
-            )
+            if _is_group_jid(jid):
+                cursor.execute(_GROUP_CHAT_SQL, (jid, limit, page * limit))
+            else:
+                user = _user_part(jid)
+                cursor.execute(_CONTACT_CHATS_SQL, (user, user, jid, user, limit, page * limit))
 
             chats = cursor.fetchall()
 
@@ -728,8 +752,8 @@ _INTERACTION_COLS = (
 )
 
 # Newest message by this sender (idx_messages_sender_time) and newest message of each direct
-# chat JID form and of the exact JID given, e.g. a group (idx_messages_chat_time), then the
-# newest of the four.
+# chat JID form and of the exact JID given (idx_messages_chat_time), then the newest of the
+# four. Group JIDs use _LAST_CHAT_MESSAGE_SQL instead.
 _LAST_INTERACTION_SQL = f"""
     SELECT * FROM (
         SELECT {_INTERACTION_COLS} FROM messages m JOIN chats c ON m.chat_jid = c.jid
@@ -755,14 +779,24 @@ _LAST_INTERACTION_SQL = f"""
 """
 
 
+# A group matches only its own chat: the exact-JID branch of _LAST_INTERACTION_SQL on its own.
+_LAST_CHAT_MESSAGE_SQL = f"""
+    SELECT {_INTERACTION_COLS} FROM messages m JOIN chats c ON m.chat_jid = c.jid
+    WHERE m.chat_jid = ? ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1
+"""
+
+
 def get_last_interaction(jid: str) -> str:
     """Get most recent message involving the contact."""
-    user = _user_part(jid)
     try:
         with _connect() as conn:
             cursor = conn.cursor()
 
-            cursor.execute(_LAST_INTERACTION_SQL, (user, user, user, jid))
+            if _is_group_jid(jid):
+                cursor.execute(_LAST_CHAT_MESSAGE_SQL, (jid,))
+            else:
+                user = _user_part(jid)
+                cursor.execute(_LAST_INTERACTION_SQL, (user, user, user, jid))
 
             msg_data = cursor.fetchone()
 
