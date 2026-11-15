@@ -2,6 +2,7 @@ import asyncio
 import io
 import logging
 import os
+import sqlite3
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -9,7 +10,8 @@ from typing import Any
 
 import qrcode
 import qrcode.image.pure
-from mcp.server.fastmcp import FastMCP, Image
+from mcp.server.mcpserver import Image, MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 import bridge_manager
 from bridge_manager import BridgeError
@@ -35,7 +37,7 @@ NOT_PAIRED_MESSAGE = "WhatsApp is not paired - call get_pairing_qr or pair_with_
 
 
 @asynccontextmanager
-async def lifespan(server: FastMCP):
+async def lifespan(server: MCPServer):
     """Start the bridge supervisor in the background and return immediately.
 
     The bridge is a shared daemon: leaving the lifespan deliberately does not stop it.
@@ -44,8 +46,8 @@ async def lifespan(server: FastMCP):
     yield
 
 
-# Initialize FastMCP server
-mcp = FastMCP("whatsapp", lifespan=lifespan)
+# Initialize MCP server
+mcp = MCPServer("whatsapp", version=bridge_manager.RELEASE, lifespan=lifespan)
 
 
 async def _bridge_unavailable() -> str | None:
@@ -78,6 +80,15 @@ async def _send_checked(fn, *args) -> dict[str, Any]:
     return {"success": success, "message": status_message}
 
 
+def _read(fn, *args, **kwargs):
+    """Run a database read; report its anticipated failures to the client with their own text."""
+    try:
+        return fn(*args, **kwargs)
+    # sqlite3.Error is here for get_message_context, the one read that re-raises it
+    except (ValueError, RuntimeError, sqlite3.Error) as e:
+        raise ToolError(str(e)) from e
+
+
 @mcp.tool()
 def search_contacts(query: str) -> list[dict[str, Any]]:
     """Search WhatsApp contacts by name or phone number.
@@ -85,7 +96,7 @@ def search_contacts(query: str) -> list[dict[str, Any]]:
     Args:
         query: Search term to match against contact names or phone numbers
     """
-    contacts = whatsapp_search_contacts(query)
+    contacts = _read(whatsapp_search_contacts, query)
     return to_jsonable(contacts)
 
 
@@ -116,7 +127,8 @@ def list_messages(
         context_before: Number of messages to include before each match (default 1)
         context_after: Number of messages to include after each match (default 1)
     """
-    messages = whatsapp_list_messages(
+    messages = _read(
+        whatsapp_list_messages,
         after=after,
         before=before,
         sender_phone_number=sender_phone_number,
@@ -148,7 +160,8 @@ def list_chats(
         include_last_message: Whether to include the last message in each chat (default True)
         sort_by: Field to sort results by, either "last_active" or "name" (default "last_active")
     """
-    chats = whatsapp_list_chats(
+    chats = _read(
+        whatsapp_list_chats,
         query=query,
         limit=limit,
         page=page,
@@ -166,7 +179,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> dict[str, Any]
         chat_jid: The JID of the chat to retrieve
         include_last_message: Whether to include the last message (default True)
     """
-    chat = whatsapp_get_chat(chat_jid, include_last_message)
+    chat = _read(whatsapp_get_chat, chat_jid, include_last_message)
     return to_jsonable(chat)
 
 
@@ -177,7 +190,7 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> dict[str, Any] | Non
     Args:
         sender_phone_number: The phone number to search for
     """
-    chat = whatsapp_get_direct_chat_by_contact(sender_phone_number)
+    chat = _read(whatsapp_get_direct_chat_by_contact, sender_phone_number)
     return to_jsonable(chat)
 
 
@@ -190,7 +203,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> list[dict[str
         limit: Maximum number of chats to return (default 20)
         page: Page number for pagination (default 0)
     """
-    chats = whatsapp_get_contact_chats(jid, limit, page)
+    chats = _read(whatsapp_get_contact_chats, jid, limit, page)
     return to_jsonable(chats)
 
 
@@ -201,7 +214,7 @@ def get_last_interaction(jid: str) -> str | None:
     Args:
         jid: The contact's JID or bare phone number to search for
     """
-    message = whatsapp_get_last_interaction(jid)
+    message = _read(whatsapp_get_last_interaction, jid)
     return message
 
 
@@ -214,7 +227,7 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5) -> dic
         before: Number of messages to include before the target message (default 5)
         after: Number of messages to include after the target message (default 5)
     """
-    context = whatsapp_get_message_context(message_id, before, after)
+    context = _read(whatsapp_get_message_context, message_id, before, after)
     return to_jsonable(context)
 
 

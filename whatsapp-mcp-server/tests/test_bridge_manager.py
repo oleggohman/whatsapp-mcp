@@ -22,8 +22,8 @@ FAKE_BRIDGE_SRC = Path(__file__).with_name("fake_bridge.py")
 
 
 def _data(result):
-    """Structured payload of a call_tool result (unwrapping FastMCP's {"result": ...})."""
-    structured = result[1]
+    """Structured payload of a call_tool result (unwrapping MCPServer's {"result": ...})."""
+    structured = result.structured_content
     return structured["result"] if set(structured) == {"result"} else structured
 
 
@@ -467,9 +467,9 @@ async def test_pairing_tools_through_mcp(env):
     )
     assert "restart_needed" not in status
 
-    content = await main.mcp.call_tool("get_pairing_qr", {})
+    content = (await main.mcp.call_tool("get_pairing_qr", {})).content
     kinds = [c.type for c in content]
-    assert kinds[0] == "image" and content[0].mimeType == "image/png"
+    assert kinds[0] == "image" and content[0].mime_type == "image/png"
     import base64
 
     assert base64.b64decode(content[0].data)[:8] == b"\x89PNG\r\n\x1a\n"
@@ -530,7 +530,7 @@ async def test_send_when_logged_in_passes_through(env, monkeypatch):
     assert mgr._done.wait(30)
     res = _data(await main.mcp.call_tool("send_message", {"recipient": "123", "message": "hi"}))
     assert res == {"success": True, "message": "sent"}
-    qr = await main.mcp.call_tool("get_pairing_qr", {})
+    qr = (await main.mcp.call_tool("get_pairing_qr", {})).content
     assert "already paired" in qr[0].text
 
 

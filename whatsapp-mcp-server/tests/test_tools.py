@@ -1,4 +1,4 @@
-"""Every MCP tool invoked through FastMCP (exercises output-schema validation), plus DB."""
+"""Every MCP tool invoked through MCPServer (exercises output-schema validation), plus DB."""
 
 import json
 import sqlite3
@@ -7,8 +7,9 @@ from pathlib import Path
 import httpx
 import pytest
 from conftest import make_messages_db
-from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.mcpserver.exceptions import ToolError
 
+import bridge_manager
 import main
 import whatsapp
 
@@ -16,8 +17,8 @@ BASELINE = Path(__file__).parent / "baseline_tools.json"
 
 
 def _payload(result):
-    """Return the structured payload of a call_tool result (unwrap FastMCP's {"result": ...})."""
-    content, structured = result
+    """Return the structured payload of a call_tool result (unwrap MCPServer's {"result": ...})."""
+    content, structured = result.content, result.structured_content
     if structured is not None:
         return structured.get("result", structured) if set(structured) == {"result"} else structured
     return json.loads(content[0].text)
@@ -196,6 +197,37 @@ def test_connect_is_read_only(store_dir):
             conn.execute("DELETE FROM chats")
 
 
+# --- read errors keep their text (mcp 2.x only forwards ToolError text) -------------------------
+
+
+async def test_read_tool_errors_keep_their_text(store_dir, monkeypatch):
+    with pytest.raises(ToolError, match="Invalid date format"):
+        await call("list_messages", after="garbage")
+    with pytest.raises(ToolError, match="not found"):
+        await call("get_message_context", message_id="missing")
+
+    # RuntimeError arm: the database file is missing
+    monkeypatch.setenv("WHATSAPP_DB_PATH", str(store_dir / "absent.db"))
+    with pytest.raises(ToolError, match="database not found"):
+        await call("get_chat", chat_jid="111@s.whatsapp.net")
+
+
+async def test_read_tool_sqlite_error_arm_and_swallowed_errors(store_dir, monkeypatch):
+    def locked():
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(whatsapp, "_connect", locked)
+    # get_message_context is the only read that re-raises sqlite3.Error
+    with pytest.raises(ToolError, match="database is locked"):
+        await call("get_message_context", message_id="m1")
+    # the other reads swallow it themselves: still an empty result, not a tool error
+    assert await call("get_contact_chats", jid="111") == []
+
+
+def test_server_version_is_the_release():
+    assert main.mcp.version == bridge_manager.RELEASE
+
+
 # --- tool schema baseline ----------------------------------------------------------------------
 
 
@@ -216,7 +248,7 @@ def _normalize(schema: dict) -> dict:
 
 async def test_tool_schemas_match_baseline():
     baseline = json.loads(BASELINE.read_text())
-    tools = {t.name: t.inputSchema for t in await main.mcp.list_tools()}
+    tools = {t.name: t.input_schema for t in await main.mcp.list_tools()}
     # The baseline tools stay unchanged; Task 9a adds exactly these pairing/status tools.
     assert set(tools) == set(baseline) | {
         "get_connection_status",

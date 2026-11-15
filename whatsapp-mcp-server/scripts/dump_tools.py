@@ -32,7 +32,7 @@ async def dump_tools() -> dict:
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.list_tools()
-    return {t.name: t.inputSchema for t in sorted(result.tools, key=lambda t: t.name)}
+    return {t.name: t.input_schema for t in sorted(result.tools, key=lambda t: t.name)}
 
 
 def main() -> int:

@@ -3,7 +3,7 @@
 import types
 
 import pytest
-from mcp.server.fastmcp import Image
+from mcp.server.mcpserver import Image
 
 import bridge_manager
 import main
