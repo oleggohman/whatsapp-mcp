@@ -9,6 +9,8 @@ published in the [oleggohman/cc-things](https://github.com/oleggohman/cc-things)
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-15
+
 ### Changed
 
 - Reads on a large `messages.db` are much faster. The bridge adds indexes on `messages` and an FTS5
@@ -175,7 +177,8 @@ DROP TABLE IF EXISTS messages_fts;
 
 - Initial version from the upstream project.
 
-[Unreleased]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.3.4...HEAD
+[Unreleased]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.3.4...v0.4.0
 [0.3.4]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.3.1...v0.3.2
