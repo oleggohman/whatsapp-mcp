@@ -705,6 +705,22 @@ def test_name_resolver_rules(contacts_on):
         assert resolve("972585529067") == "Mia Gohman"  # memoized
 
 
+def test_name_resolver_skips_contacts_for_known_lid(contacts_on):
+    # Bare LID digits with no chat row (a group sender the bridge could not map when stored)
+    # that happen to match a Contacts number.
+    wa = sqlite3.connect(contacts_on / "whatsapp.db")
+    wa.execute("INSERT INTO whatsmeow_lid_map VALUES ('972520001111', '15550001111')")
+    wa.commit()
+    wa.close()
+    with whatsapp._connect() as conn:
+        resolve = whatsapp._name_resolver(conn)
+        assert resolve("972520001111") == "972520001111"
+        assert resolve("972585529067") == "Mia Gohman"
+    (contacts_on / "whatsapp.db").unlink()
+    with whatsapp._connect() as conn:  # no LID map: the bare sender is taken as a phone number
+        assert whatsapp._name_resolver(conn)("972520001111") == "Dan Levi"
+
+
 def test_name_resolver_database_error_resolves_to_sender(contacts_on):
     with whatsapp._connect() as conn:
         resolve = whatsapp._name_resolver(conn)
