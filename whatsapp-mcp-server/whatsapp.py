@@ -1002,7 +1002,7 @@ def send_audio_message(recipient: str, media_path: str) -> tuple[bool, str]:
                 logger.warning("could not remove temp file %s", converted_path)
 
 
-def download_media(message_id: str, chat_jid: str) -> str | None:
+def download_media(message_id: str, chat_jid: str) -> tuple[str | None, str]:
     """Download media from a message and return the local file path.
 
     Args:
@@ -1010,13 +1010,14 @@ def download_media(message_id: str, chat_jid: str) -> str | None:
         chat_jid: The JID of the chat containing the message
 
     Returns:
-        The local file path if download was successful, None otherwise
+        (local path, "") on success, else (None, the bridge's or transport's message)
     """
     result, error = _post("download", {"message_id": message_id, "chat_jid": chat_jid})
     if result is None:
         logger.error("%s", error)
-        return None
+        return None, error
     if result.get("success", False):
-        return result.get("path")
-    logger.error("Download failed: %s", result.get("message", "Unknown error"))
-    return None
+        return result.get("path"), ""
+    message = result.get("message", "Unknown error")
+    logger.error("Download failed: %s", message)
+    return None, message

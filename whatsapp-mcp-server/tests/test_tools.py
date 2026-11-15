@@ -149,7 +149,7 @@ async def test_download_media(store_dir, bridge_ok, monkeypatch):
         ),
     )
     res = await call("download_media", message_id="m1", chat_jid="x")
-    assert res == {"success": False, "message": "Failed to download media"}
+    assert res == {"success": False, "message": "no media"}
 
 
 # --- search / LID ------------------------------------------------------------------------------

@@ -121,10 +121,10 @@ def test_send_audio_ogg_passthrough(bridge, tmp_path):
 def test_download_media(bridge):
     requests, state = bridge
     state["handler"] = lambda req: httpx.Response(200, json={"success": True, "path": "/x/y.jpg"})
-    assert whatsapp.download_media("m1", "c@s.whatsapp.net") == "/x/y.jpg"
+    assert whatsapp.download_media("m1", "c@s.whatsapp.net") == ("/x/y.jpg", "")
     assert json.loads(requests[0].content) == {"message_id": "m1", "chat_jid": "c@s.whatsapp.net"}
     assert str(requests[0].url).endswith("/api/download")
     state["handler"] = lambda req: httpx.Response(200, json={"success": False, "message": "nope"})
-    assert whatsapp.download_media("m1", "c") is None
+    assert whatsapp.download_media("m1", "c") == (None, "nope")
     state["handler"] = lambda req: httpx.Response(500, text="boom")
-    assert whatsapp.download_media("m1", "c") is None
+    assert whatsapp.download_media("m1", "c") == (None, "Error: HTTP 500 - boom")

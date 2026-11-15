@@ -100,11 +100,9 @@ async def test_failed_send_reports_not_paired(mgr):
 
 
 async def test_download_media_failure_message(mgr, monkeypatch):
-    monkeypatch.setattr(main, "whatsapp_download_media", lambda message_id, chat: None)
-    assert await main.download_media("m1", "c") == {
-        "success": False,
-        "message": "Failed to download media",
-    }
+    text = "Failed to download media: download: download failed with status code 403"
+    monkeypatch.setattr(main, "whatsapp_download_media", lambda message_id, chat: (None, text))
+    assert await main.download_media("m1", "c") == {"success": False, "message": text}
 
 
 # --- get_connection_status ---------------------------------------------------------------------

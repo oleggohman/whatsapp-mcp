@@ -298,12 +298,12 @@ async def download_media(message_id: str, chat_jid: str) -> dict[str, Any]:
     unavailable = await _bridge_unavailable()
     if unavailable:
         return {"success": False, "message": unavailable}
-    file_path = await asyncio.to_thread(whatsapp_download_media, message_id, chat_jid)
+    file_path, message = await asyncio.to_thread(whatsapp_download_media, message_id, chat_jid)
 
     if file_path:
         return {"success": True, "message": "Media downloaded successfully", "file_path": file_path}
     else:
-        return {"success": False, "message": "Failed to download media"}
+        return {"success": False, "message": message}
 
 
 def _connection_status(reconnect: bool) -> dict[str, Any]:
