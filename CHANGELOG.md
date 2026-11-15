@@ -9,6 +9,29 @@ published in the [oleggohman/cc-things](https://github.com/oleggohman/cc-things)
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-11-15
+
+### Added
+
+- macOS Contacts name fallback. When WhatsApp has no name for a direct chat (the bridge stored a
+  bare number), the MCP server looks the number up in the Contacts app. This covers chat names,
+  contact names, sender names and the `Chat:` prefix of formatted messages. The lookup is
+  read-only, local, in memory and macOS only; nothing is written to the store or sent anywhere.
+  WhatsApp names always win. Set `WHATSAPP_MACOS_CONTACTS=0` (or `false`, `no`, `off`) to turn it
+  off. A missing or denied Contacts database is skipped silently (one `INFO` log line).
+- `search_contacts` also matches Contacts names for direct chats. `list_chats` `query` and
+  `sort_by` still use the stored WhatsApp names.
+
+### Fixed
+
+- `download_media` failed with HTTP 403 for every file: the bridge dropped the signed query
+  (`ccb`, `oh`, `oe`) of the media URL, which whatsmeow needs in the direct path. The query is
+  kept now.
+- The bridge logs a failed download (`Media download failed (message ..., chat ...)`) to
+  `bridge.log`.
+- The `download_media` tool returns the bridge's error message instead of the fixed text
+  `Failed to download media`.
+
 ## [0.4.1] - 2026-11-15
 
 ### Changed
@@ -206,7 +229,8 @@ DROP TABLE IF EXISTS messages_fts;
 
 - Initial version from the upstream project.
 
-[Unreleased]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.3.4...v0.4.0
 [0.3.4]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.3.3...v0.3.4
