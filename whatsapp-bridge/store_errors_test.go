@@ -284,21 +284,39 @@ func TestMigrateSearchFailsClosed(t *testing.T) {
 	absent := state(0, 0, 0, 0, 0)
 	fresh := state(1, 3, 2, 2, 0)
 	stale := state(1, 3, 1, 2, 0)
-	cases := []struct {
+	type failCase struct {
 		name string
 		c    *fakeConnector
 		want string
+		// notDroppable: the error must wrap errFTSNotDroppable; every other case must not
+		notDroppable bool
+	}
+	cases := []failCase{
+		{"index creation", &fakeConnector{txMode: true, failSQL: "idx_messages_chat_time"}, "create indexes: ", false},
+		{"existence check", &fakeConnector{txMode: true, failSQL: "type = 'table'"}, "check messages_fts: ", false},
+		{"drop orphaned triggers", &fakeConnector{txMode: true, failSQL: "DROP TRIGGER", queryRows: state(0, 3, 0, 0, 0)}, "drop orphaned messages_fts triggers: ", false},
+		{"drop triggers", &fakeConnector{txMode: true, failSQL: "DROP TRIGGER", queryRows: stale}, "drop stale messages_fts: triggers: ", false},
+		// A failure SQLite does not report (here a plain error) is not a damaged table
+		{"drop table", &fakeConnector{txMode: true, failSQL: "DROP TABLE", queryRows: stale}, "drop stale messages_fts: table: ", false},
+		{"begin", &fakeConnector{txMode: true, failBegin: true}, "begin: ", false},
+		{"fts table", &fakeConnector{txMode: true, failSQL: "CREATE VIRTUAL TABLE"}, "create messages_fts: ", false},
+		{"triggers", &fakeConnector{txMode: true, failSQL: "CREATE TRIGGER"}, "create messages_fts triggers: ", false},
+		{"rebuild", &fakeConnector{txMode: true, failSQL: "'rebuild'"}, "rebuild messages_fts: ", false},
+		{"commit", &fakeConnector{txMode: true, failCommit: true, queryRows: fresh}, "commit: ", false},
+	}
+	// Only a damaged table gets the recovery hint; a busy, locked, full, read-only, unopenable or
+	// failing file, low memory or an interrupt is not something the README recovery fixes
+	for name, tc := range map[string]struct {
+		code         sqlite3.ErrNo
+		notDroppable bool
 	}{
-		{"index creation", &fakeConnector{txMode: true, failSQL: "idx_messages_chat_time"}, "create indexes: "},
-		{"existence check", &fakeConnector{txMode: true, failSQL: "type = 'table'"}, "check messages_fts: "},
-		{"drop orphaned triggers", &fakeConnector{txMode: true, failSQL: "DROP TRIGGER", queryRows: state(0, 3, 0, 0, 0)}, "drop orphaned messages_fts triggers: "},
-		{"drop triggers", &fakeConnector{txMode: true, failSQL: "DROP TRIGGER", queryRows: stale}, "drop stale messages_fts: triggers: "},
-		{"drop table", &fakeConnector{txMode: true, failSQL: "DROP TABLE", queryRows: stale}, "drop stale messages_fts: table: "},
-		{"begin", &fakeConnector{txMode: true, failBegin: true}, "begin: "},
-		{"fts table", &fakeConnector{txMode: true, failSQL: "CREATE VIRTUAL TABLE"}, "create messages_fts: "},
-		{"triggers", &fakeConnector{txMode: true, failSQL: "CREATE TRIGGER"}, "create messages_fts triggers: "},
-		{"rebuild", &fakeConnector{txMode: true, failSQL: "'rebuild'"}, "rebuild messages_fts: "},
-		{"commit", &fakeConnector{txMode: true, failCommit: true, queryRows: fresh}, "commit: "},
+		"error": {sqlite3.ErrError, true}, "corrupt": {sqlite3.ErrCorrupt, true}, "notadb": {sqlite3.ErrNotADB, true},
+		"busy": {sqlite3.ErrBusy, false}, "locked": {sqlite3.ErrLocked, false}, "full": {sqlite3.ErrFull, false},
+		"readonly": {sqlite3.ErrReadonly, false}, "ioerr": {sqlite3.ErrIoErr, false}, "cantopen": {sqlite3.ErrCantOpen, false},
+		"nomem": {sqlite3.ErrNomem, false}, "interrupt": {sqlite3.ErrInterrupt, false},
+	} {
+		c := &fakeConnector{txMode: true, failSQL: "DROP TABLE", failSQLErr: sqlite3.Error{Code: tc.code}, queryRows: stale}
+		cases = append(cases, failCase{"drop table " + name, c, "drop stale messages_fts: table: ", tc.notDroppable})
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -309,33 +327,11 @@ func TestMigrateSearchFailsClosed(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("err = %v, want %q", err, tc.want)
 			}
-			if tc.name == "drop table" && !errors.Is(err, errFTSNotDroppable) {
-				t.Fatalf("err = %v, want errFTSNotDroppable", err)
+			if got := errors.Is(err, errFTSNotDroppable); got != tc.notDroppable {
+				t.Fatalf("err = %v, wraps errFTSNotDroppable = %t, want %t", err, got, tc.notDroppable)
 			}
 		})
 	}
-	// A busy, locked, full, read-only or failing file is not a damaged table: no recovery hint
-	for name, code := range map[string]sqlite3.ErrNo{
-		"busy": sqlite3.ErrBusy, "locked": sqlite3.ErrLocked, "full": sqlite3.ErrFull,
-		"readonly": sqlite3.ErrReadonly, "ioerr": sqlite3.ErrIoErr,
-	} {
-		t.Run("drop table "+name, func(t *testing.T) {
-			c := &fakeConnector{txMode: true, failSQL: "DROP TABLE", failSQLErr: sqlite3.Error{Code: code}, queryRows: stale}
-			err := fakeStore(c).migrateSearch(context.Background())
-			if err == nil || !strings.Contains(err.Error(), "drop stale messages_fts: table: ") {
-				t.Fatalf("err = %v, want a failed table drop", err)
-			}
-			if errors.Is(err, errFTSNotDroppable) {
-				t.Fatalf("err = %v wraps errFTSNotDroppable", err)
-			}
-		})
-	}
-	t.Run("drop table sqlite error", func(t *testing.T) {
-		c := &fakeConnector{txMode: true, failSQL: "DROP TABLE", failSQLErr: sqlite3.Error{Code: sqlite3.ErrError}, queryRows: stale}
-		if err := fakeStore(c).migrateSearch(context.Background()); !errors.Is(err, errFTSNotDroppable) {
-			t.Fatalf("err = %v, want errFTSNotDroppable", err)
-		}
-	})
 	t.Run("current index skips the rebuild", func(t *testing.T) {
 		c := &fakeConnector{txMode: true, queryRows: fresh}
 		if err := fakeStore(c).migrateSearch(context.Background()); err != nil {

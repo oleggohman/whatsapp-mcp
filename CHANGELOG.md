@@ -9,17 +9,6 @@ published in the [oleggohman/cc-things](https://github.com/oleggohman/cc-things)
 
 ## [Unreleased]
 
-### Fixed
-
-- An FTS index with segments that have no `messages_fts_idx` entry is now detected. FTS5 finds a
-  term through that table, so such a segment made search return no hits for its terms while both
-  `integrity-check` forms and the row count passed. The start-up check now counts these segments
-  before the integrity check; on a hit that start drops and rebuilds the index, and search uses
-  `LIKE` while the rebuild runs. The check cannot see a segment that keeps at least one idx row
-  and lost others.
-- `get_contact_chats` and `get_last_interaction` match a group JID (`...@g.us`) only to its own
-  chat. Before, a group JID could also match chats through the contact and sender lookups.
-
 ### Changed
 
 - When SQLite cannot drop a damaged `messages_fts` table, the bridge logs an error that names the
@@ -35,6 +24,17 @@ published in the [oleggohman/cc-things](https://github.com/oleggohman/cc-things)
   `messages.db` to WAL mode each time it opens it, and in WAL mode this does not block bridge
   writes. Where WAL is not in effect, a bridge write waits up to 5 s for the call to end and then
   fails with `database is locked`.
+
+### Fixed
+
+- An FTS index with segments that have no `messages_fts_idx` entry is now detected. FTS5 finds a
+  term through that table, so such a segment made search return no hits for its terms while both
+  `integrity-check` forms and the row count passed. The start-up check now counts these segments
+  before the integrity check; on a hit that start drops and rebuilds the index, and search uses
+  `LIKE` while the rebuild runs. The check cannot see a segment that keeps at least one idx row
+  and lost others.
+- `get_contact_chats` and `get_last_interaction` match a group JID (`...@g.us`) only to its own
+  chat. Before, a group JID could also match chats through the contact and sender lookups.
 
 ## [0.4.0] - 2026-11-15
 

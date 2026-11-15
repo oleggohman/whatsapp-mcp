@@ -80,7 +80,7 @@ async def _send_checked(fn, *args) -> dict[str, Any]:
     return {"success": success, "message": status_message}
 
 
-def _read(fn, *args, **kwargs):
+def _read(fn, *args, **kwargs) -> Any:
     """Run a database read; report its anticipated failures to the client with their own text."""
     try:
         return fn(*args, **kwargs)

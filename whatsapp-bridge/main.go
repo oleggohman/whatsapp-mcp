@@ -305,9 +305,9 @@ func run() int {
 	cancelled := migCtx.Err() != nil
 	if !cancelled {
 		if c := messageStore.ftsCheck; c.err != nil {
-			logger.Warnf("Search index failed its integrity check after %s, rebuilding it: %v", c.took.Round(time.Millisecond), c.err)
+			logger.Warnf("Search index failed its start-up check after %s, rebuilding it: %v", c.took.Round(time.Millisecond), c.err)
 		} else if c.ran {
-			logger.Infof("Search index integrity check passed in %s", c.took.Round(time.Millisecond))
+			logger.Infof("Search index start-up checks passed in %s", c.took.Round(time.Millisecond))
 		}
 		if migErr != nil {
 			// Search stays on LIKE; the bridge still serves

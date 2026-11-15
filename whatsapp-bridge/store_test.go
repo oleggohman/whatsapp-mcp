@@ -947,7 +947,9 @@ func TestMigrateSearchOutOfRangeSegmentIDIsRebuilt(t *testing.T) {
 // The segment check must not flag indexes that are healthy but look odd: no segments at all, a
 // trigger-built index, and a merge that is only partly done.
 func TestMigrateSearchSegmentCheckKeepsHealthyIndexes(t *testing.T) {
-	const automergeMarker = "INSERT INTO messages_fts(messages_fts, rank) VALUES('automerge', 7)"
+	// A non-default automerge value that survives only if the index is not rebuilt
+	const automergeMark = 7
+	automergeMarker := fmt.Sprintf("INSERT INTO messages_fts(messages_fts, rank) VALUES('automerge', %d)", automergeMark)
 	setup := func(t *testing.T) (*MessageStore, string) {
 		t.Helper()
 		s := newTestStore(t)
@@ -1053,7 +1055,7 @@ func TestMigrateSearchSegmentCheckKeepsHealthyIndexes(t *testing.T) {
 				if _, err := s.db.Exec(tc.marker); err != nil {
 					t.Fatal(err)
 				}
-				want = 7
+				want = automergeMark
 			}
 			s.db.SetMaxIdleConns(0)
 			if err := s.migrateSearch(context.Background()); err != nil {
@@ -1118,9 +1120,8 @@ func TestMigrateSearchDropsOrphanedTriggersFirst(t *testing.T) {
 	}
 }
 
-// TestBundledSQLiteVersionFloor records the SQLite release the FTS repair
-// tests were verified on (3.54.1). It is a floor, not an equality, so a later
-// go-sqlite3 bump does not fail it.
+// The FTS repair tests were verified on the bundled SQLite 3.54.1. The check is a floor, not an
+// equality, so a later go-sqlite3 bump does not fail it.
 func TestBundledSQLiteVersionFloor(t *testing.T) {
 	version, number, _ := sqlite3.Version()
 	if number < 3054001 {

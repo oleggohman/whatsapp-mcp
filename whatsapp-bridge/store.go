@@ -64,11 +64,13 @@ type Message struct {
 // Database handler for storing message history
 type MessageStore struct {
 	db *sql.DB
-	// ftsCheck is the last integrity check of messages_fts that migrateSearch ran; run logs it.
+	// ftsCheck is the last health check (segment check + integrity check) of messages_fts that
+	// migrateSearch ran; run logs it.
 	ftsCheck ftsCheck
 }
 
-// ftsCheck is how long an integrity check of messages_fts took and what it found (nil: healthy).
+// ftsCheck is how long the last health check (segment check + integrity check) of messages_fts
+// took and what it found (nil: healthy).
 // ran is set once the check executed: took alone cannot tell, as a coarse clock (Windows) can report 0.
 type ftsCheck struct {
 	ran  bool
@@ -311,9 +313,10 @@ const ftsRecoverySection = "Search index cannot be removed"
 // messages no longer touch the index, and readers ignore a table without its triggers. Then it
 // drops the table. FTS5 must open a table to drop it, so a broken one stays behind; it is
 // harmless without triggers, and the next start tries again. A failed table drop wraps
-// errFTSNotDroppable unless SQLite reports a transient or file-level failure (busy, locked, disk
-// full, read-only, I/O error), which the README recovery would not fix. run logs the error and
-// connects.
+// errFTSNotDroppable only when SQLite reports a damaged table (generic error, corrupt, not a
+// database). Any other failure (busy, locked, disk full, read-only, I/O, cannot open, out of
+// memory, interrupted, a cancelled context) is one the README recovery would not fix. run logs
+// the error and connects.
 func (store *MessageStore) dropFTS(ctx context.Context) error {
 	if _, err := store.db.ExecContext(ctx, dropFTSTriggersSQL); err != nil {
 		return fmt.Errorf("triggers: %w", err)
@@ -322,11 +325,11 @@ func (store *MessageStore) dropFTS(ctx context.Context) error {
 		var se sqlite3.Error
 		if errors.As(err, &se) {
 			switch se.Code {
-			case sqlite3.ErrBusy, sqlite3.ErrLocked, sqlite3.ErrFull, sqlite3.ErrReadonly, sqlite3.ErrIoErr:
-				return fmt.Errorf("table: %w", err)
+			case sqlite3.ErrError, sqlite3.ErrCorrupt, sqlite3.ErrNotADB:
+				return fmt.Errorf("table: %w: %w", errFTSNotDroppable, err)
 			}
 		}
-		return fmt.Errorf("table: %w: %w", errFTSNotDroppable, err)
+		return fmt.Errorf("table: %w", err)
 	}
 	return nil
 }

@@ -735,15 +735,15 @@ func TestRunSignalAfterMigrationExits(t *testing.T) {
 	}
 }
 
-// run logs how long the integrity check of an existing search index took and what it found.
+// run logs how long the start-up checks of an existing search index took and what they found.
 func TestRunLogsIntegrityCheck(t *testing.T) {
 	for name, tc := range map[string]struct {
 		check ftsCheck
 		want  string
 	}{
-		"passed": {ftsCheck{ran: true, took: 1500 * time.Millisecond}, "Search index integrity check passed in 1.5s"},
+		"passed": {ftsCheck{ran: true, took: 1500 * time.Millisecond}, "Search index start-up checks passed in 1.5s"},
 		"failed": {ftsCheck{ran: true, took: 2 * time.Second, err: io.ErrUnexpectedEOF},
-			"Search index failed its integrity check after 2s, rebuilding it: unexpected EOF"},
+			"Search index failed its start-up check after 2s, rebuilding it: unexpected EOF"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			h := newRunHarness(t, &fakeContainer{dev: &store.Device{}})
