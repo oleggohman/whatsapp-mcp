@@ -140,7 +140,9 @@ def _signature(paths: list[Path]) -> tuple:
 
 
 def _read_rows(uri: str) -> list[tuple]:
-    conn = sqlite3.connect(uri, uri=True)
+    # A short busy timeout: a database locked by Contacts.app falls back to immutable=1
+    # quickly instead of stalling the read tool for SQLite's default 5 s per database.
+    conn = sqlite3.connect(uri, uri=True, timeout=0.5)
     try:
         return conn.execute(_QUERY).fetchall()
     finally:

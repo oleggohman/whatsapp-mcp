@@ -306,6 +306,7 @@ def test_mode_ro_failure_falls_back_to_immutable(ab, monkeypatch):
 
     def connect(target, **kwargs):
         uris.append(target)
+        assert kwargs["timeout"] == 0.5
         if "mode=ro" in target:
             raise sqlite3.OperationalError("unable to open database file")
         return real_connect(target, **kwargs)
