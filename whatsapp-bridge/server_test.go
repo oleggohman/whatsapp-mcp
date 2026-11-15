@@ -426,6 +426,29 @@ func TestDownloadHandlerEndToEnd(t *testing.T) {
 	}
 }
 
+func TestDownloadHandlerLogsFailure(t *testing.T) {
+	root := t.TempDir()
+	store := newTestStoreIn(t, root)
+	seedMedia(t, store, "1234@s.whatsapp.net", "m1", "f.txt")
+	fc := &fakeClient{connected: true, downloadErr: errors.New("download failed with status code 403")}
+	a := newAPIServer(func() bridgeClient { return fc }, store, "", "127.0.0.1:8080")
+	var rec *httptest.ResponseRecorder
+	stderr := captureStderr(t, func() {
+		rec = do(a.handler(), http.MethodPost, "/api/download", `{"message_id":"m1","chat_jid":"1234@s.whatsapp.net"}`)
+	})
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("code = %d (%s)", rec.Code, rec.Body.String())
+	}
+	var resp DownloadMediaResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil || resp.Success ||
+		!strings.Contains(resp.Message, "Failed to download media: download: download failed with status code 403") {
+		t.Fatalf("resp = %+v err=%v", resp, err)
+	}
+	if want := "Media download failed (message m1, chat 1234@s.whatsapp.net): download: download failed with status code 403"; !strings.Contains(stderr, want) {
+		t.Fatalf("stderr = %q", stderr)
+	}
+}
+
 func TestBridgeAddrDefaultsToLoopback(t *testing.T) {
 	t.Setenv("WHATSAPP_BRIDGE_ADDR", "")
 	addr := bridgeAddr()

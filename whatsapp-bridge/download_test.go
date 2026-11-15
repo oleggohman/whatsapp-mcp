@@ -59,7 +59,7 @@ func TestDownloadMediaTypes(t *testing.T) {
 				t.Fatalf("file = %q, %v", b, err)
 			}
 			dl, isDL := fc.dlMsgs[0].(*MediaDownloader)
-			if !isDL || dl.MediaType != wm || dl.DirectPath != "/v/t62/abc.enc" || dl.FileLength != 9 {
+			if !isDL || dl.MediaType != wm || dl.DirectPath != "/v/t62/abc.enc?x=1" || dl.FileLength != 9 {
 				t.Fatalf("downloader = %+v", fc.dlMsgs[0])
 			}
 			// A second call finds the file and does not download again
@@ -172,7 +172,7 @@ func TestDownloadMediaErrors(t *testing.T) {
 		s := newTestStoreIn(t, root)
 		seedTyped(t, s, "m", "image", "a.jpg", url, 9)
 		fc := &fakeClient{downloadErr: errors.New("cdn 404")}
-		if err := attempt(t, fc, s, "m"); err.Error() != "failed to download media: cdn 404" {
+		if err := attempt(t, fc, s, "m"); err.Error() != "download: cdn 404" || !errors.Is(err, fc.downloadErr) {
 			t.Fatal(err)
 		}
 		if _, err := os.Stat(filepath.Join(root, sanitizeChatDirName(dlChat), "a.jpg")); !os.IsNotExist(err) {

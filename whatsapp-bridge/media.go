@@ -202,7 +202,7 @@ func downloadMedia(client bridgeClient, messageStore *MessageStore, messageID, c
 	// Download the media using whatsmeow client
 	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
-		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
+		return false, "", "", "", fmt.Errorf("download: %w", err)
 	}
 
 	// Save the downloaded media to file
@@ -274,22 +274,13 @@ func safeMediaPath(root, chatJID, filename string) (chatDir, localPath, safeName
 	return chatDir, localPath, safeName, nil
 }
 
-// Extract direct path from a WhatsApp media URL
+// extractDirectPathFromURL returns the path and query of a WhatsApp media URL. whatsmeow
+// appends "&hash=...&mms-type=..." to it, so the signed query (ccb, oh, oe) must stay:
+// without it the media servers answer 403.
 func extractDirectPathFromURL(url string) string {
-	// The direct path is typically in the URL, we need to extract it
-	// Example URL: https://mmg.whatsapp.net/v/t62.7118-24/13812002_698058036224062_3424455886509161511_n.enc?ccb=11-4&oh=...
-
-	// Find the path part after the domain
 	parts := strings.SplitN(url, ".net/", 2)
 	if len(parts) < 2 {
-		return url // Return original URL if parsing fails
+		return url
 	}
-
-	pathPart := parts[1]
-
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
-	return "/" + pathPart
+	return "/" + parts[1]
 }

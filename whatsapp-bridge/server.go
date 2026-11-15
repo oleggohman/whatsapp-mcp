@@ -581,6 +581,7 @@ func (a *apiServer) handleDownload(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			errMsg = err.Error()
 		}
+		logf("Media download failed (message %s, chat %s): %s\n", req.MessageID, req.ChatJID, errMsg)
 		writeJSON(w, http.StatusInternalServerError, DownloadMediaResponse{
 			Success: false,
 			Message: fmt.Sprintf("Failed to download media: %s", errMsg),

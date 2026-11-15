@@ -86,7 +86,9 @@ func TestExtractDirectPathFromURL(t *testing.T) {
 	tests := []struct {
 		name, url, want string
 	}{
-		{"with query", "https://mmg.whatsapp.net/v/t62.7118-24/123_n.enc?ccb=11-4&oh=abc", "/v/t62.7118-24/123_n.enc"},
+		{"with query", "https://mmg.whatsapp.net/v/t62.7118-24/123_n.enc?ccb=11-4&oh=abc", "/v/t62.7118-24/123_n.enc?ccb=11-4&oh=abc"},
+		{"full signed query", "https://mmg.whatsapp.net/v/t62.7118-24/123_n.enc?ccb=11-4&oh=abc&oe=def", "/v/t62.7118-24/123_n.enc?ccb=11-4&oh=abc&oe=def"},
+		{"second question mark", "https://mmg.whatsapp.net/v/t62.7118-24/123_n.enc?a?b=c?d", "/v/t62.7118-24/123_n.enc?a?b=c?d"},
 		{"no query", "https://mmg.whatsapp.net/v/t62.7118-24/123_n.enc", "/v/t62.7118-24/123_n.enc"},
 		{"malformed returns input", "not-a-whatsapp-url", "not-a-whatsapp-url"},
 		{"empty", "", ""},
