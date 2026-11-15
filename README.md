@@ -243,7 +243,7 @@ No variable is required. The Go bridge and the Python server read the same names
 - Every endpoint except `/api/health` requires the bearer token. See [The local bridge token](#the-local-bridge-token). A bridge started by hand without a token file has authentication disabled.
 - Downloaded media is written below `<store>/<chat>/` only. Chat names and file names from senders are reduced to a safe bare name, so a sender cannot write outside the store.
 - Message bodies are not logged.
-- Contacts names are read from `~/Library/Application Support/AddressBook` read-only, kept in memory only, and never written to the store or sent anywhere. macOS asks once for Contacts access for the app that runs the server (Claude Desktop, your terminal). Denying it only disables the fallback.
+- Contacts names are read from `~/Library/Application Support/AddressBook` read-only, kept in memory only, and never written to the store or sent anywhere. Contacts data is never modified; SQLite may create a database's `-wal`/`-shm` side files when they are missing. macOS asks once for Contacts access for the app that runs the server (Claude Desktop, your terminal). Denying it only disables the fallback.
 - The store (`whatsapp-bridge/store/`), databases, token and logs are listed in `.gitignore`.
 
 **Prompt injection.** A message you receive can contain instructions aimed at the model. An injected instruction could make the model call `send_file` on a sensitive local file (an SSH key, a `.env`) or send your messages to a chat. Nothing in this server prevents that. Keep per-tool approval enabled in your MCP client and review every `send_file` and `send_message` call before you approve it.

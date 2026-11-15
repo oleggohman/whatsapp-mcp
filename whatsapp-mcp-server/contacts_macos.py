@@ -1,6 +1,7 @@
 """Read-only name lookup in the macOS Contacts (AddressBook) databases.
 
-Everything stays local: the databases are opened read-only, the result lives in memory
+Everything stays local: the databases are opened read-only (SQLite may still create a
+missing -wal/-shm side file; the data is never modified), the result lives in memory
 only, nothing is written to the WhatsApp store and nothing leaves the machine. The module
 is inert off macOS and when WHATSAPP_MACOS_CONTACTS is "0", "false", "no" or "off". A
 missing directory or denied Contacts access yields an empty index, never an exception.
