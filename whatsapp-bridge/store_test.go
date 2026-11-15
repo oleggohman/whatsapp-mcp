@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	sqlite3 "github.com/mattn/go-sqlite3"
 )
 
 func newTestStore(t *testing.T) *MessageStore {
@@ -858,5 +860,15 @@ func TestMigrateSearchDropsOrphanedTriggersFirst(t *testing.T) {
 	}
 	if got := ftsHits(t, s, "cormorant"); len(got) != 1 || got[0] != "w1" {
 		t.Fatalf("MATCH cormorant = %v", got)
+	}
+}
+
+// TestBundledSQLiteVersionFloor records the SQLite release the FTS repair
+// tests were verified on (3.54.1). It is a floor, not an equality, so a later
+// go-sqlite3 bump does not fail it.
+func TestBundledSQLiteVersionFloor(t *testing.T) {
+	version, number, _ := sqlite3.Version()
+	if number < 3054001 {
+		t.Fatalf("bundled SQLite %s (%d) is older than 3.54.1", version, number)
 	}
 }
