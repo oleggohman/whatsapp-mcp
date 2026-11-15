@@ -111,6 +111,33 @@ def test_list_messages_context_survives_concurrent_chat_merge(store_dir, monkeyp
     assert out.index("hello") < out.index("second") < out.index("third")
 
 
+def test_list_messages_on_rollback_journal_database(tmp_path, monkeypatch):
+    # Documented cost of a non-WAL file, not a goal: the read transaction holds a shared lock
+    # until the call ends, so a writer started in the middle of list_messages cannot commit.
+    db = tmp_path / "messages.db"
+    make_messages_db(db, wal=False)
+    monkeypatch.setenv("WHATSAPP_DB_PATH", str(db))
+    monkeypatch.setenv("WHATSAPP_STORE_DIR", str(tmp_path))
+    real = whatsapp._name_resolver
+    outcome = []
+
+    def write_then_resolve(conn):
+        writer = sqlite3.connect(db, timeout=0)
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+                writer.execute("UPDATE messages SET content = 'changed' WHERE id = 'm1'")
+                writer.commit()
+            outcome.append("locked")
+        finally:
+            writer.close()
+        return real(conn)
+
+    monkeypatch.setattr(whatsapp, "_name_resolver", write_then_resolve)
+    out = whatsapp.list_messages(query="second", context_before=1, context_after=1)
+    assert outcome == ["locked"]
+    assert out.index("hello") < out.index("second") < out.index("third")
+
+
 def test_sender_names_do_not_match_by_substring(tmp_path, monkeypatch):
     db = tmp_path / "messages.db"
     make_messages_db(db)
