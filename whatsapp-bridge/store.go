@@ -173,9 +173,10 @@ const dropFTSTriggersSQL = `
 // FTS index when the table is new. An existing index is stale when a trigger is missing or it
 // does not cover every message. A missing trigger means writes went unindexed: an older bridge's
 // INSERT OR REPLACE renumbers rowids, so the index can be stale even at an equal row count.
-// An index FTS5 cannot read, or one with segments that have no messages_fts_idx entry (MATCH
-// would find nothing), is treated as stale too: its triggers would make every write to
-// messages fail. See ftsHealthy for how that is checked. A stale index is dropped before the
+// An index FTS5 cannot read is treated as stale too: its triggers would make every write to
+// messages fail. So is one with segments that have no messages_fts_idx entry: writes still
+// work, but MATCH silently finds nothing for the terms in those segments instead of falling
+// back to LIKE. See ftsHealthy for how both are checked. A stale index is dropped before the
 // rebuild starts. Readers use MATCH whenever messages_fts exists with its three triggers, so a
 // stale table kept while the rebuild runs, or after it fails or is cancelled, would silently miss
 // rows instead of falling back to LIKE. The triggers are only created in the transaction that
