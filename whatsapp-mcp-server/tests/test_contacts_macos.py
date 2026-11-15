@@ -131,6 +131,24 @@ def test_names_organization_and_nameless(ab):
     assert index.name_for("972500000004") == "Solo"
 
 
+def test_non_text_columns_are_skipped(ab):
+    root = ab({"": [MIA]})
+    conn = sqlite3.connect(root / contacts_macos.DB_NAME)
+    conn.execute("INSERT INTO ZABCDRECORD VALUES (7, ?, X'01', X'00')", (b"Blob",))
+    conn.execute("INSERT INTO ZABCDRECORD VALUES (8, 'Num', 'Ber', '')")
+    conn.execute("INSERT INTO ZABCDRECORD VALUES (9, 'Org', NULL, 3.5)")
+    conn.execute("INSERT INTO ZABCDPHONENUMBER (ZOWNER, ZFULLNUMBER) VALUES (7, '+972500000007')")
+    conn.execute("INSERT INTO ZABCDPHONENUMBER (ZOWNER, ZFULLNUMBER) VALUES (8, X'2B3937')")
+    conn.execute("INSERT INTO ZABCDPHONENUMBER (ZOWNER, ZFULLNUMBER) VALUES (9, '+972500000009')")
+    conn.commit()
+    conn.close()
+    index = contacts_macos.get_index()
+    assert index.name_for("972585529067") == "Mia Gohman"
+    assert index.name_for("972500000007") is None
+    assert index.name_for("972500000009") == "Org"
+    assert [e.name for e in index.entries] == ["Mia Gohman", "Org"]
+
+
 def test_corrupt_plist(ab):
     root = ab(
         {

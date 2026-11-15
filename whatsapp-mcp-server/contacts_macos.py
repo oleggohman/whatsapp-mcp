@@ -158,6 +158,11 @@ def _rows(path: Path) -> list[tuple]:
         return _read_rows(uri + "?immutable=1")
 
 
+def _text(value: object) -> str:
+    """A stripped text column, or "" for NULL and non-text values."""
+    return value.strip() if isinstance(value, str) else ""
+
+
 def _load(paths: list[Path]) -> Index:
     full: dict[str, str] = {}
     national: dict[str, str] = {}
@@ -168,8 +173,10 @@ def _load(paths: list[Path]) -> Index:
         except sqlite3.DatabaseError:
             continue
         for first, last, org, number in rows:
-            name = " ".join(p for p in ((first or "").strip(), (last or "").strip()) if p)
-            name = name or (org or "").strip()
+            if not isinstance(number, str):
+                continue  # a BLOB or number in ZFULLNUMBER: skip the row, keep the index
+            name = " ".join(p for p in (_text(first), _text(last)) if p)
+            name = name or _text(org)
             n_full, n_national = normalize(number)
             if not name or len(n_national) < MIN_NATIONAL_DIGITS:
                 continue
