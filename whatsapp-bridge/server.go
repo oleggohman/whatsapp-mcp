@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -552,6 +553,10 @@ func (a *apiServer) handleSend(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleDownload handles POST /api/download.
+// urlQuery matches the query of a URL inside an error message. A transport error from
+// whatsmeow embeds the signed media URL (oh=, oe=, hash=); the log keeps only host and path.
+var urlQuery = regexp.MustCompile(`\?[^\s"]*`)
+
 func (a *apiServer) handleDownload(w http.ResponseWriter, r *http.Request) {
 	// Only allow POST requests
 	if r.Method != http.MethodPost {
@@ -581,7 +586,7 @@ func (a *apiServer) handleDownload(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			errMsg = err.Error()
 		}
-		logf("Media download failed (message %s, chat %s): %s\n", req.MessageID, req.ChatJID, errMsg)
+		logf("Media download failed (message %s, chat %s): %s\n", req.MessageID, req.ChatJID, urlQuery.ReplaceAllString(errMsg, "?<redacted>"))
 		writeJSON(w, http.StatusInternalServerError, DownloadMediaResponse{
 			Success: false,
 			Message: fmt.Sprintf("Failed to download media: %s", errMsg),

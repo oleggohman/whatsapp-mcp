@@ -449,6 +449,22 @@ func TestDownloadHandlerLogsFailure(t *testing.T) {
 	}
 }
 
+func TestDownloadHandlerLogRedactsSignedURL(t *testing.T) {
+	root := t.TempDir()
+	store := newTestStoreIn(t, root)
+	seedMedia(t, store, "1234@s.whatsapp.net", "m1", "f.txt")
+	urlErr := errors.New(`failed to download media from last host: Get "https://mmg.whatsapp.net/v/t62/x.enc?ccb=11-4&oh=SECRET&oe=6&hash=h": dial tcp: connection refused`)
+	fc := &fakeClient{connected: true, downloadErr: urlErr}
+	a := newAPIServer(func() bridgeClient { return fc }, store, "", "127.0.0.1:8080")
+	stderr := captureStderr(t, func() {
+		do(a.handler(), http.MethodPost, "/api/download", `{"message_id":"m1","chat_jid":"1234@s.whatsapp.net"}`)
+	})
+	want := `Get "https://mmg.whatsapp.net/v/t62/x.enc?<redacted>": dial tcp: connection refused`
+	if !strings.Contains(stderr, want) || strings.Contains(stderr, "SECRET") {
+		t.Fatalf("stderr = %q", stderr)
+	}
+}
+
 func TestBridgeAddrDefaultsToLoopback(t *testing.T) {
 	t.Setenv("WHATSAPP_BRIDGE_ADDR", "")
 	addr := bridgeAddr()
