@@ -12,6 +12,7 @@ import plistlib
 import re
 import sqlite3
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -68,6 +69,8 @@ _index: Index | None = None
 _checked_at = 0.0
 _signature_seen: tuple | None = None
 _last_failure: str | None = None
+# The MCP server runs sync tools in worker threads; one lock keeps the cache state consistent.
+_lock = threading.Lock()
 
 
 def _is_macos() -> bool:
@@ -189,9 +192,14 @@ def _load(paths: list[Path]) -> Index:
 
 
 def get_index() -> Index:
-    global _index, _checked_at, _signature_seen, _last_failure
     if not enabled():
         return EMPTY
+    with _lock:
+        return _refresh()
+
+
+def _refresh() -> Index:
+    global _index, _checked_at, _signature_seen, _last_failure
     now = time.monotonic()
     if _index is not None and now - _checked_at < REFRESH_SECONDS:
         return _index

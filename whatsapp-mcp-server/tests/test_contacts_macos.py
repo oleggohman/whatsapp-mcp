@@ -4,6 +4,8 @@ import logging
 import os
 import plistlib
 import sqlite3
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -147,6 +149,34 @@ def test_non_text_columns_are_skipped(ab):
     assert index.name_for("972500000007") is None
     assert index.name_for("972500000009") == "Org"
     assert [e.name for e in index.entries] == ["Mia Gohman", "Org"]
+
+
+def test_concurrent_callers_share_one_load(ab, monkeypatch):
+    ab({"": [MIA]})
+    real_load = contacts_macos._load
+    loads = []
+
+    def slow_load(paths):
+        loads.append(contacts_macos._lock.locked())
+        time.sleep(0.05)  # widen the window two unsynchronized callers would race in
+        return real_load(paths)
+
+    monkeypatch.setattr(contacts_macos, "_load", slow_load)
+    start = threading.Barrier(2)
+    results = []
+
+    def call():
+        start.wait()
+        results.append(contacts_macos.get_index())
+
+    threads = [threading.Thread(target=call) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert loads == [True]
+    assert results[0] is results[1]
+    assert results[0].name_for("972585529067") == "Mia Gohman"
 
 
 def test_corrupt_plist(ab):
