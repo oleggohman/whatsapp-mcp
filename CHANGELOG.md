@@ -9,6 +9,12 @@ published in the [oleggohman/cc-things](https://github.com/oleggohman/cc-things)
 
 ## [Unreleased]
 
+### Fixed
+
+- Documents sent through the bridge now carry their file name. Previously only the title was set, so
+  recipients and a later `download_media` of the sent message saw `document_<timestamp>` with no
+  extension.
+
 ## [0.4.2] - 2026-11-15
 
 ### Added

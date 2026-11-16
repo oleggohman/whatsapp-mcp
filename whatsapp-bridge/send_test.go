@@ -106,6 +106,9 @@ func TestSendWhatsAppMessageMediaKinds(t *testing.T) {
 				if d.GetTitle() != tc.file {
 					t.Fatalf("title = %q, want %q", d.GetTitle(), tc.file)
 				}
+				if d.GetFileName() != tc.file {
+					t.Fatalf("file name = %q, want %q", d.GetFileName(), tc.file)
+				}
 			case whatsmeow.MediaAudio:
 				gotMime = m.GetAudioMessage().GetMimetype()
 				gotCaption = "cap" // audio messages carry no caption
