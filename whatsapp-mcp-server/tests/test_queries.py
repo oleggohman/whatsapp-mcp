@@ -760,6 +760,17 @@ def test_search_contacts_suffix_bounds_match_name_for(contacts_on):
     assert [c.jid for c in whatsapp.search_contacts("Mia")] == [MIA]
 
 
+def test_masked_stored_name_falls_back_to_contacts(contacts_on):
+    writer = sqlite3.connect(contacts_on / "messages.db")
+    writer.execute("UPDATE chats SET name = ? WHERE jid = ?", ("+972∙∙∙∙∙∙∙67", MIA))
+    writer.commit()
+    writer.close()
+    assert whatsapp.get_chat(MIA).name == "Mia Gohman"
+    assert _chat_names(whatsapp.list_chats(limit=50))[MIA] == "Mia Gohman"
+    assert [c.name for c in whatsapp.search_contacts("Mia")] == ["Mia Gohman"]
+    assert [c.name for c in whatsapp.search_contacts("972")] == ["Mia Gohman"]
+
+
 def test_search_contacts_ignores_contacts_when_off(contacts_on, monkeypatch):
     monkeypatch.setenv("WHATSAPP_MACOS_CONTACTS", "0")
     assert whatsapp.search_contacts("Mia Gohman") == []
@@ -792,6 +803,9 @@ def test_search_contacts_caps_at_50(store_dir, tmp_path, monkeypatch, sql_hits, 
         (None, "972585529067@s.whatsapp.net", True),
         ("972585529067", "972585529067@s.whatsapp.net", True),
         ("+972 58-552 9067", "972585529067@s.whatsapp.net", True),
+        ("+972∙∙∙∙∙∙∙67", "972585529067@s.whatsapp.net", True),
+        ("+1 ••• •••• 12", "972585529067@s.whatsapp.net", True),
+        ("∙∙ Alice ∙∙", "972585529067@s.whatsapp.net", False),
         ("LID 123", "123@lid", True),
         ("Group g1", "g1@g.us", True),
         ("HY.group Support", "g1@g.us", False),

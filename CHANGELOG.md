@@ -9,6 +9,12 @@ published in the [oleggohman/cc-things](https://github.com/oleggohman/cc-things)
 
 ## [Unreleased]
 
+### Fixed
+
+- Masked phone numbers such as `+972∙∙∙∙∙∙∙67` (WhatsApp hides the digits behind `∙` or `•`) are now
+  treated as placeholder names in both the bridge and the MCP server. The macOS Contacts fallback
+  replaces them, and the bridge replaces them once a real name is known.
+
 ## [0.4.3] - 2026-11-16
 
 ### Fixed

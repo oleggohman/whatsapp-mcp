@@ -107,14 +107,15 @@ def _is_group_jid(jid: str) -> bool:
 
 
 _PLACEHOLDER_LID = re.compile(r"^LID \d+$")
-_PLACEHOLDER_NUMBER = re.compile(r"^\+?[\d\s\-()]+$")
+# Also accepts WhatsApp's mask characters for hidden digits: U+2219 and U+2022.
+_PLACEHOLDER_NUMBER = re.compile(r"^\+?[\d\s\-()∙•]+$")
 
 
 def _is_placeholder_name(name: str | None, jid: str) -> bool:
     """True when name is empty or a generated fallback rather than a real name.
 
     Mirrors isPlaceholderName in whatsapp-bridge/chatname.go: empty, the bare user part,
-    "LID <digits>", "Group <id>" for a group, or a number-like string.
+    "LID <digits>", "Group <id>" for a group, or a number-like string (masked digits included).
     """
     name = (name or "").strip()
     user = jid.split("@")[0]

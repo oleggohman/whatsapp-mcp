@@ -31,11 +31,13 @@ type nameHints struct {
 
 var (
 	lidPlaceholderRe = regexp.MustCompile(`^LID \d+$`)
-	numberLikeRe     = regexp.MustCompile(`^\+?[\d\s\-()]+$`)
+	// numberLikeRe also accepts the mask characters WhatsApp uses for hidden digits:
+	// U+2219 BULLET OPERATOR and U+2022 BULLET (e.g. "+972∙∙∙∙∙∙∙67").
+	numberLikeRe = regexp.MustCompile(`^\+?[\d\s\-()\x{2219}\x{2022}]+$`)
 )
 
 // isPlaceholderName reports whether name is empty or one of the generated fallbacks:
-// bare digits, a formatted number, "LID <digits>" or "Group <id>".
+// bare digits, a formatted or masked number, "LID <digits>" or "Group <id>".
 func isPlaceholderName(name string, jid types.JID) bool {
 	name = strings.TrimSpace(name)
 	if name == "" || name == jid.User {
