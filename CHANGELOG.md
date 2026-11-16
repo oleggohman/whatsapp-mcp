@@ -9,6 +9,8 @@ published in the [oleggohman/cc-things](https://github.com/oleggohman/cc-things)
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-11-16
+
 ### Fixed
 
 - Documents sent through the bridge now carry their file name. Previously only the title was set, so
@@ -236,7 +238,8 @@ DROP TABLE IF EXISTS messages_fts;
 
 - Initial version from the upstream project.
 
-[Unreleased]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.3.4...v0.4.0
