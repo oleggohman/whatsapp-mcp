@@ -7,7 +7,7 @@ description: Use when asked to validate or test the WhatsApp MCP tools.
 
 ## Overview
 
-Exercise every `mcp__plugin_whatsapp_whatsapp__*` tool the server lists (15 as of 0.4.3) against the live account and report one row per tool.
+Exercise every `mcp__plugin_whatsapp_whatsapp__*` tool the server lists (15 as of 0.4.4) against the live account and report one row per tool.
 A tool passes only when its output is checked, not when it merely returns `success: true`.
 Read-only tools run freely. Send tools need the user's explicit OK and go only to the user's own "Message yourself" chat.
 

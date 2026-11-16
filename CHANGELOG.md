@@ -9,6 +9,8 @@ published in the [oleggohman/cc-things](https://github.com/oleggohman/cc-things)
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-11-16
+
 ### Added
 
 - Project skill `validate-whatsapp-mcp` (`.claude/skills/`) that checks every MCP tool against a live
@@ -249,7 +251,8 @@ DROP TABLE IF EXISTS messages_fts;
 
 - Initial version from the upstream project.
 
-[Unreleased]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.4.3...HEAD
+[Unreleased]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.4.4...HEAD
+[0.4.4]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.4.0...v0.4.1
