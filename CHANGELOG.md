@@ -11,7 +11,7 @@ published in the [oleggohman/cc-things](https://github.com/oleggohman/cc-things)
 
 ### Added
 
-- Project skill `validate-whatsapp-mcp` (`.claude/skills/`) that checks all 16 tools against a live
+- Project skill `validate-whatsapp-mcp` (`.claude/skills/`) that checks every MCP tool against a live
   account. Running it is now the last step of the release process in the README.
 
 ### Fixed

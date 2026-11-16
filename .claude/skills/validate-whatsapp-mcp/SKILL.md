@@ -7,7 +7,7 @@ description: Use when asked to validate or test the WhatsApp MCP tools.
 
 ## Overview
 
-Exercise all 16 `mcp__plugin_whatsapp_whatsapp__*` tools against the live account and report one row per tool.
+Exercise every `mcp__plugin_whatsapp_whatsapp__*` tool the server lists (15 as of 0.4.3) against the live account and report one row per tool.
 A tool passes only when its output is checked, not when it merely returns `success: true`.
 Read-only tools run freely. Send tools need the user's explicit OK and go only to the user's own "Message yourself" chat.
 
@@ -73,7 +73,7 @@ Paths used below:
 
 ## Common mistakes
 
-- Reporting "works" after read tools only. All 16 tools get a row, even if the row says "not tested" and why.
+- Reporting "works" after read tools only. Every tool gets a row, even if the row says "not tested" and why.
 - Trusting `success: true`. Run `file` on downloads and read sent messages back.
 - Reporting a download failure without the bridge's real error from step 5.
 - Sending to any chat other than the user's own, or sending without asking first.

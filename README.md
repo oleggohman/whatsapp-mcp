@@ -311,7 +311,7 @@ cd whatsapp-mcp-server && uv run pytest && uv run ruff check .
 git tag vX.Y.Z && git push origin vX.Y.Z
 ```
 
-4. Validate the release against a live account. Once the release is installed (for the Claude Code plugin: bump the marketplace entry, update the plugin, and start a new Claude Code session so the new MCP server and bridge run), run the project skill [`validate-whatsapp-mcp`](.claude/skills/validate-whatsapp-mcp/SKILL.md) in Claude Code (`/validate-whatsapp-mcp`). It exercises all 16 tools and reports one row per tool. The send tools only run with your OK and only to your own "Message yourself" chat. A release is done when no tool is ❌; fix any ❌ in a follow-up release.
+4. Validate the release against a live account. Once the release is installed (for the Claude Code plugin: bump the marketplace entry, update the plugin, and start a new Claude Code session so the new MCP server and bridge run), run the project skill [`validate-whatsapp-mcp`](.claude/skills/validate-whatsapp-mcp/SKILL.md) in Claude Code (`/validate-whatsapp-mcp`). It exercises every tool the MCP server lists and reports one row per tool. The send tools only run with your OK and only to your own "Message yourself" chat. A release is done when no tool is ❌; fix any ❌ in a follow-up release.
 
 ## License
 
