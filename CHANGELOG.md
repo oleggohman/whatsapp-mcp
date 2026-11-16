@@ -9,6 +9,11 @@ published in the [oleggohman/cc-things](https://github.com/oleggohman/cc-things)
 
 ## [Unreleased]
 
+### Added
+
+- Project skill `validate-whatsapp-mcp` (`.claude/skills/`) that checks all 16 tools against a live
+  account. Running it is now the last step of the release process in the README.
+
 ### Fixed
 
 - Masked phone numbers such as `+972∙∙∙∙∙∙∙67` (WhatsApp hides the digits behind `∙` or `•`) are now

@@ -18,3 +18,7 @@ bridge.lock
 # Coverage artefacts
 .coverage
 coverage.out
+
+# Claude Code: local worktrees and settings (project skills in .claude/skills are tracked)
+.claude/worktrees/
+.claude/settings.local.json
