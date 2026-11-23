@@ -47,6 +47,183 @@ def test_invalid_start_timeout_falls_back_to_default(monkeypatch):
     assert bridge_manager.start_timeout() == 7.5
 
 
+# --- unexpanded WHATSAPP_STORE_DIR -------------------------------------------------------------
+
+PLACEHOLDER = "${CLAUDE_PLUGIN_DATA}/store"
+# Captured at import, before the autouse fixture swaps them for tmp dirs.
+_REAL_PLUGIN_DATA_ROOT = bridge_manager._plugin_data_root
+_REAL_STABLE_DEFAULT_STORE = bridge_manager._stable_default_store
+
+
+def test_fallback_locations_live_under_home(tmp_path, monkeypatch):
+    """Pure path computation under a fake HOME; nothing is read or created."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert _REAL_PLUGIN_DATA_ROOT() == str(tmp_path / ".claude" / "plugins" / "data")
+    assert _REAL_STABLE_DEFAULT_STORE() == str(tmp_path / ".whatsapp-mcp" / "store")
+
+
+@pytest.fixture
+def unexpanded(tmp_path, monkeypatch):
+    """WHATSAPP_STORE_DIR passed through unexpanded; glob root and stable default in tmp_path."""
+    root = tmp_path / "plugin-data"
+    root.mkdir()
+    default = tmp_path / "stable" / "store"
+    monkeypatch.setattr(bridge_manager, "_plugin_data_root", lambda: str(root))
+    monkeypatch.setattr(bridge_manager, "_stable_default_store", lambda: str(default))
+    monkeypatch.setenv("WHATSAPP_STORE_DIR", PLACEHOLDER)
+    return {"root": root, "default": str(default), "tmp": tmp_path}
+
+
+def _make_store(path, token="secret", token_mode=0o600, db=False, mode=0o700):
+    """A store dir with an optional bridge.token (token=None: none) and whatsapp.db."""
+    path.mkdir(parents=True)
+    if token is not None:
+        (path / "bridge.token").write_text(token)
+        (path / "bridge.token").chmod(token_mode)
+    if db:
+        (path / "whatsapp.db").write_bytes(b"")
+    path.chmod(mode)
+    return path
+
+
+def _bridge_answers(monkeypatch, body=None, status=200):
+    """Stub httpx.get as the /api/health answer (body None: nothing listens); returns call URLs."""
+    calls = []
+
+    def get(url, **kw):
+        calls.append(url)
+        if body is None:
+            raise httpx.ConnectError("refused")
+        return httpx.Response(status, json=body)
+
+    monkeypatch.setattr(httpx, "get", get)
+    return calls
+
+
+def _bridge_body(store):
+    return {"service": "whatsapp-bridge", "store_dir": str(store), "pid": 1}
+
+
+def _real(path):
+    return os.path.realpath(str(path))
+
+
+def test_unexpanded_store_uses_running_bridge_store(unexpanded, monkeypatch, caplog):
+    store = _make_store(unexpanded["tmp"] / "running")
+    calls = _bridge_answers(monkeypatch, _bridge_body(store))
+    with caplog.at_level("WARNING", logger="bridge_manager"):
+        assert bridge_manager.store_dir() == _real(store)
+        assert bridge_manager.token_path() == os.path.join(_real(store), "bridge.token")
+    assert calls == ["http://127.0.0.1:9/api/health"]
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert PLACEHOLDER in warnings[0] and "running bridge" in warnings[0]
+
+
+def test_unexpanded_store_uses_single_claude_code_store(unexpanded, monkeypatch, caplog):
+    _bridge_answers(monkeypatch)
+    store = _make_store(unexpanded["root"] / "whatsapp-abc" / "store", token=None, db=True)
+    _make_store(unexpanded["root"] / "whatsapp-nodb" / "store")  # no whatsapp.db: ignored
+    _make_store(unexpanded["root"] / "other-plugin" / "store", db=True)  # not whatsapp-*
+    with caplog.at_level("WARNING", logger="bridge_manager"):
+        assert bridge_manager.store_dir() == _real(store)
+    assert "Claude Code store" in caplog.text
+
+
+@pytest.mark.parametrize("count", [0, 2])
+def test_unexpanded_store_without_single_match_uses_stable_default(
+    unexpanded, monkeypatch, caplog, count
+):
+    _bridge_answers(monkeypatch)
+    for i in range(count):
+        _make_store(unexpanded["root"] / f"whatsapp-{i}" / "store", db=True)
+    with caplog.at_level("WARNING", logger="bridge_manager"):
+        assert bridge_manager.store_dir() == unexpanded["default"]
+    assert "(default)" in caplog.text
+
+
+def test_unexpanded_store_skips_unsafe_claude_code_store(unexpanded, monkeypatch):
+    _bridge_answers(monkeypatch)
+    _make_store(unexpanded["root"] / "whatsapp-abc" / "store", db=True, mode=0o777)
+    assert bridge_manager.store_dir() == unexpanded["default"]
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "token-missing",
+        "token-empty",
+        "token-0644",
+        "dir-group-writable",
+        "dir-other-writable",
+        "not-a-dir",
+        "missing-dir",
+        "wrong-owner",
+        "relative-dir",
+        "not-a-bridge",
+        "not-json",
+    ],
+)
+def test_unexpanded_store_rejects_unsafe_bridge_store(unexpanded, monkeypatch, case):
+    tmp = unexpanded["tmp"]
+    kwargs = {
+        "token-missing": {"token": None},
+        "token-empty": {"token": ""},
+        "token-0644": {"token_mode": 0o644},
+        "dir-group-writable": {"mode": 0o770},
+        "dir-other-writable": {"mode": 0o703},
+    }.get(case, {})
+    store = _make_store(tmp / "running", **kwargs)
+    reported = str(store)
+    if case == "not-a-dir":
+        reported = str(store / "bridge.token")
+    elif case == "missing-dir":
+        reported = str(tmp / "gone")
+    elif case == "relative-dir":
+        reported = os.path.relpath(store)
+    elif case == "wrong-owner":
+        uid = os.getuid()
+        monkeypatch.setattr(os, "getuid", lambda: uid + 1)
+    body = _bridge_body(reported)
+    if case == "not-a-bridge":
+        body["service"] = "something-else"
+    if case == "not-json":
+        monkeypatch.setattr(httpx, "get", lambda url, **kw: httpx.Response(200, content=b"<x>"))
+    else:
+        _bridge_answers(monkeypatch, body)
+    assert bridge_manager.store_dir() == unexpanded["default"]
+
+
+def test_unexpanded_store_never_probes_a_remote_bridge(unexpanded, monkeypatch):
+    store = _make_store(unexpanded["tmp"] / "running")
+    calls = _bridge_answers(monkeypatch, _bridge_body(store))
+    monkeypatch.setenv("WHATSAPP_API_BASE_URL", "http://192.0.2.1:8080/api")
+    assert bridge_manager.store_dir() == unexpanded["default"]
+    assert calls == []
+
+
+def test_unexpanded_store_is_cached_until_reset(unexpanded, monkeypatch, caplog):
+    store = _make_store(unexpanded["tmp"] / "running")
+    calls = _bridge_answers(monkeypatch, _bridge_body(store))
+    with caplog.at_level("WARNING", logger="bridge_manager"):
+        assert bridge_manager.store_dir() == _real(store)
+        _bridge_answers(monkeypatch)  # the bridge goes away
+        assert bridge_manager.store_dir() == _real(store)
+    assert len(calls) == 1
+    assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 1
+    bridge_manager.reset_manager()
+    assert bridge_manager.store_dir() == unexpanded["default"]
+
+
+def test_expanded_and_unset_store_dir_unchanged(tmp_path, monkeypatch):
+    calls = _bridge_answers(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_STORE_DIR", str(tmp_path / "s"))
+    assert bridge_manager.store_dir() == str(tmp_path / "s")
+    monkeypatch.delenv("WHATSAPP_STORE_DIR")
+    assert bridge_manager.store_dir() == os.path.abspath(bridge_manager.DEFAULT_STORE_DIR)
+    assert calls == []
+
+
 # --- token -------------------------------------------------------------------------------------
 
 

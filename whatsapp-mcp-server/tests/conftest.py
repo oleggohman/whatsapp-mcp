@@ -14,6 +14,8 @@ if str(SERVER_DIR) not in sys.path:
 import contacts_macos  # noqa: E402
 
 DEFAULT_STORE = SERVER_DIR.parent / "whatsapp-bridge" / "store"
+# Port 9 (discard) is closed on loopback; nothing answers there.
+CLOSED_API_BASE_URL = "http://127.0.0.1:9/api"
 
 
 @pytest.fixture(autouse=True)
@@ -178,6 +180,14 @@ def _isolate_bridge_env(tmp_path_factory, monkeypatch):
 
     monkeypatch.setenv("WHATSAPP_BRIDGE_AUTOSTART", "0")
     monkeypatch.setenv("WHATSAPP_STORE_DIR", str(tmp_path_factory.mktemp("store")))
+    # A closed loopback port: no test may reach a live bridge on the default :8080.
+    monkeypatch.setenv("WHATSAPP_API_BASE_URL", CLOSED_API_BASE_URL)
+    # The unexpanded-store fallback must never look at the real ~/.claude or default store.
+    fallback = tmp_path_factory.mktemp("fallback")
+    monkeypatch.setattr(bridge_manager, "_plugin_data_root", lambda: str(fallback / "data"))
+    monkeypatch.setattr(
+        bridge_manager, "_stable_default_store", lambda: str(fallback / "default-store")
+    )
     for var in (
         "WHATSAPP_BRIDGE_ADDR",
         "WHATSAPP_BRIDGE_BIN",
@@ -197,7 +207,7 @@ def store_dir(tmp_path, monkeypatch):
     make_whatsapp_db(tmp_path / "whatsapp.db")
     monkeypatch.setenv("WHATSAPP_DB_PATH", str(tmp_path / "messages.db"))
     monkeypatch.setenv("WHATSAPP_STORE_DIR", str(tmp_path))
-    monkeypatch.delenv("WHATSAPP_API_BASE_URL", raising=False)
+    monkeypatch.setenv("WHATSAPP_API_BASE_URL", CLOSED_API_BASE_URL)
     monkeypatch.delenv("WHATSAPP_BRIDGE_TOKEN", raising=False)
     return tmp_path
 

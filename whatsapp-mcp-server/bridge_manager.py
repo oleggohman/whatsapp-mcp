@@ -15,6 +15,7 @@ import re
 import secrets
 import shutil
 import signal
+import stat
 import subprocess
 import threading
 import time
@@ -70,8 +71,111 @@ class BridgeError(RuntimeError):
 
 
 def store_dir() -> str:
-    """Absolute store dir shared by the bridge and this server (WHATSAPP_STORE_DIR)."""
-    return os.path.abspath(os.environ.get("WHATSAPP_STORE_DIR") or DEFAULT_STORE_DIR)
+    """Absolute store dir shared by the bridge and this server (WHATSAPP_STORE_DIR).
+
+    A value with an unexpanded host placeholder (Cowork passes "${CLAUDE_PLUGIN_DATA}/store"
+    literally) counts as unset and resolves via _resolve_fallback_store().
+    """
+    value = os.environ.get("WHATSAPP_STORE_DIR")
+    if value and _unexpanded(value):
+        return _resolve_fallback_store(value)
+    return os.path.abspath(value or DEFAULT_STORE_DIR)
+
+
+def _unexpanded(value: str) -> bool:
+    return "${" in value
+
+
+def _plugin_data_root() -> str:
+    """Where Claude Code keeps plugin data (one whatsapp-*/store per install)."""
+    return os.path.expanduser("~/.claude/plugins/data")
+
+
+def _stable_default_store() -> str:
+    """Last-resort store outside the versioned plugin dir, so the login survives updates."""
+    return os.path.expanduser("~/.whatsapp-mcp/store")
+
+
+def _safe_store(path: str, require_token: bool = False) -> str | None:
+    """Real path of path when it is a dir only this user can write (plus, with require_token, a
+    non-empty bridge.token owned by the user with mode 0600); None otherwise."""
+    if not hasattr(os, "getuid"):  # pragma: no cover - Windows: no ownership check, never adopt
+        return None
+    real = os.path.realpath(path)
+    uid = os.getuid()
+    try:
+        st = os.stat(real)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != uid or st.st_mode & 0o022:
+        return None
+    if require_token:
+        try:
+            tok = os.stat(os.path.join(real, "bridge.token"))
+        except OSError:
+            return None
+        if (
+            not stat.S_ISREG(tok.st_mode)
+            or tok.st_uid != uid
+            or stat.S_IMODE(tok.st_mode) != 0o600
+            or tok.st_size == 0
+        ):
+            return None
+    return real
+
+
+def _running_bridge_store() -> str | None:
+    """Store of a WhatsApp bridge already answering on the loopback API address, if safe.
+
+    /api/health is unauthenticated, so the reported dir is only trusted after _safe_store.
+    """
+    if not _is_loopback(urlsplit(api_base_url()).hostname):
+        return None
+    try:
+        body = httpx.get(f"{api_base_url()}/health", timeout=HEALTH_TIMEOUT).json()
+    except Exception:
+        return None
+    if not isinstance(body, dict) or body.get("service") != "whatsapp-bridge":
+        return None
+    reported = body.get("store_dir")
+    if not isinstance(reported, str) or not os.path.isabs(reported):
+        return None
+    return _safe_store(reported, require_token=True)
+
+
+def _claude_code_store() -> str | None:
+    """The single safe Claude Code plugin store holding whatsapp.db; None for zero or several."""
+    pattern = os.path.join(glob.escape(_plugin_data_root()), "whatsapp-*", "store")
+    found = set()
+    for path in glob.glob(pattern):
+        safe = _safe_store(path) if os.path.isfile(os.path.join(path, "whatsapp.db")) else None
+        if safe:
+            found.add(safe)
+    return found.pop() if len(found) == 1 else None
+
+
+_fallback_store: str | None = None
+_fallback_lock = threading.Lock()
+
+
+def _resolve_fallback_store(value: str) -> str:
+    """Store for an unexpanded WHATSAPP_STORE_DIR, resolved once per process (see reset_manager).
+
+    Order: the running bridge's store, the single Claude Code store, the stable default.
+    """
+    global _fallback_store
+    with _fallback_lock:
+        if _fallback_store is None:
+            path, reason = _running_bridge_store(), "running bridge"
+            if not path:
+                path, reason = _claude_code_store(), "Claude Code store"
+            if not path:
+                path, reason = os.path.abspath(_stable_default_store()), "default"
+            logger.warning(
+                "WHATSAPP_STORE_DIR is not expanded (%r); using %s (%s)", value, path, reason
+            )
+            _fallback_store = path
+        return _fallback_store
 
 
 def api_base_url() -> str:
@@ -913,7 +1017,9 @@ def get_manager() -> BridgeManager:
 
 
 def reset_manager() -> None:
-    """Drop the singleton (tests)."""
-    global _manager
+    """Drop the singleton and the cached fallback store (tests)."""
+    global _manager, _fallback_store
     with _manager_lock:
         _manager = None
+    with _fallback_lock:
+        _fallback_store = None

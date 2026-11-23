@@ -127,6 +127,24 @@ def test_rejects_bridge_with_other_store_dir(env):
     assert spawns(env["store"]) == 0
 
 
+def test_unexpanded_store_dir_joins_the_running_bridge(env, monkeypatch):
+    """Cowork passes ${CLAUDE_PLUGIN_DATA} literally: reuse the running bridge, no port fight."""
+    store = env["store"]
+    store.mkdir(mode=0o700)
+    token = store / "bridge.token"
+    token.write_text("shared-token")
+    token.chmod(0o600)
+    start_fake(env)
+    wait_health(env)
+    monkeypatch.setenv("WHATSAPP_STORE_DIR", "${CLAUDE_PLUGIN_DATA}/store")
+    mgr = BridgeManager()
+    mgr.ensure_running()
+    assert mgr.state == "running"
+    assert bridge_manager.store_dir() == os.path.realpath(store)
+    assert spawns(store) == 1  # only the hand-started one
+    assert mgr.api("GET", "status")["pairing"] == "idle"  # authenticated with its token
+
+
 def test_spawns_and_waits_for_health(env):
     mgr = BridgeManager()
     mgr.ensure_running()
