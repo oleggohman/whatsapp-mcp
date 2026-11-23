@@ -9,6 +9,17 @@ published in the [oleggohman/cc-things](https://github.com/oleggohman/cc-things)
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-11-23
+
+### Fixed
+
+- Cowork (Claude Desktop) passes `WHATSAPP_STORE_DIR=${CLAUDE_PLUGIN_DATA}/store` unexpanded, so the
+  server used a literal `${CLAUDE_PLUGIN_DATA}` dir and failed with "port in use by another
+  bridge/store" while the Claude Code bridge ran. A value with `${...}` is now treated as unset: the
+  server uses the store of the bridge already running on the loopback address, else the single Claude
+  Code store that holds `whatsapp.db`, else `~/.whatsapp-mcp/store`. Adopted stores must be owned by
+  the user and not group/other-writable, and a running bridge's `bridge.token` must be mode 0600.
+
 ## [0.4.4] - 2026-11-16
 
 ### Added
@@ -251,7 +262,8 @@ DROP TABLE IF EXISTS messages_fts;
 
 - Initial version from the upstream project.
 
-[Unreleased]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.4.4...HEAD
+[Unreleased]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.4.5...HEAD
+[0.4.5]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/oleggohman/whatsapp-mcp/compare/v0.4.1...v0.4.2

@@ -51,7 +51,7 @@ REPLACE_TIMEOUT = 15.0
 PAIRING_IN_PROGRESS = ("qr", "code")
 # Release of this server and of the bridge it builds (bridgeRelease in whatsapp-bridge/pairing.go).
 # A bridge reporting a newer release in /api/health is never replaced by this server.
-RELEASE = "0.4.4"
+RELEASE = "0.4.5"
 API_TIMEOUT = httpx.Timeout(30.0, connect=3.0)
 
 GO_PROBE_PATHS = (
